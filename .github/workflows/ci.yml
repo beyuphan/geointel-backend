@@ -1,0 +1,36 @@
+name: GeoIntel Otomatik Test
+
+# Ne zaman çalışsın? -> main dalına kod atılınca
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  test-yap:
+    runs-on: ubuntu-latest # Robot Ubuntu kullansın
+
+    steps:
+    # 1. Adım: Senin kodunu GitHub'dan çeksin
+    - uses: actions/checkout@v3
+
+    # 2. Adım: Python 3.11 kursun
+    - name: Python Kuruluyor
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+
+    # 3. Adım: Gerekli kütüphaneleri yüklesin
+    - name: Kütüphaneler Yükleniyor
+      run: |
+        python -m pip install --upgrade pip
+        # Test araçlarını ve projenin ihtiyaçlarını yükle
+        pip install pytest httpx asyncpg pydantic fastapi uvicorn polyline
+
+    # 4. Adım: Python'a "Dosyalarım burada" desin (Path ayarı)
+    - name: Yollar Tanımlanıyor
+      run: echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
+
+    # 5. Adım: Testleri çalıştırsın!
+    - name: Testler Çalışıyor
+      run: |
+        pytest tests/
