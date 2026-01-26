@@ -1,11 +1,9 @@
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
-fastmcp>=0.1.0        # MCP Sunucusu için
-asyncpg>=0.29.0       # PostGIS bağlantısı
-httpx>=0.26.0         # Dış API istekleri
-polyline>=2.0.0       # Google Rota decoding
+fastmcp>=0.1.0
+asyncpg>=0.29.0
+httpx>=0.26.0
+polyline>=2.0.0
 pydantic-settings>=2.1.0
 python-dotenv>=1.0.0
-# Folium'u JSON döneceksek kaldırmalıyız ama prototip kodun çalışsın diye ekliyorum
-folium>=0.15.0
 loguru>=0.7.0
