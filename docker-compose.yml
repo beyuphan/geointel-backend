@@ -61,6 +61,7 @@ services:
       - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_postgis:5432/${POSTGRES_DB}
       - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY}
       - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
+      - HERE_API_KEY=${HERE_API_KEY}
     depends_on:
       postgres_postgis:
         condition: service_healthy

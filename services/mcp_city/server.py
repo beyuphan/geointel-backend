@@ -3,8 +3,9 @@ import httpx
 import asyncpg
 from fastapi import FastAPI
 from pydantic import BaseModel
+from config import settings
 
-app = FastAPI(title="City MCP Service")
+app = FastAPI(title=settings.APP_NAME)
 mcp_api = app # Docker uyumluluğu
 
 # Modeller
@@ -26,14 +27,9 @@ class SavePlaceQuery(BaseModel):
     category: str = "Genel"
     note: str = ""
 
-# Değişkenler
-DB_URL = os.getenv("DATABASE_URL")
-OWM_KEY = os.getenv("OPENWEATHER_API_KEY")
-GOOGLE_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
-HERE_KEY = os.getenv("HERE_API_KEY")
 
 async def get_db_connection():
-    return await asyncpg.connect(DB_URL)
+    return await asyncpg.connect(settings.DATABASE_URL)
 
 # --- ARAÇLAR (SADECE API, MANTIK YOK) ---
 
@@ -54,14 +50,14 @@ async def get_weather(data: WeatherQuery):
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             "https://api.openweathermap.org/data/2.5/weather",
-            params={"lat": data.lat, "lon": data.lon, "appid": OWM_KEY, "units": "metric", "lang": "tr"}
+            params={"lat": data.lat, "lon": data.lon, "appid": settings.OPENWEATHER_API_KEY , "units": "metric", "lang": "tr"}
         )
         # Direkt API cevabını dönüyoruz, yorum yok.
         return resp.json()
 
 @app.post("/search_places_google")
 async def search_places(data: LocationQuery):
-    params = {"query": data.query, "key": GOOGLE_KEY, "language": "tr"}
+    params = {"query": data.query, "key": settings.GOOGLE_MAPS_API_KEY, "language": "tr"}
     async with httpx.AsyncClient() as client:
         resp = await client.get("https://maps.googleapis.com/maps/api/place/textsearch/json", params=params)
         return resp.json()
@@ -71,7 +67,7 @@ async def search_places(data: LocationQuery):
 async def get_route(data: RouteQuery):
     print(f"🚗 [HERE ROUTING] İstek: {data.origin} -> {data.destination}", flush=True)
 
-    if not HERE_KEY:
+    if not settings.HERE_API_KEY:
         print("❌ [HERE ERROR] API Key Yok!", flush=True)
         return {"error": "HERE API Key eksik"}
     
@@ -87,7 +83,7 @@ async def get_route(data: RouteQuery):
             "origin": data.origin.replace(" ", ""),       # Boşlukları temizle
             "destination": data.destination.replace(" ", ""),
             "return": "summary,polyline",
-            "apiKey": HERE_KEY
+            "apiKey": settings.HERE_API_KEY
         }
         
         try:
