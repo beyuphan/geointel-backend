@@ -1,14 +1,14 @@
-import os
 import httpx
 import asyncpg
 from fastapi import FastAPI
 from pydantic import BaseModel
 from config import settings
+from logger import log  # <--- LOGLAMA EKLENDİ
 
 app = FastAPI(title=settings.APP_NAME)
-mcp_api = app # Docker uyumluluğu
+mcp_api = app 
 
-# Modeller
+# --- MODELLER ---
 class LocationQuery(BaseModel):
     query: str
 
@@ -27,11 +27,10 @@ class SavePlaceQuery(BaseModel):
     category: str = "Genel"
     note: str = ""
 
-
 async def get_db_connection():
     return await asyncpg.connect(settings.DATABASE_URL)
 
-# --- ARAÇLAR (SADECE API, MANTIK YOK) ---
+# --- ARAÇLAR ---
 
 @app.post("/save_location")
 async def save_location(data: SavePlaceQuery):
@@ -47,71 +46,69 @@ async def save_location(data: SavePlaceQuery):
 
 @app.post("/get_weather")
 async def get_weather(data: WeatherQuery):
-    async with httpx.AsyncClient() as client:
+    # Timeout eklendi: 30 saniye
+    async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(
             "https://api.openweathermap.org/data/2.5/weather",
             params={"lat": data.lat, "lon": data.lon, "appid": settings.OPENWEATHER_API_KEY , "units": "metric", "lang": "tr"}
         )
-        # Direkt API cevabını dönüyoruz, yorum yok.
         return resp.json()
 
 @app.post("/search_places_google")
 async def search_places(data: LocationQuery):
     params = {"query": data.query, "key": settings.GOOGLE_MAPS_API_KEY, "language": "tr"}
-    async with httpx.AsyncClient() as client:
+    # Timeout eklendi: 30 saniye
+    async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get("https://maps.googleapis.com/maps/api/place/textsearch/json", params=params)
         return resp.json()
 
-# services/mcp_city/server.py dosyasının en altındaki fonksiyon:
 @app.post("/get_route_data")
 async def get_route(data: RouteQuery):
-    print(f"🚗 [HERE ROUTING] İstek: {data.origin} -> {data.destination}", flush=True)
+    # Print yerine Log kullanımı
+    log.info(f"🚗 [HERE ROUTING] İstek: {data.origin} -> {data.destination}")
 
     if not settings.HERE_API_KEY:
-        print("❌ [HERE ERROR] API Key Yok!", flush=True)
+        log.error("❌ [HERE ERROR] API Key Yok!")
         return {"error": "HERE API Key eksik"}
     
-    # HERE API 'lat,lon' formatını sever. (Örn: 52.5308,13.3847)
-    # Eğer LLM bize metin yolladıysa (Rize Kalesi gibi), HERE hata verir.
-    # O yüzden LLM'in kesinlikle koordinat yollaması lazım.
-    
-    async with httpx.AsyncClient() as client:
+    # Timeout eklendi: 30 saniye
+    async with httpx.AsyncClient(timeout=30.0) as client:
         url = "https://router.hereapi.com/v8/routes"
         
         params = {
             "transportMode": "car",
-            "origin": data.origin.replace(" ", ""),       # Boşlukları temizle
+            "origin": data.origin.replace(" ", ""),
             "destination": data.destination.replace(" ", ""),
             "return": "summary,polyline",
             "apiKey": settings.HERE_API_KEY
         }
         
         try:
-            print(f"📡 [HERE REQUEST] Soruluyor: {url}", flush=True)
+            log.info(f"📡 [HERE REQUEST] Soruluyor...")
             resp = await client.get(url, params=params)
             
             if resp.status_code != 200:
-                print(f"❌ [HERE ERROR] Hata Döndü: {resp.text}", flush=True)
+                log.error(f"❌ [HERE ERROR] Hata Döndü: {resp.text}")
                 return {"error": f"HERE API Hatası: {resp.status_code} - {resp.text}"}
 
             res = resp.json()
             
-            # HERE Cevap Formatı Google'dan farklıdır:
             if not res.get("routes"):
+                 log.warning("⚠️ Rota bulunamadı (Google search gerekebilir)")
                  return {"error": "Rota bulunamadı."}
 
             section = res["routes"][0]["sections"][0]
             
             summary = {
-                "distance": f"{section['summary']['length'] / 1000:.2f} km", # Metre gelir, km yapalım
-                "duration": f"{section['summary']['duration'] / 60:.0f} dk", # Saniye gelir, dk yapalım
-                "polyline": section["polyline"], # İşte o meşhur şifreli string
+                "distance": f"{section['summary']['length'] / 1000:.2f} km",
+                "duration": f"{section['summary']['duration'] / 60:.0f} dk",
+                "polyline": section["polyline"],
                 "summary": f"Tahmini {section['summary']['duration'] // 60} dakika"
             }
             
-            print(f"✅ [HERE SUCCESS] Rota Hazır: {summary['distance']}", flush=True)
+            log.success(f"✅ [HERE SUCCESS] Rota Hazır: {summary['distance']}")
             return summary
 
         except Exception as e:
-            print(f"☠️ [HERE EXCEPTION] Patladı: {str(e)}", flush=True)
+            log.error(f"☠️ [HERE EXCEPTION] Patladı: {str(e)}")
             return {"error": f"Sunucu Hatası: {str(e)}"}

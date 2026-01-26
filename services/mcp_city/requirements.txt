@@ -8,3 +8,4 @@ pydantic-settings>=2.1.0
 python-dotenv>=1.0.0
 # Folium'u JSON döneceksek kaldırmalıyız ama prototip kodun çalışsın diye ekliyorum
 folium>=0.15.0
+loguru>=0.7.0
