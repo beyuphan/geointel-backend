@@ -1,0 +1,93 @@
+services:
+  # 1. VERİTABANI (POSTGIS)
+  postgres_postgis:
+    image: postgis/postgis:15-3.3
+    container_name: geo_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - geo_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 2. ÖNBELLEK (REDIS)
+  redis_cache:
+    image: redis:alpine
+    container_name: geo_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - geo_net
+
+  # 3. BEYİN (ORCHESTRATOR - LANGGRAPH)
+  orchestrator:
+    build: 
+      context: ./services/orchestrator
+      dockerfile: Dockerfile
+    container_name: geo_brain
+    ports:
+      - "8000:8000" # Dış dünyaya açık tek kapı
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY} # Rota çizmek için gerekebilir
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_postgis:5432/${POSTGRES_DB}
+    depends_on:
+      postgres_postgis:
+        condition: service_healthy
+      mcp_city:
+        condition: service_started
+    networks:
+      - geo_net
+    volumes:
+      - ./services/orchestrator:/app
+
+  # 4. ŞEHİR AJANI (MCP CITY)
+  mcp_city:
+    build: 
+      context: ./services/mcp_city
+      dockerfile: Dockerfile
+    container_name: geo_mcp_city
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_postgis:5432/${POSTGRES_DB}
+      - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY}
+      - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
+    depends_on:
+      postgres_postgis:
+        condition: service_healthy
+    networks:
+      - geo_net
+    volumes:
+      - ./services/mcp_city:/app
+
+  # 5. UYDU AJANI (MCP SATELLITE - İleride kodlayacağız)
+  mcp_satellite:
+    image: python:3.11-slim # Şimdilik boş image, sonra dolduracağız
+    container_name: geo_mcp_satellite
+    command: tail -f /dev/null # Ayakta kalsın diye
+    networks:
+      - geo_net
+
+  # 6. İSTİHBARAT AJANI (MCP INTEL - İleride kodlayacağız)
+  mcp_intel:
+    image: python:3.11-slim
+    container_name: geo_mcp_intel
+    command: tail -f /dev/null
+    networks:
+      - geo_net
+
+networks:
+  geo_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
