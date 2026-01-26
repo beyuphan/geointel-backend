@@ -1,0 +1,21 @@
+# .gitignore
+
+# 1. Çevresel Değişkenler (BUNU SAKIN SİLME)
+.env
+.env.*
+
+# 2. Python Artıkları
+__pycache__/
+*.py[cod]
+*.so
+.venv
+env/
+venv/
+
+# 3. Docker ve Veritabanı Verileri (Localde kalsın)
+infra/postgres/data/
+infra/redis/data/
+
+# 4. IDE Dosyaları
+.vscode/
+.idea/

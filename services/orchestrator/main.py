@@ -3,6 +3,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List
+from datetime import datetime
 
 # LangChain & LangGraph
 from langchain_anthropic import ChatAnthropic
@@ -107,6 +108,29 @@ class AgentState(TypedDict):
 # 1. Düğüm: Ajan (Karar Verici)
 def agent_node(state: AgentState):
     messages = state["messages"]
+    
+    # 1. Şu anki saati al (Örn: 2026-01-26 21:30)
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+    
+    # 2. Sistem mesajını güncelle (Zaman bilgisini enjekte et)
+    # LLM'e diyoruz ki: "Bak saat bu, cevabını buna göre ver."
+    time_context = f"""
+    [ŞU ANKİ ZAMAN: {current_time}]
+    Cevaplarını bu saate göre ayarla.
+    Örneğin saat akşam 21:00 ise "iyi günler" değil "iyi akşamlar" de.
+    Hava durumu yorumlarken saati dikkate al.
+    """
+    
+    # Mevcut System Prompt'un ucuna zamanı ekliyoruz
+    if isinstance(messages[0], SystemMessage):
+        # Var olanı güncelle
+        original_prompt = messages[0].content.split("[ŞU ANKİ ZAMAN")[0] # Eskisini temizle (varsa)
+        messages[0] = SystemMessage(content=original_prompt + "\n" + time_context)
+    else:
+        # Yoksa başa ekle
+        messages.insert(0, SystemMessage(content=SYSTEM_PROMPT + "\n" + time_context))
+        
+    # 3. Modeli çalıştır
     response = model_with_tools.invoke(messages)
     return {"messages": [response]}
 
