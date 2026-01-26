@@ -1,9 +1,11 @@
-import os
-import httpx
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Optional, List
+# services/orchestrator/main.py
 from datetime import datetime
+from typing import TypedDict, Annotated, List, Optional
+import operator
+
+import httpx
+from fastapi import FastAPI
+from pydantic import BaseModel
 
 # LangChain & LangGraph
 from langchain_anthropic import ChatAnthropic
@@ -12,17 +14,19 @@ from langchain_core.tools import tool
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 
-# --- AYARLAR ---
-app = FastAPI(title="GeoIntel Orchestrator", version="1.0")
-CITY_AGENT_URL = "http://geo_mcp_city:8000" # Docker içindeki adres
+# Bizim Modüller
+from config import settings
+from logger import log
 
-# LLM (Beyin)
+# --- UYGULAMA KURULUMU ---
+app = FastAPI(title=settings.APP_NAME, version="1.0")
+
+# --- LLM (BEYİN) AYARLARI ---
 llm = ChatAnthropic(
-    model="claude-sonnet-4-5-20250929",
+    model="claude-sonnet-4-5-20250929",  # Model ismi güncel kalsın
     temperature=0,
-    api_key=os.getenv("ANTHROPIC_API_KEY")
+    api_key=settings.ANTHROPIC_API_KEY
 )
-# SYSTEM_PROMPT kısmını bul ve bunla değiştir:
 
 SYSTEM_PROMPT = """Sen üst düzey bir Coğrafi Zeka Ajanısın (GeoIntel Agent).
 
@@ -40,122 +44,126 @@ NASIL DÜŞÜNMELİSİN? (ReAct Mantığı):
      - Sonra tekrar rota aracını dene.
 
 MEVCUT ARAÇLARIN:
-- call_city_search: Yer ismi ver, sana Google detaylarını (koordinat dahil) versin.
 - call_city_weather: Koordinat ver, hava durumu versin.
-- call_city_route: Başlangıç ve bitiş ver (isim veya koordinat), rota çizsin.
+- call_city_search: Yer ismi ver, detayları (koordinat dahil) versin.
+- call_city_route: Başlangıç ve bitiş ver (MUTLAKA KOORDİNAT OLMALI), rota çizsin.
 
 ASLA "Yapamıyorum" deme. Hata alırsan strateji değiştir ve tekrar dene.
-Örnek: Kullanıcı "Rize'den Trabzon'a git" dedi ve rota aracı "Bulunamadı" dedi.
-DOĞRU HAMLE: Önce Rize'yi search et -> Koordinatı al. Sonra Trabzon'u search et -> Koordinatı al. Sonra bu iki koordinatla tekrar Rota çiz.
+Örnek: "Rize'den Trabzon'a git" -> Önce Rize ve Trabzon'un koordinatlarını bul, sonra rota çiz.
+"""
 
-Hadi başla."""
-# --- İSTEMCİ (Client): Şehir Ajanı ile Konuşan Fonksiyonlar ---
-# Orchestrator, işi kendisi yapmaz. İşçiye (MCP City) havale eder.
+# --- İSTEMCİ (TOOLS) ---
+
 @tool
 async def call_city_weather(lat: float, lon: float):
     """
     Verilen koordinatın (lat, lon) hava durumunu öğrenmek için BU ARACI KULLAN.
     """
-    print(f"🧠 [ORCHESTRATOR] Tool Tetiklendi: Lat={lat}, Lon={lon}", flush=True)
-    print(f"📞 [ORCHESTRATOR] City Agent aranıyor: {CITY_AGENT_URL}/get_weather", flush=True)
+    log.info(f"🌤️ [TOOL: WEATHER] Koordinat: {lat}, {lon}")
     
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             response = await client.post(
-                f"{CITY_AGENT_URL}/get_weather", 
-                json={"lat": lat, "lon": lon},
-                timeout=10.0 # Zaman aşımı ekleyelim
+                f"{settings.MCP_CITY_URL}/get_weather", 
+                json={"lat": lat, "lon": lon}
             )
-            print(f"✅ [ORCHESTRATOR] City Agent Cevabı ({response.status_code}): {response.text}", flush=True)
+            response.raise_for_status()
+            log.success(f"✅ Hava durumu alındı.")
             return response.text
         except Exception as e:
-            print(f"❌ [ORCHESTRATOR] Bağlantı Hatası: {e}", flush=True)
+            log.error(f"❌ Hava durumu hatası: {e}")
             return f"HATA: Şehir Ajanına ulaşılamadı: {e}"
+
 @tool
 async def call_city_search(query: str):
-    """Mekan aramak (otel, park, vs) için kullanılır."""
-    async with httpx.AsyncClient() as client:
-        # FastMCP endpoint mantığı: POST /tool_name
-        res = await client.post(f"{CITY_AGENT_URL}/search_places_google", json={"query": query})
-        return res.json() if res.status_code == 200 else res.text
+    """Mekan aramak (otel, park, şehir merkezi vs) ve KOORDİNAT bulmak için kullanılır."""
+    log.info(f"🔍 [TOOL: SEARCH] Aranıyor: {query}")
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            res = await client.post(
+                f"{settings.MCP_CITY_URL}/search_places_google", 
+                json={"query": query}
+            )
+            return res.json() if res.status_code == 200 else res.text
+        except Exception as e:
+            log.error(f"❌ Arama hatası: {e}")
+            return f"HATA: {e}"
 
 @tool
 async def call_city_route(origin: str, destination: str):
     """
     İki nokta arasına HERE MAPS ile rota çizer.
-    ÇOK ÖNEMLİ: 'origin' ve 'destination' parametreleri MUTLAKA 'Lat,Lon' formatında olmalıdır.
-    ASLA ŞEHİR İSMİ GÖNDERME.
-    Önce 'call_city_search' ile koordinat bul, sonra o koordinatları buraya virgülle yapıştır.
-    Örnek: "41.0201,40.5234"
+    ÇOK ÖNEMLİ: 'origin' ve 'destination' parametreleri MUTLAKA 'Lat,Lon' formatında olmalıdır (Örn: "41.02,40.52").
+    ASLA ŞEHİR İSMİ GÖNDERME. Önce search ile koordinat bul.
     """
-    async with httpx.AsyncClient() as client:
-        res = await client.post(f"{CITY_AGENT_URL}/get_route_data", json={"origin": origin, "destination": destination})
-        return res.json() if res.status_code == 200 else res.text
+    log.info(f"🚗 [TOOL: ROUTE] Rota: {origin} -> {destination}")
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            res = await client.post(
+                f"{settings.MCP_CITY_URL}/get_route_data", 
+                json={"origin": origin, "destination": destination}
+            )
+            if res.status_code == 200:
+                log.success("✅ Rota çizildi.")
+                return res.json()
+            else:
+                log.warning(f"⚠️ Rota hatası: {res.text}")
+                return res.text
+        except Exception as e:
+            log.error(f"❌ Rota bağlantı hatası: {e}")
+            return f"HATA: {e}"
 
-# --- TOOL LISTESİ ---
+# --- LANGGRAPH KURULUMU ---
+
 tools = [call_city_weather, call_city_search, call_city_route]
-
-# LLM'e bu aletleri tanıtalım
 model_with_tools = llm.bind_tools(tools)
 
-# --- LANGGRAPH AKIŞI ---
-from typing import TypedDict, Annotated
-import operator
-
 class AgentState(TypedDict):
-    messages: Annotated[List[HumanMessage | AIMessage], operator.add]
+    messages: Annotated[List[HumanMessage | AIMessage | SystemMessage], operator.add]
 
-# 1. Düğüm: Ajan (Karar Verici)
 def agent_node(state: AgentState):
     messages = state["messages"]
     
-    # 1. Şu anki saati al (Örn: 2026-01-26 21:30)
+    # Zaman Algısı Enjeksiyonu
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-    
-    # 2. Sistem mesajını güncelle (Zaman bilgisini enjekte et)
-    # LLM'e diyoruz ki: "Bak saat bu, cevabını buna göre ver."
     time_context = f"""
     [ŞU ANKİ ZAMAN: {current_time}]
-    Cevaplarını bu saate göre ayarla.
-    Örneğin saat akşam 21:00 ise "iyi günler" değil "iyi akşamlar" de.
-    Hava durumu yorumlarken saati dikkate al.
+    Cevaplarını bu saate göre ayarla. (Örn: 21:00 ise akşam olduğunu bil).
     """
     
-    # Mevcut System Prompt'un ucuna zamanı ekliyoruz
+    # System Prompt Güncelleme
     if isinstance(messages[0], SystemMessage):
-        # Var olanı güncelle
-        original_prompt = messages[0].content.split("[ŞU ANKİ ZAMAN")[0] # Eskisini temizle (varsa)
-        messages[0] = SystemMessage(content=original_prompt + "\n" + time_context)
+        # Eğer zaten varsa, zamanı güncellemek için eskisini alıp ekliyoruz
+        # (Basitçe her seferinde temiz system prompt + zaman veriyoruz)
+        messages[0] = SystemMessage(content=SYSTEM_PROMPT + "\n" + time_context)
     else:
-        # Yoksa başa ekle
         messages.insert(0, SystemMessage(content=SYSTEM_PROMPT + "\n" + time_context))
         
-    # 3. Modeli çalıştır
+    log.info("🧠 LLM Düşünüyor...")
     response = model_with_tools.invoke(messages)
     return {"messages": [response]}
 
-# 2. Düğüm: Alet Kullanıcısı (Tool Executor)
 tool_node = ToolNode(tools)
 
-# 3. Grafik Oluştur
+# Grafik Akışı
 workflow = StateGraph(AgentState)
-
 workflow.add_node("agent", agent_node)
 workflow.add_node("tools", tool_node)
 
 workflow.set_entry_point("agent")
 
-# Koşullu Kenar: Ajan bir tool çağırdı mı?
 def should_continue(state: AgentState):
     last_message = state["messages"][-1]
     if last_message.tool_calls:
-        return "tools" # Evet, alete git
-    return END # Hayır, cevap bitti
+        log.info(f"🛠️ LLM Tool Çağırdı: {len(last_message.tool_calls)} adet")
+        return "tools"
+    return END
 
 workflow.add_conditional_edges("agent", should_continue)
-workflow.add_edge("tools", "agent") # Alet bitince tekrar ajana dön (yorumlama yapması için)
+workflow.add_edge("tools", "agent")
 
-# Uygulamayı Derle
 app_graph = workflow.compile()
 
 # --- API ENDPOINT ---
@@ -165,18 +173,20 @@ class ChatRequest(BaseModel):
 
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
-    """Mobil uygulamadan gelen mesajı işler."""
+    log.info(f"💬 Yeni Mesaj: {request.message}")
     
-    # LangGraph'ı çalıştır
-    inputs = {"messages": [HumanMessage(content=request.message)]}
-    
-    final_state = await app_graph.ainvoke(inputs)
-    
-    # Son mesajı al (AI Cevabı)
-    last_msg = final_state["messages"][-1].content
-    
-    return {"response": last_msg}
+    try:
+        inputs = {"messages": [HumanMessage(content=request.message)]}
+        final_state = await app_graph.ainvoke(inputs)
+        
+        last_msg = final_state["messages"][-1].content
+        log.success("✅ Cevap Hazır")
+        return {"response": last_msg}
+        
+    except Exception as e:
+        log.critical(f"🔥 Kritik Hata: {str(e)}")
+        return {"error": "Sistemde beklenmedik bir hata oluştu."}
 
 @app.get("/health")
 def health_check():
-    return {"status": "Orchestrator is running", "brain": "Active"}
+    return {"status": "active", "service": "Orchestrator"}
