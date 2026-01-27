@@ -8,12 +8,13 @@ jobs:
   test-yap:
     runs-on: ubuntu-latest
 
-    # YENİ BÖLÜM: SAHTE ANAHTARLAR (Test sırasında Pydantic patlamasın diye)
+    # SAHTE ANAHTARLAR (Environment Hatası Almamak İçin)
     env:
       DATABASE_URL: "postgresql://user:pass@localhost:5432/testdb"
       OPENWEATHER_API_KEY: "test_key"
       HERE_API_KEY: "test_key"
       GOOGLE_MAPS_API_KEY: "test_key"
+      ANTHROPIC_API_KEY: "test_key" # Bunu da ekledim ne olur ne olmaz
 
     steps:
     - uses: actions/checkout@v3
@@ -26,13 +27,14 @@ jobs:
     - name: Kütüphaneler Yükleniyor
       run: |
         python -m pip install --upgrade pip
-        pip install pytest httpx asyncpg pydantic pydantic-settings fastapi uvicorn polyline loguru
+        # DÜZELTME: Buraya 'fastmcp' ve 'python-dotenv' ekledim.
+        # Ayrıca Orchestrator bağımlılıkları (langchain vs) lazım olabilir diye onları da ekliyorum.
+        pip install pytest httpx asyncpg pydantic pydantic-settings fastapi uvicorn polyline loguru fastmcp python-dotenv langchain-anthropic langchain-core langgraph
 
-    # KRİTİK DÜZELTME BURADA:
-    # PYTHONPATH'e alt klasörleri de ekliyoruz ki 'import config' çalışsın.
     - name: Yollar Tanımlanıyor
       run: |
-        echo "PYTHONPATH=$PYTHONPATH:$(pwd):$(pwd)/services/mcp_city" >> $GITHUB_ENV
+        # Hem ana dizini hem de alt servisleri yola ekliyoruz
+        echo "PYTHONPATH=$PYTHONPATH:$(pwd):$(pwd)/services/mcp_city:$(pwd)/services/orchestrator" >> $GITHUB_ENV
 
     - name: Testler Çalışıyor
       run: |
