@@ -1,192 +1,273 @@
-# services/orchestrator/main.py
-from datetime import datetime
-from typing import TypedDict, Annotated, List, Optional
 import operator
-
 import httpx
-from fastapi import FastAPI
-from pydantic import BaseModel
+import json
+import asyncio
+from datetime import datetime
+from typing import TypedDict, Annotated, List, Any, Dict
+from contextlib import asynccontextmanager
 
-# LangChain & LangGraph
+from fastapi import FastAPI
+from pydantic import BaseModel, create_model
+
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_core.tools import tool
+from langchain_core.tools import StructuredTool
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 
-# Bizim Modüller
 from config import settings
 from logger import log
 
-# --- UYGULAMA KURULUMU ---
-app = FastAPI(title=settings.APP_NAME, version="1.0")
+# --- GLOBAL DURUM ---
+RUNTIME_TOOLS = []
+MCP_SESSION_URL = None
+PENDING_REQUESTS: Dict[str, asyncio.Future] = {}
 
-# --- LLM (BEYİN) AYARLARI ---
+# --- MANUEL TOOL TANIMLARI (HİBRİT STRATEJİ) ---
+MANUAL_TOOLS = [
+    {
+        "name": "search_infrastructure_osm",
+        "description": "KAMUSAL ALANLARI (Havalimanı, Meydan) bulur. Koordinat tespiti için İLK BUNU KULLAN.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "lat": {"type": "number", "description": "Merkez enlem"},
+                "lon": {"type": "number", "description": "Merkez boylam"},
+                "category": {"type": "string", "description": "Seçenekler: airport, park, square, mosque, hospital"}
+            },
+            "required": ["lat", "lon", "category"]
+        }
+    },
+    # ... (search_places_google, get_route_data vs. AYNI KALSIN) ...
+    {
+        "name": "search_places_google",
+        "description": "TİCARİ İŞLETMELERİ (Restoran, Kafe) bulur.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "lat": {"type": "number"},
+                "lon": {"type": "number"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "get_route_data",
+        "description": "İki koordinat arası rota. Sadece 'lat,lon' formatında veri gir.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "origin": {"type": "string"},
+                "destination": {"type": "string"}
+            },
+            "required": ["origin", "destination"]
+        }
+    },
+    {
+        "name": "get_weather",
+        "description": "Hava durumu.",
+        "inputSchema": {"type": "object", "properties": {"lat": {"type": "number"}, "lon": {"type": "number"}}, "required": ["lat", "lon"]}
+    },
+    {
+        "name": "save_location",
+        "description": "Kaydet.",
+        "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "lat": {"type": "number"}, "lon": {"type": "number"}, "category": {"type": "string"}, "note": {"type": "string"}}, "required": ["name", "lat", "lon"]}
+    }
+]
+# --- SSE DINLEYICI ---
+async def sse_listener_loop():
+    global MCP_SESSION_URL
+    base_url = f"{settings.MCP_CITY_URL}/sse"
+    log.info(f"🎧 SSE Dinleniyor: {base_url}")
+
+    async with httpx.AsyncClient(timeout=None) as client:
+        try:
+            async with client.stream("GET", base_url) as response:
+                async for line in response.aiter_lines():
+                    if not line: continue
+                    if line.startswith("event: endpoint"): continue
+
+                    if line.startswith("data: "):
+                        data_str = line.replace("data: ", "").strip()
+                        
+                        # KANAL YAKALAMA
+                        if data_str.startswith("/") or "http" in data_str:
+                            if not data_str.startswith("{"):
+                                final_url = f"{settings.MCP_CITY_URL}{data_str}" if data_str.startswith("/") else data_str
+                                MCP_SESSION_URL = final_url
+                                log.success(f"✅ Kanal Açık: {MCP_SESSION_URL}")
+                                continue
+
+                        # CEVAP YAKALAMA
+                        if data_str.startswith("{"):
+                            try:
+                                msg = json.loads(data_str)
+                                if "id" in msg:
+                                    req_id = str(msg["id"])
+                                    if req_id in PENDING_REQUESTS:
+                                        future = PENDING_REQUESTS[req_id]
+                                        if not future.done():
+                                            future.set_result(msg)
+                            except: pass
+
+        except Exception as e:
+            log.error(f"🔥 SSE Koptu: {e}")
+            await asyncio.sleep(3)
+            asyncio.create_task(sse_listener_loop())
+
+# --- RPC ÇAĞRISI ---
+async def mcp_rpc_call(method: str, params: dict = None):
+    # Kanalı bekle
+    for _ in range(20): 
+        if MCP_SESSION_URL: break
+        await asyncio.sleep(0.5)
+    
+    if not MCP_SESSION_URL: return "Hata: Kanal yok."
+
+    req_id = str(int(datetime.now().timestamp() * 1000))
+    
+    payload = {
+        "jsonrpc": "2.0", 
+        "method": method, 
+        "params": params or {}, 
+        "id": int(req_id)
+    }
+    
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    PENDING_REQUESTS[req_id] = future
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            await client.post(MCP_SESSION_URL, json=payload)
+            response_data = await asyncio.wait_for(future, timeout=20.0)
+            
+            if "error" in response_data:
+                err = response_data["error"]
+                log.error(f"❌ RPC Hata: {err}")
+                return f"Hata: {err}"
+                
+            return response_data.get("result")
+    except asyncio.TimeoutError:
+        return "Timeout"
+    except Exception as e:
+        return f"RPC Exception: {e}"
+    finally:
+        if req_id in PENDING_REQUESTS: del PENDING_REQUESTS[req_id]
+
+# --- TOOL WRAPPER ---
+async def create_dynamic_tool(tool_def: dict):
+    name = tool_def["name"]
+    desc = tool_def.get("description", "")
+    schema = tool_def.get("inputSchema", {"properties": {}})
+    fields = {k: (Any, ...) for k in schema.get("properties", {}).keys()}
+    DynamicSchema = create_model(f"{name}_Schema", **fields)
+
+    async def execution_wrapper(**kwargs):
+        log.info(f"🚀 [MCP] Çalıştırılıyor: {name} | Argümanlar: {kwargs}")
+        
+        result = await mcp_rpc_call("tools/call", {"name": name, "arguments": kwargs})
+        
+        if isinstance(result, dict) and "content" in result:
+             text_content = []
+             for c in result["content"]:
+                 if c["type"] == "text":
+                     text_content.append(c["text"])
+             final = "\n".join(text_content)
+             log.success(f"✅ [MCP] {name} Sonucu: {final[:200]}...") # Logu boğmasın diye kısalttım
+             return final
+             
+        if isinstance(result, dict) and not "content" in result:
+            return str(result)
+            
+        return str(result)
+
+    return StructuredTool.from_function(
+        func=None,
+        coroutine=execution_wrapper,
+        name=name,
+        description=desc,
+        args_schema=DynamicSchema
+    )
+
+# --- LIFESPAN & APP ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(sse_listener_loop())
+    await asyncio.sleep(2) 
+    
+    log.info("🤝 Protokol Başlatılıyor (Initialize)...")
+    init_result = await mcp_rpc_call("initialize", {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": {"name": "Orchestrator", "version": "1.0"}
+    })
+    
+    if init_result:
+        log.success("✅ Protokol Onaylandı.")
+        # await mcp_rpc_call("notifications/initialized") 
+    else:
+        log.warning("⚠️ Initialize cevapsız kaldı, devam ediliyor.")
+
+    log.info("🛠️ Araçlar Yükleniyor...")
+    for t_def in MANUAL_TOOLS:
+        tool_obj = await create_dynamic_tool(t_def)
+        RUNTIME_TOOLS.append(tool_obj)
+        log.info(f"   -> {t_def['name']}")
+    
+    log.success(f"✅ {len(RUNTIME_TOOLS)} Araç Hazır.")
+    yield
+    task.cancel()
+    RUNTIME_TOOLS.clear()
+
+app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
+
 llm = ChatAnthropic(
-    model="claude-sonnet-4-5-20250929",  # Model ismi güncel kalsın
+    model="claude-sonnet-4-5-20250929", 
     temperature=0,
     api_key=settings.ANTHROPIC_API_KEY
 )
 
-SYSTEM_PROMPT = """Sen üst düzey bir Coğrafi Zeka Ajanısın (GeoIntel Agent).
+# --- SYSTEM PROMPT (BEYİN YIKAMA) ---
+SYSTEM_PROMPT = """
+Sen GeoIntel Ajanısın. Görevin kesin coğrafi verilerle planlama yapmak.
 
-GÖREVİN: Karmaşık coğrafi soruları, elindeki araçları (tools) birbirine bağlayarak çözmek.
-
-NASIL DÜŞÜNMELİSİN? (ReAct Mantığı):
-1. Kullanıcının isteğini anla.
-2. Hangi aracı kullanman gerektiğini planla.
-3. Aracı çalıştır.
-4. SONUCU KONTROL ET.
-   - Eğer sonuç başarılıysa: Cevabı ver.
-   - EĞER SONUÇ HATALIYSA (Örn: Rota bulunamadı): PES ETME. Nedenini düşün.
-     - "Acaba yer ismini koordinata mı çevirmeliyim?" diye sor.
-     - 'call_city_search' aracını kullanarak koordinatları bul.
-     - Sonra tekrar rota aracını dene.
-
-MEVCUT ARAÇLARIN:
-- call_city_weather: Koordinat ver, hava durumu versin.
-- call_city_search: Yer ismi ver, detayları (koordinat dahil) versin.
-- call_city_route: Başlangıç ve bitiş ver (MUTLAKA KOORDİNAT OLMALI), rota çizsin.
-
-ASLA "Yapamıyorum" deme. Hata alırsan strateji değiştir ve tekrar dene.
-Örnek: "Rize'den Trabzon'a git" -> Önce Rize ve Trabzon'un koordinatlarını bul, sonra rota çiz.
+KURALLAR:
+1. ASLA koordinat tahmini yapma veya halüsinasyon görme.
+2. Bir yere gitmek isteniyorsa, ÖNCE `search_infrastructure_osm` ile o yerin GERÇEK koordinatını bul.
+3. Ticari bir yer (restoran vb) aranıyorsa `search_places_google` kullan.
+4. Koordinatları bulduktan sonra `get_route_data` aracına 'enlem,boylam' formatında (virgülle) ver.
+5. "Yol üzeri" deniyorsa, rotanın varış noktasına yakın ilçeleri (Pazar, Çayeli vb.) referans alarak restoran ara.
+6. Rize Merkez Referans: 41.02, 40.52
 """
 
-# --- İSTEMCİ (TOOLS) ---
-
-@tool
-async def call_city_weather(lat: float, lon: float):
-    """
-    Verilen koordinatın (lat, lon) hava durumunu öğrenmek için BU ARACI KULLAN.
-    """
-    log.info(f"🌤️ [TOOL: WEATHER] Koordinat: {lat}, {lon}")
-    
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            response = await client.post(
-                f"{settings.MCP_CITY_URL}/get_weather", 
-                json={"lat": lat, "lon": lon}
-            )
-            response.raise_for_status()
-            log.success(f"✅ Hava durumu alındı.")
-            return response.text
-        except Exception as e:
-            log.error(f"❌ Hava durumu hatası: {e}")
-            return f"HATA: Şehir Ajanına ulaşılamadı: {e}"
-
-@tool
-async def call_city_search(query: str):
-    """Mekan aramak (otel, park, şehir merkezi vs) ve KOORDİNAT bulmak için kullanılır."""
-    log.info(f"🔍 [TOOL: SEARCH] Aranıyor: {query}")
-    
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            res = await client.post(
-                f"{settings.MCP_CITY_URL}/search_places_google", 
-                json={"query": query}
-            )
-            return res.json() if res.status_code == 200 else res.text
-        except Exception as e:
-            log.error(f"❌ Arama hatası: {e}")
-            return f"HATA: {e}"
-
-@tool
-async def call_city_route(origin: str, destination: str):
-    """
-    İki nokta arasına HERE MAPS ile rota çizer.
-    ÇOK ÖNEMLİ: 'origin' ve 'destination' parametreleri MUTLAKA 'Lat,Lon' formatında olmalıdır (Örn: "41.02,40.52").
-    ASLA ŞEHİR İSMİ GÖNDERME. Önce search ile koordinat bul.
-    """
-    log.info(f"🚗 [TOOL: ROUTE] Rota: {origin} -> {destination}")
-    
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            res = await client.post(
-                f"{settings.MCP_CITY_URL}/get_route_data", 
-                json={"origin": origin, "destination": destination}
-            )
-            if res.status_code == 200:
-                log.success("✅ Rota çizildi.")
-                return res.json()
-            else:
-                log.warning(f"⚠️ Rota hatası: {res.text}")
-                return res.text
-        except Exception as e:
-            log.error(f"❌ Rota bağlantı hatası: {e}")
-            return f"HATA: {e}"
-
-# --- LANGGRAPH KURULUMU ---
-
-tools = [call_city_weather, call_city_search, call_city_route]
-model_with_tools = llm.bind_tools(tools)
-
-class AgentState(TypedDict):
-    messages: Annotated[List[HumanMessage | AIMessage | SystemMessage], operator.add]
-
-def agent_node(state: AgentState):
-    messages = state["messages"]
-    
-    # Zaman Algısı Enjeksiyonu
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-    time_context = f"""
-    [ŞU ANKİ ZAMAN: {current_time}]
-    Cevaplarını bu saate göre ayarla. (Örn: 21:00 ise akşam olduğunu bil).
-    """
-    
-    # System Prompt Güncelleme
-    if isinstance(messages[0], SystemMessage):
-        # Eğer zaten varsa, zamanı güncellemek için eskisini alıp ekliyoruz
-        # (Basitçe her seferinde temiz system prompt + zaman veriyoruz)
-        messages[0] = SystemMessage(content=SYSTEM_PROMPT + "\n" + time_context)
-    else:
-        messages.insert(0, SystemMessage(content=SYSTEM_PROMPT + "\n" + time_context))
-        
-    log.info("🧠 LLM Düşünüyor...")
-    response = model_with_tools.invoke(messages)
-    return {"messages": [response]}
-
-tool_node = ToolNode(tools)
-
-# Grafik Akışı
-workflow = StateGraph(AgentState)
-workflow.add_node("agent", agent_node)
-workflow.add_node("tools", tool_node)
-
-workflow.set_entry_point("agent")
-
-def should_continue(state: AgentState):
-    last_message = state["messages"][-1]
-    if last_message.tool_calls:
-        log.info(f"🛠️ LLM Tool Çağırdı: {len(last_message.tool_calls)} adet")
-        return "tools"
-    return END
-
-workflow.add_conditional_edges("agent", should_continue)
-workflow.add_edge("tools", "agent")
-
-app_graph = workflow.compile()
-
-# --- API ENDPOINT ---
 class ChatRequest(BaseModel):
     message: str
-    history: Optional[List[str]] = []
 
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
-    log.info(f"💬 Yeni Mesaj: {request.message}")
+    if not RUNTIME_TOOLS: return {"error": "Araçlar yok."}
     
-    try:
-        inputs = {"messages": [HumanMessage(content=request.message)]}
-        final_state = await app_graph.ainvoke(inputs)
-        
-        last_msg = final_state["messages"][-1].content
-        log.success("✅ Cevap Hazır")
-        return {"response": last_msg}
-        
-    except Exception as e:
-        log.critical(f"🔥 Kritik Hata: {str(e)}")
-        return {"error": "Sistemde beklenmedik bir hata oluştu."}
+    model_with_tools = llm.bind_tools(RUNTIME_TOOLS)
+    tool_node = ToolNode(RUNTIME_TOOLS)
+    
+    class AgentState(TypedDict):
+        messages: Annotated[List[Any], operator.add]
 
-@app.get("/health")
-def health_check():
-    return {"status": "active", "service": "Orchestrator"}
+    def agent_node(state: AgentState):
+        msgs = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+        return {"messages": [model_with_tools.invoke(msgs)]}
+
+    def should_continue(state: AgentState):
+        return "tools" if state["messages"][-1].tool_calls else END
+
+    workflow = StateGraph(AgentState)
+    workflow.add_node("agent", agent_node)
+    workflow.add_node("tools", tool_node)
+    workflow.set_entry_point("agent")
+    workflow.add_conditional_edges("agent", should_continue)
+    workflow.add_edge("tools", "agent")
+    
+    final = await workflow.compile().ainvoke({"messages": [HumanMessage(content=request.message)]})
+    return {"response": final["messages"][-1].content}
