@@ -33,7 +33,7 @@ MANUAL_TOOLS = [
             "properties": {
                 "lat": {"type": "number", "description": "Merkez enlem"},
                 "lon": {"type": "number", "description": "Merkez boylam"},
-                "category": {"type": "string", "description": "Seçenekler: airport, park, square, mosque, hospital"}
+                "category": {"type": "string", "description": "ZORUNLU SEÇENEKLER: airport, park, square, mosque, hospital, school"}
             },
             "required": ["lat", "lon", "category"]
         }
@@ -234,12 +234,22 @@ SYSTEM_PROMPT = """
 Sen GeoIntel Ajanısın. Görevin kesin coğrafi verilerle planlama yapmak.
 
 KURALLAR:
-1. ASLA koordinat tahmini yapma veya halüsinasyon görme.
-2. Bir yere gitmek isteniyorsa, ÖNCE `search_infrastructure_osm` ile o yerin GERÇEK koordinatını bul.
-3. Ticari bir yer (restoran vb) aranıyorsa `search_places_google` kullan.
-4. Koordinatları bulduktan sonra `get_route_data` aracına 'enlem,boylam' formatında (virgülle) ver.
-5. "Yol üzeri" deniyorsa, rotanın varış noktasına yakın ilçeleri (Pazar, Çayeli vb.) referans alarak restoran ara.
-6. Rize Merkez Referans: 41.02, 40.52
+1. ASLA koordinat tahmini yapma.
+2. Kamusal alanlar (Havalimanı, Meydan, Okul, Cami) için `search_infrastructure_osm` kullan.
+   - DİKKAT: OSM için sadece şu kategorileri kullanabilirsin: 'airport', 'park', 'square', 'mosque', 'hospital', 'school'.
+   - "Kafe", "Restoran" gibi ticari yerleri OSM'de ARAMA.
+3. Ticari işletmeler (Restoran, Otel, Benzinlik) için `search_places_google` kullan.
+4. Rota hesapla (`get_route_data`).
+5. Rota sonucunda gelen `analiz_noktalari` (Başlangıç, Orta, Bitiş) için hava durumunu kontrol et (`get_weather`).
+6. ANALİZ YAP:
+   - Yolun ortasında yağmur veya kar var mı?
+   - Rüzgar hızı motorlu kurye için tehlikeli mi (>30 km/s)?
+7. SONUÇ SUNUMU:
+   - Eğer hava temizse: Rotayı ve restoranları öner.
+   - Eğer hava kötüyse: "⚠️ UYARI: Rota üzerinde 1 saat sonra yağış bekleniyor. Dikkatli olun veya şu alternatif saatte çıkın" gibi yorum ekle.
+
+ASLA sadece ham veriyi basma. Bir seyahat asistanı gibi davran.
+
 """
 
 class ChatRequest(BaseModel):

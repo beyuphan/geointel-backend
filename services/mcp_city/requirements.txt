@@ -6,4 +6,6 @@ httpx>=0.26.0
 polyline>=2.0.0
 pydantic-settings>=2.1.0
 python-dotenv>=1.0.0
-loguru>=0.7.0
+loguru>=0.7.
+ruff>=0.0.280
+flexpolyline>=0.1.0
