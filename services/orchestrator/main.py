@@ -243,7 +243,7 @@ SONUÇ SUNUMU: Cevabının en sonuna veya ilgili yerin yanına mutlaka **(Enlem,
 class ChatRequest(BaseModel):
     session_id: str = "default_session"  # EKLENDİ
     message: str
-
+    
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     if not RUNTIME_TOOLS: return {"error": "Araçlar yok."}
@@ -251,31 +251,26 @@ async def chat_endpoint(request: ChatRequest):
     model_with_tools = llm.bind_tools(RUNTIME_TOOLS)
     tool_node = ToolNode(RUNTIME_TOOLS)
     
-    # --- 1. GEÇMİŞİ REDIS'TEN ÇEK ---
-    history_msgs = []
+    # 1. GEÇMİŞİ REDIS'TEN YÜKLE
+    history = []
     if redis_client:
         try:
-            stored_history = redis_client.lrange(f"chat:{request.session_id}", 0, -1)
-            for item in stored_history:
-                msg_data = json.loads(item)
-                if msg_data["role"] == "user":
-                    history_msgs.append(HumanMessage(content=msg_data["content"]))
-                elif msg_data["role"] == "assistant":
-                    history_msgs.append(AIMessage(content=msg_data["content"]))
-        except Exception as e:
-            log.warning(f"Geçmiş çekilemedi: {e}")
+            stored = redis_client.lrange(f"chat:{request.session_id}", 0, -1)
+            for item in stored:
+                msg = json.loads(item)
+                if msg["role"] == "user": history.append(HumanMessage(content=msg["content"]))
+                elif msg["role"] == "assistant": history.append(AIMessage(content=msg["content"]))
+        except: pass
 
     class AgentState(TypedDict):
         messages: Annotated[List[Any], operator.add]
 
-    # --- 2. HAFIZAYI BEYNE ENJEKTE ET ---
     def agent_node(state: AgentState):
-        # System Prompt + REDIS GEÇMİŞİ + Şu anki mesaj
-        # Not: state["messages"] sadece bu request'teki yeni mesajı içerir.
-        msgs = [SystemMessage(content=SYSTEM_PROMPT)] + history_msgs + state["messages"]
+        msgs = [SystemMessage(content=SYSTEM_PROMPT)] + history + state["messages"]
         return {"messages": [model_with_tools.invoke(msgs)]}
 
     def should_continue(state: AgentState):
+        last_msg = state["messages"][-1]
         return "tools" if state["messages"][-1].tool_calls else END
 
     workflow = StateGraph(AgentState)
@@ -285,22 +280,32 @@ async def chat_endpoint(request: ChatRequest):
     workflow.add_conditional_edges("agent", should_continue)
     workflow.add_edge("tools", "agent")
     
-    # --- 3. ÇALIŞTIR ---
-    final = await workflow.compile().ainvoke({"messages": [HumanMessage(content=request.message)]})
-    final_response = final["messages"][-1].content
+    # 2. ÇALIŞTIR
+    final_state = await workflow.compile().ainvoke({"messages": [HumanMessage(content=request.message)]})
+    final_response = final_state["messages"][-1].content
 
-    # --- 4. GEÇMİŞİ KAYDET ---
+    # --- YENİ KISIM: ROTA POLYLINE VERİSİNİ ÇEK ---
+    route_polyline = None
+    if redis_client:
+        # Eğer bu turda 'get_route_data' aracı çalıştıysa, Redis'teki taze rotayı alalım
+        # Basitçe: Her zaman 'latest_route' keyine bakıyoruz.
+        try:
+            route_polyline = redis_client.get("latest_route")
+        except: pass
+    # ----------------------------------------------
+
+    # 3. YENİ MESAJLARI REDIS'E KAYDET
     if redis_client:
         try:
-            # User Message
             redis_client.rpush(f"chat:{request.session_id}", json.dumps({"role": "user", "content": request.message}))
-            # AI Response
             redis_client.rpush(f"chat:{request.session_id}", json.dumps({"role": "assistant", "content": final_response}))
-            # 24 Saat Sakla
             redis_client.expire(f"chat:{request.session_id}", 86400)
-            # Son 20 mesajı tut (Sliding Window)
             redis_client.ltrim(f"chat:{request.session_id}", -20, -1)
         except Exception as e:
             log.warning(f"Geçmiş kaydedilemedi: {e}")
 
-    return {"response": final_response}
+    # JSON cevabına 'route_polyline' ekledik
+    return {
+        "response": final_response, 
+        "route_polyline": route_polyline 
+    }

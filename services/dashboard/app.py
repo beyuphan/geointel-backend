@@ -4,6 +4,7 @@ import os
 import folium
 from streamlit_folium import st_folium
 import re
+import flexpolyline  # Rota kodunu çözmek için lazım
 
 # --- AYARLAR ---
 st.set_page_config(
@@ -32,15 +33,14 @@ if "session_id" not in st.session_state:
     st.session_state.session_id = f"user_{uuid.uuid4().hex[:8]}"
 if "last_coords" not in st.session_state:
     st.session_state.last_coords = [41.0082, 28.9784] # Default: İstanbul
+if "current_route" not in st.session_state:
+    st.session_state.current_route = None # Rotayı tutmak için
 
-# --- KOORDİNAT YAKALAYICI (Geliştirildi) ---
+# --- YARDIMCI FONKSİYONLAR ---
 def extract_coordinates(text):
-    # Hem "41.0, 29.0" hem de "(41.0, 29.0)" formatını yakalar
     pattern = r"\(?(\d{1,2}\.\d+),\s*(\d{1,3}\.\d+)\)?"
     matches = re.findall(pattern, text)
-    if matches:
-        # Son bulunan koordinatı al (Genelde sonuç en sondadır)
-        return [float(matches[-1][0]), float(matches[-1][1])]
+    if matches: return [float(matches[-1][0]), float(matches[-1][1])]
     return None
 
 def send_message(prompt):
@@ -48,10 +48,10 @@ def send_message(prompt):
         payload = {"session_id": st.session_state.session_id, "message": prompt}
         response = httpx.post(f"{ORCHESTRATOR_URL}/chat", json=payload, timeout=90.0)
         if response.status_code == 200:
-            return response.json().get("response", "⚠️ Cevap yok.")
-        return f"❌ Hata ({response.status_code})"
+            return response.json() # Tüm JSON'ı dönüyoruz (polyline için)
+        return {"response": f"❌ Hata ({response.status_code})"}
     except Exception as e:
-        return f"🔥 Bağlantı Hatası: {str(e)}"
+        return {"response": f"🔥 Bağlantı Hatası: {str(e)}"}
 
 # --- ARAYÜZ ---
 col1, col2 = st.columns([1, 1], gap="medium")
@@ -62,8 +62,7 @@ with col1:
     
     container = st.container(height=600, border=False)
     with container:
-        if not st.session_state.messages:
-            st.info("Sistem Hazır. Görev bekliyorum...")
+        if not st.session_state.messages: st.info("Sistem Hazır. Görev bekliyorum...")
         
         for message in st.session_state.messages:
             with st.chat_message(message["role"], avatar="🧑‍💻" if message["role"] == "user" else "🤖"):
@@ -75,26 +74,51 @@ with col1:
             with st.chat_message("user", avatar="🧑‍💻"): st.markdown(prompt)
             with st.chat_message("assistant", avatar="🤖"):
                 with st.spinner("Veriler işleniyor..."):
-                    response_text = send_message(prompt)
+                    api_result = send_message(prompt)
+                    response_text = api_result.get("response", "")
+                    route_poly = api_result.get("route_polyline")
+                    
                     st.markdown(response_text)
         
         st.session_state.messages.append({"role": "assistant", "content": response_text})
         
-        # Koordinat varsa güncelle
+        # 1. Koordinat Güncelleme
         coords = extract_coordinates(response_text)
         if coords:
             st.session_state.last_coords = coords
-            st.toast(f"📍 Rota Güncellendi: {coords}", icon="🚀")
+        
+        # 2. Rota Güncelleme (Varsa)
+        if route_poly and route_poly != "LATEST":
+            try:
+                # Flexpolyline decode ([(lat, lon), ...])
+                decoded_route = flexpolyline.decode(route_poly)
+                st.session_state.current_route = decoded_route
+                st.toast("🛣️ Yeni Rota Çizildi!", icon="🚗")
+            except Exception as e:
+                print(f"Rota hatası: {e}")
 
 with col2:
-    st.subheader("🗺️ Uydu Haritası")
-    # TEMA DEĞİŞTİ: OpenStreetMap (Renkli ve Aydınlık)
+    st.subheader("🗺️ Taktik Harita")
     m = folium.Map(location=st.session_state.last_coords, zoom_start=13, tiles="OpenStreetMap")
     
+    # Hedef Marker
     folium.Marker(
         st.session_state.last_coords,
         popup="Hedef",
         icon=folium.Icon(color="red", icon="info-sign")
     ).add_to(m)
+    
+    # Rota Çizgisi (Varsa)
+    if st.session_state.current_route:
+        folium.PolyLine(
+            st.session_state.current_route,
+            color="blue",
+            weight=5,
+            opacity=0.8,
+            tooltip="Ana Güzergah"
+        ).add_to(m)
+        
+        # Haritayı rotaya sığdır
+        m.fit_bounds(st.session_state.current_route)
     
     st_folium(m, width="100%", height=700)
