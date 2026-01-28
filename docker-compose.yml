@@ -85,7 +85,19 @@ services:
     command: tail -f /dev/null
     networks:
       - geo_net
-
+  geo_dashboard:
+    build: ./services/dashboard
+    container_name: geo_dashboard
+    ports:
+      - "8501:8501"  # Tarayıcıdan erişmek için
+    environment:
+      - ORCHESTRATOR_URL=http://geo_brain:8000
+    volumes:
+      - ./services/dashboard:/app
+    networks:
+      - geo_net
+    depends_on:
+      - orchestrator
 networks:
   geo_net:
     driver: bridge

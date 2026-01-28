@@ -231,6 +231,12 @@ ROTA ÜZERİ ARAMA KURALI:
 
 HAFIZA KURALI:
 - Kullanıcı "Orayı kaydet" veya "Bahsettiğin yer" derse, geçmiş mesajlardaki mekan bilgilerini ve koordinatlarını hatırla.
+
+
+
+SONUÇ SUNUMU: Cevabının en sonuna veya ilgili yerin yanına mutlaka **(Enlem, Boylam)** formatında koordinatı yaz. 
+ Örn: "Rize Havalimanı (41.1803, 40.9950) konumuna gidiyoruz."
+ Bunu yazmazsan harita güncellenmez!
 """
 
 # --- GÜNCELLENEN REQUEST MODELİ (Session ID Eklendi) ---
