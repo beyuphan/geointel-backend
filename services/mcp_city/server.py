@@ -16,9 +16,9 @@ async def search_infrastructure_osm(lat: float, lon: float, category: str) -> li
     return await search_infrastructure_osm_handler(lat, lon, category)
 
 @mcp.tool()
-async def search_places_google(query: str, lat: float = None, lon: float = None) -> list:
-    """Ticari mekanları (Restoran, Kafe) Google'dan bulur."""
-    return await search_places_google_handler(query, lat, lon)
+async def search_places_google(query: str, lat: float = None, lon: float = None, route_polyline: str = None) -> list:
+    """Ticari mekanları bulur. Eğer 'route_polyline' verilirse SADECE rota üzerindekileri getirir."""
+    return await search_places_google_handler(query, lat, lon, route_polyline)
 
 @mcp.tool()
 async def get_route_data(origin: str, destination: str) -> dict:

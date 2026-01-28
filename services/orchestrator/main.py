@@ -41,15 +41,16 @@ MANUAL_TOOLS = [
     # ... (search_places_google, get_route_data vs. AYNI KALSIN) ...
     {
         "name": "search_places_google",
-        "description": "TİCARİ İŞLETMELERİ (Restoran, Kafe) bulur.",
+        "description": "Ticari mekanları arar. Rota üzeri arama için 'route_polyline' parametresini kullan.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
                 "lat": {"type": "number"},
-                "lon": {"type": "number"}
-            },
-            "required": ["query"]
+                "lon": {"type": "number"},
+                # YENİ PARAMETRE
+                "route_polyline": {"type": "string", "description": "get_route_data aracından dönen 'polyline_encoded' verisi."}
+            }
         }
     },
     {
@@ -249,7 +250,10 @@ KURALLAR:
    - Eğer hava kötüyse: "⚠️ UYARI: Rota üzerinde 1 saat sonra yağış bekleniyor. Dikkatli olun veya şu alternatif saatte çıkın" gibi yorum ekle.
 
 ASLA sadece ham veriyi basma. Bir seyahat asistanı gibi davran.
-
+ROTA ÜZERİ ARAMA KURALI:
+1. Önce `get_route_data` çalışır. Bu işlem rotayı otomatik olarak veritabanına (Redis) kaydeder.
+2. Ardından `search_places_google` kullanırken, `route_polyline` parametresine sadece "LATEST" yaz.
+3. ASLA o uzun karmaşık karakter dizisini kopyalayıp yapıştırmaya çalışma, hata oluşur.
 """
 
 class ChatRequest(BaseModel):

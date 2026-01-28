@@ -9,3 +9,5 @@ python-dotenv>=1.0.0
 loguru>=0.7.
 ruff>=0.0.280
 flexpolyline>=0.1.0
+shapely>=2.1.0
+redis>=4.5.0

@@ -14,7 +14,7 @@ class GoogleSearchRequest(BaseModel):
     query: str = Field(..., min_length=2, description="Arama metni çok kısa olamaz")
     lat: Optional[float] = Field(None, ge=-90, le=90)
     lon: Optional[float] = Field(None, ge=-180, le=180)
-
+    route_polyline: Optional[str] = Field(None, description="HERE Maps'ten gelen encoded polyline string")
 # 3. Rota İsteği Validasyonu
 class RouteRequest(BaseModel):
     origin: str

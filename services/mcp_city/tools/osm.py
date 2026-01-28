@@ -1,62 +1,53 @@
+# services/mcp_city/tools/osm.py
 import httpx
 from logger import log
 from .config import settings
 from .models import OSMRequest
 
 async def search_infrastructure_osm_handler(lat: float, lon: float, category: str) -> list:
-    """
-    OpenStreetMap (Overpass API) kullanarak altyapı araması yapar.
-    """
     try:
-        # 1. Pydantic ile Validasyon (Gizli Koruma)
-        # Gelen veri hatalıysa burada patlar ve except bloğuna düşer
         req = OSMRequest(lat=lat, lon=lon, category=category)
-
-        # 2. Havalimanı ise çapı büyüt (Config'den değil mantıktan gelir)
         radius = 50000 if req.category == "airport" else req.radius
-        
-        log.info(f"🌍 [OSM] Taranıyor: {req.category} ({req.lat}, {req.lon}) - Çap: {radius}m")
-
-        # 3. Config'den Tag Map'i çek
         tags = settings.OSM_TAG_MAP.get(req.category)
-        if not tags:
-            return [{"error": f"Bilinmeyen kategori: {req.category}"}]
-
-        # 4. Overpass Sorgusu Hazırla
+        
         filters = "".join([f'nwr[{t}](around:{radius},{req.lat},{req.lon});' for t in tags])
-        query = f"""
-        [out:json][timeout:25];
-        (
-          {filters}
-        );
-        out center 5;
-        """
+        query = f"[out:json][timeout:15];({filters});out center 5;" # Timeout'u kıstım, hızlı pes etsin
 
-        # 5. İsteği At
+        # --- FALLBACK MEKANİZMASI ---
         async with httpx.AsyncClient() as client:
-            resp = await client.post(settings.OVERPASS_URL, data=query)
+            last_error = None
             
-            if resp.status_code != 200:
-                log.error(f"OSM Hatası: {resp.status_code}")
-                return [{"error": f"OSM Sunucu Hatası: {resp.status_code}"}]
+            for url in settings.OVERPASS_URLS: # Listeyi geziyoruz
+                try:
+                    log.info(f"🌍 [OSM] Deneniyor: {url}")
+                    resp = await client.post(url, data=query)
+                    
+                    if resp.status_code == 200:
+                        # Başarılı oldu, veriyi işle ve döngüyü kır
+                        places = []
+                        for el in resp.json().get("elements", []):
+                            tags = el.get("tags", {})
+                            name = tags.get("name") or tags.get("name:tr")
+                            if not name: continue
+                            places.append({
+                                "isim": name,
+                                "kategori": req.category,
+                                "lat": el.get("lat") or el.get("center", {}).get("lat"),
+                                "lon": el.get("lon") or el.get("center", {}).get("lon")
+                            })
+                        log.success(f"✅ [OSM] Başarılı ({url}) - {len(places)} yer.")
+                        return places[:5]
+                    
+                    else:
+                        log.warning(f"⚠️ [OSM] Hata ({resp.status_code}) - Sıradakine geçiliyor...")
+                        last_error = f"HTTP {resp.status_code}"
+
+                except Exception as e:
+                    log.warning(f"⚠️ [OSM] Bağlantı Hatası: {e} - Sıradakine geçiliyor...")
+                    last_error = str(e)
             
-            # 6. Veriyi Parse Et
-            places = []
-            for el in resp.json().get("elements", []):
-                tags = el.get("tags", {})
-                name = tags.get("name") or tags.get("name:tr") or tags.get("name:en")
-                if not name: continue
-                
-                places.append({
-                    "isim": name,
-                    "kategori": req.category,
-                    "lat": el.get("lat") or el.get("center", {}).get("lat"),
-                    "lon": el.get("lon") or el.get("center", {}).get("lon")
-                })
-            
-            log.success(f"✅ [OSM] {len(places)} yer bulundu.")
-            return places[:3]
+            # Buraya geldiysek tüm URL'ler patlamıştır
+            return [{"error": f"Tüm OSM sunucuları yanıt vermedi. Son hata: {last_error}"}]
 
     except Exception as e:
-        log.error(f"OSM Handler Hatası: {e}")
         return [{"error": str(e)}]

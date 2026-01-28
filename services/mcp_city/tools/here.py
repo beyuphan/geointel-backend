@@ -3,6 +3,8 @@ import flexpolyline
 from logger import log
 from .config import settings
 from .models import RouteRequest
+# REDIS STORE'U ÇAĞIRIYORUZ
+from .cache import redis_store
 
 # YARDIMCI FONKSİYON: Koordinatın Adını Bul
 async def get_location_name(lat, lon):
@@ -23,7 +25,7 @@ async def get_location_name(lat, lon):
     return "Bilinmeyen Konum"
 
 async def get_route_data_handler(origin: str, destination: str) -> dict:
-    """HERE Maps API ile rota ve GEOMETRİ hesaplar."""
+    """HERE Maps API ile rota hesaplar ve REDIS'E KAYDEDER."""
     try:
         req = RouteRequest(origin=origin, destination=destination)
         
@@ -44,26 +46,31 @@ async def get_route_data_handler(origin: str, destination: str) -> dict:
                 summary = section["summary"]
                 encoded_polyline = section["polyline"]
                 
-                # Koordinatları çöz
+                # --- REDIS KAYDI ---
+                # Uzun stringi Redis'e atıyoruz, 1 saat saklasın
+                redis_store.set_route(encoded_polyline)
+                log.info("💾 Rota başarıyla REDIS'e önbelleklendi.")
+                
+                # Koordinatları çöz (Orta nokta hesabı için)
                 decoded_coords = list(flexpolyline.decode(encoded_polyline))
                 
                 # Orta noktayı al
                 mid_point = decoded_coords[len(decoded_coords) // 2]
-                
-                # BURADA GOOGLE'A SORUYORUZ: "Bu orta nokta neresi?"
                 mid_point_name = await get_location_name(mid_point[0], mid_point[1])
 
                 check_points = {
                     "baslangic": {"coords": decoded_coords[0], "ad": "Başlangıç"},
-                    "orta_nokta": {"coords": mid_point, "ad": mid_point_name}, # <-- ARTIK ADINI BİLİYORUZ
+                    "orta_nokta": {"coords": mid_point, "ad": mid_point_name},
                     "bitis": {"coords": decoded_coords[-1], "ad": "Bitiş"}
                 }
 
                 return {
                     "mesafe_km": round(summary["length"] / 1000, 2),
                     "sure_dk": round(summary["duration"] / 60, 0),
-                    "analiz_noktalari": check_points, # Orchestrator artık ismi görüp sallamayacak
-                    "polyline_encoded": encoded_polyline
+                    "analiz_noktalari": check_points,
+                    # LLM'e uzun stringi göndermiyoruz, "LATEST" diyoruz.
+                    # Böylece LLM Google tool'unu çağırırken "LATEST" yazacak.
+                    "polyline_encoded": "LATEST" 
                 }
             
             return {"error": "Rota bulunamadı"}
