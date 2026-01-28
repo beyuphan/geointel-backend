@@ -29,7 +29,7 @@ jobs:
         python -m pip install --upgrade pip
         # DÜZELTME: Buraya 'fastmcp' ve 'python-dotenv' ekledim.
         # Ayrıca Orchestrator bağımlılıkları (langchain vs) lazım olabilir diye onları da ekliyorum.
-        pip install  pytest pytest-asyncio httpx asyncpg pydantic pydantic-settings fastapi uvicorn polyline loguru fastmcp python-dotenv langchain-anthropic langchain-core langgraph
+        pip install  pytest pytest-asyncio httpx asyncpg pydantic pydantic-settings fastapi uvicorn polyline loguru fastmcp python-dotenv langchain-anthropic langchain-core langgraph flexpolyline shapely redis
 
     - name: Yollar Tanımlanıyor
       run: |
