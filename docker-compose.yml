@@ -78,13 +78,19 @@ services:
     networks:
       - geo_net
 
-  # 6. İSTİHBARAT AJANI (MCP INTEL - İleride kodlayacağız)
+  # 6. İSTİHBARAT AJANI (MCP INTEL)
   mcp_intel:
-    image: python:3.11-slim
+    build: 
+      context: ./services/mcp_intel
+      dockerfile: Dockerfile
     container_name: geo_mcp_intel
-    command: tail -f /dev/null
+    ports:
+      - "8001:8001" # Dışarıdan test etmek istersen diye
     networks:
       - geo_net
+
+
+  # 6. arayüz AJANI
   geo_dashboard:
     build: ./services/dashboard
     container_name: geo_dashboard

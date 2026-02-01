@@ -2,113 +2,142 @@ import operator
 import httpx
 import json
 import asyncio
-import redis  # <--- EKLENDİ
+import redis
+import os
 from datetime import datetime
 from typing import TypedDict, Annotated, List, Any, Dict
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, create_model
 
-from langchain_anthropic import ChatAnthropic
+# --- MODÜLER İMPORTLAR (JİLET GİBİ OLDU) ---
+from profile_manager import ProfileManager          # Hafıza Yöneticisi
+from tools import MANUAL_TOOLS                      # Araç Tanımları
+from prompt_manager import get_dynamic_system_prompt # Zeka/Prompt Yöneticisi
+
+# --- LANGCHAIN ---
+from langchain_openai import ChatOpenAI 
+# (Eğer Claude kullanıyorsan: from langchain_anthropic import ChatAnthropic)
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import StructuredTool
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 
-from config import settings
-from logger import log
+from loguru import logger as log
+
+# --- AYARLAR ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+CITY_AGENT_URL = "http://geo_mcp_city:8000"
+INTEL_AGENT_URL = "http://geo_mcp_intel:8001"
+REDIS_HOST = "geo_redis"
 
 # --- GLOBAL DURUM ---
 RUNTIME_TOOLS = []
-MCP_SESSION_URL = None
+MCP_SESSIONS: Dict[str, str] = {}
 PENDING_REQUESTS: Dict[str, asyncio.Future] = {}
 
-# --- REDIS AYARLARI (EKLENDİ) ---
-# Senin kod yapını bozmadan sadece hafıza bağlantısını ekledim
-REDIS_HOST = "geo_redis"
-REDIS_PORT = 6379
+# --- REDIS KURULUMU ---
 try:
-    redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
+    redis_client = redis.Redis(host=REDIS_HOST, port=6379, db=0, decode_responses=True)
     redis_client.ping()
     log.success("✅ [Orchestrator] Redis Hafızası Aktif")
 except Exception as e:
     log.error(f"❌ [Orchestrator] Redis Hatası: {e}")
     redis_client = None
 
-# --- MANUEL TOOL TANIMLARI ---
-MANUAL_TOOLS = [
-    {
-        "name": "search_infrastructure_osm",
-        "description": "KAMUSAL ALANLARI (Havalimanı, Meydan) bulur. Koordinat tespiti için İLK BUNU KULLAN.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "lat": {"type": "number", "description": "Merkez enlem"},
-                "lon": {"type": "number", "description": "Merkez boylam"},
-                "category": {"type": "string", "description": "ZORUNLU SEÇENEKLER: airport, park, square, mosque, hospital, school"}
-            },
-            "required": ["lat", "lon", "category"]
-        }
-    },
-    {
-        "name": "search_places_google",
-        "description": "Ticari mekanları arar. Rota üzeri arama için 'route_polyline' parametresini kullan.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "lat": {"type": "number"},
-                "lon": {"type": "number"},
-                "route_polyline": {"type": "string", "description": "get_route_data aracından dönen 'polyline_encoded' verisi."}
-            }
-        }
-    },
-    {
-        "name": "get_route_data",
-        "description": "İki koordinat arası rota. Sadece 'lat,lon' formatında veri gir.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "origin": {"type": "string"},
-                "destination": {"type": "string"}
-            },
-            "required": ["origin", "destination"]
-        }
-    },
-    {
-        "name": "get_weather",
-        "description": "Hava durumu.",
-        "inputSchema": {"type": "object", "properties": {"lat": {"type": "number"}, "lon": {"type": "number"}}, "required": ["lat", "lon"]}
-    },
-    {
-        "name": "save_location",
-        "description": "Kaydet.",
-        "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "lat": {"type": "number"}, "lon": {"type": "number"}, "category": {"type": "string"}, "note": {"type": "string"}}, "required": ["name", "lat", "lon"]}
-    }
-]
+# --- TOOL ROUTER (YÖNLENDİRİCİ) ---
+TOOL_ROUTER = {
+    # CITY
+    "search_infrastructure_osm": "city",
+    "search_places_google": "city",
+    "get_route_data": "city",
+    "get_weather": "city",
+    "save_location": "city",
+    # INTEL
+    "get_pharmacies": "intel",
+    "get_fuel_prices": "intel",
+    "get_city_events": "intel",
+    "get_sports_events": "intel",
+    # LOCAL
+    "remember_info": "orchestrator",  
+}
 
-# --- SSE DINLEYICI (SENİN ORİJİNAL KODUN) ---
-async def sse_listener_loop():
-    global MCP_SESSION_URL
-    base_url = f"{settings.MCP_CITY_URL}/sse"
-    log.info(f"🎧 SSE Dinleniyor: {base_url}")
+# --- RPC ÇAĞRISI (SAĞLAM BAĞLANTI MANTIĞI) ---
+async def mcp_rpc_call(service_name: str, method: str, params: dict = None):
+    # Session ID bekleme döngüsü
+    for _ in range(20): 
+        if MCP_SESSIONS.get(service_name): break
+        await asyncio.sleep(0.5)
+    
+    session_url = MCP_SESSIONS.get(service_name)
+    if not session_url: return f"Hata: {service_name.upper()} Ajanı çevrimdışı."
 
+    req_id = str(int(datetime.now().timestamp() * 1000))
+    json_id = int(req_id)
+    
+    payload = {"jsonrpc": "2.0", "method": method, "params": params or {}, "id": json_id}
+    
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    PENDING_REQUESTS[req_id] = future
+    
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            await client.post(session_url, json=payload)
+            response_data = await asyncio.wait_for(future, timeout=80.0)
+            
+            if "error" in response_data:
+                err = response_data["error"]
+                log.error(f"❌ RPC Hata ({service_name}): {err}")
+                return f"Hata: {err}"
+            
+            # MCP sonucunu temizle
+            result = response_data.get("result")
+            if isinstance(result, dict) and "content" in result:
+                 # İçerik varsa text kısmını al
+                content_list = result["content"]
+                if isinstance(content_list, list) and content_list:
+                    return content_list[0].get("text", str(content_list))
+            return result
+
+    except asyncio.TimeoutError:
+        return "Timeout (Servis geç yanıt verdi)"
+    except Exception as e:
+        return f"RPC Exception: {e}"
+    finally:
+        if req_id in PENDING_REQUESTS: del PENDING_REQUESTS[req_id]
+
+# --- SSE LISTENER (OTOMATİK BAĞLANMA) ---
+async def sse_listener_loop(service_name: str, base_url: str):
+    log.info(f"🎧 [{service_name.upper()}] SSE Dinleniyor: {base_url}")
     async with httpx.AsyncClient(timeout=None) as client:
         try:
             async with client.stream("GET", base_url) as response:
                 async for line in response.aiter_lines():
                     if not line: continue
                     if line.startswith("event: endpoint"): continue
-
+                    
                     if line.startswith("data: "):
                         data_str = line.replace("data: ", "").strip()
+                        
+                        # 1. Session URL Yakalama
                         if data_str.startswith("/") or "http" in data_str:
-                            final_url = f"{settings.MCP_CITY_URL}{data_str}" if data_str.startswith("/") else data_str
-                            MCP_SESSION_URL = final_url
-                            log.success(f"✅ Kanal Açık: {MCP_SESSION_URL}")
+                            root = base_url.replace("/sse", "")
+                            final_url = f"{root}{data_str}" if data_str.startswith("/") else data_str
+                            MCP_SESSIONS[service_name] = final_url
+                            log.success(f"✅ [{service_name.upper()}] Kanal Açık: {final_url}")
+                            
+                            # Init Gönder
+                            asyncio.create_task(mcp_rpc_call(service_name, "initialize", {
+                                "protocolVersion": "2024-11-05", 
+                                "capabilities": {}, 
+                                "clientInfo": {"name": "Orchestrator", "version": "1.0"}
+                            }))
                             continue
 
+                        # 2. RPC Cevabı Yakalama
                         if data_str.startswith("{"):
                             try:
                                 msg = json.loads(data_str)
@@ -116,44 +145,12 @@ async def sse_listener_loop():
                                     req_id = str(msg["id"])
                                     if req_id in PENDING_REQUESTS:
                                         future = PENDING_REQUESTS[req_id]
-                                        if not future.done():
-                                            future.set_result(msg)
+                                        if not future.done(): future.set_result(msg)
                             except: pass
         except Exception as e:
-            log.error(f"🔥 SSE Koptu: {e}")
+            log.error(f"🔥 [{service_name.upper()}] SSE Koptu: {e}")
             await asyncio.sleep(3)
-            asyncio.create_task(sse_listener_loop())
-
-# --- RPC ÇAĞRISI (SENİN ORİJİNAL KODUN) ---
-async def mcp_rpc_call(method: str, params: dict = None):
-    for _ in range(20): 
-        if MCP_SESSION_URL: break
-        await asyncio.sleep(0.5)
-    
-    if not MCP_SESSION_URL: return "Hata: Kanal yok."
-
-    req_id = str(int(datetime.now().timestamp() * 1000))
-    payload = {"jsonrpc": "2.0", "method": method, "params": params or {}, "id": int(req_id)}
-    
-    loop = asyncio.get_running_loop()
-    future = loop.create_future()
-    PENDING_REQUESTS[req_id] = future
-    
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            await client.post(MCP_SESSION_URL, json=payload)
-            response_data = await asyncio.wait_for(future, timeout=20.0)
-            if "error" in response_data:
-                err = response_data["error"]
-                log.error(f"❌ RPC Hata: {err}")
-                return f"Hata: {err}"
-            return response_data.get("result")
-    except asyncio.TimeoutError:
-        return "Timeout"
-    except Exception as e:
-        return f"RPC Exception: {e}"
-    finally:
-        if req_id in PENDING_REQUESTS: del PENDING_REQUESTS[req_id]
+            asyncio.create_task(sse_listener_loop(service_name, base_url))
 
 # --- TOOL WRAPPER ---
 async def create_dynamic_tool(tool_def: dict):
@@ -164,16 +161,20 @@ async def create_dynamic_tool(tool_def: dict):
     DynamicSchema = create_model(f"{name}_Schema", **fields)
 
     async def execution_wrapper(**kwargs):
-        log.info(f"🚀 [MCP] Çalıştırılıyor: {name} | Argümanlar: {kwargs}")
-        result = await mcp_rpc_call("tools/call", {"name": name, "arguments": kwargs})
+        target_service = TOOL_ROUTER.get(name)
         
-        # Sonucu stringe çevir (LangGraph uyumu için)
-        if isinstance(result, dict) and "content" in result:
-             text_content = [c["text"] for c in result["content"] if c["type"] == "text"]
-             final = "\n".join(text_content)
-             log.success(f"✅ [MCP] {name} Sonucu: {final[:200]}...")
-             return final
-        return str(result)
+        # Yerel (Orchestrator) Araçları
+        if target_service == "orchestrator":
+            if name == "remember_info":
+                return await ProfileManager.update_memory(kwargs.get("category"), kwargs.get("value"))
+            return "Bilinmeyen yerel araç."
+        
+        # Uzak (City/Intel) Araçları
+        if not target_service:
+            return f"Hata: '{name}' aracı yönlendirilmemiş."
+
+        log.info(f"🚀 [MCP -> {target_service.upper()}] {name} Args: {kwargs}")
+        return await mcp_rpc_call(target_service, "tools/call", {"name": name, "arguments": kwargs})
 
     return StructuredTool.from_function(
         func=None, coroutine=execution_wrapper, name=name, description=desc, args_schema=DynamicSchema
@@ -182,76 +183,49 @@ async def create_dynamic_tool(tool_def: dict):
 # --- LIFESPAN ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(sse_listener_loop())
+    # Dinleyicileri başlat
+    asyncio.create_task(sse_listener_loop("city", f"{CITY_AGENT_URL}/sse"))
+    asyncio.create_task(sse_listener_loop("intel", f"{INTEL_AGENT_URL}/sse"))
+    
     await asyncio.sleep(2) 
     
-    log.info("🤝 Protokol Başlatılıyor (Initialize)...")
-    init_result = await mcp_rpc_call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "Orchestrator", "version": "1.0"}})
-    
-    if init_result: log.success("✅ Protokol Onaylandı.")
-    else: log.warning("⚠️ Initialize cevapsız kaldı.")
-
     log.info("🛠️ Araçlar Yükleniyor...")
+    # MANUAL_TOOLS artık tools.py'den geliyor!
     for t_def in MANUAL_TOOLS:
         tool_obj = await create_dynamic_tool(t_def)
         RUNTIME_TOOLS.append(tool_obj)
     
     log.success(f"✅ {len(RUNTIME_TOOLS)} Araç Hazır.")
     yield
-    task.cancel()
     RUNTIME_TOOLS.clear()
 
-app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
+app = FastAPI(title="GeoIntel Orchestrator", lifespan=lifespan)
 
-# --- SENİN MODEL AYARLARIN (DOKUNMADIM) ---
-llm = ChatAnthropic(
-    model="claude-sonnet-4-5-20250929", 
-    temperature=0,
-    api_key=settings.ANTHROPIC_API_KEY
-)
+# --- LLM AYARLARI ---
+# Eğer Claude kullanıyorsan burayı ChatAnthropic yapabilirsin
+llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
 
-SYSTEM_PROMPT = """
-Sen GeoIntel Ajanısın. Görevin kesin coğrafi verilerle planlama yapmak.
-
-KURALLAR:
-1. ASLA koordinat tahmini yapma.
-2. Kamusal alanlar (Havalimanı, Meydan, Okul, Cami) için `search_infrastructure_osm` kullan.
-   - OSM kategorileri: 'airport', 'park', 'square', 'mosque', 'hospital', 'school'.
-3. Ticari işletmeler için `search_places_google` kullan.
-4. Rota hesapla (`get_route_data`).
-5. Rota sonucunda gelen `analiz_noktalari` için `get_weather` kontrolü yap.
-6. ANALİZ YAP: Yağmur, kar, rüzgar uyarısı ver.
-
-ASLA sadece ham veriyi basma. Bir seyahat asistanı gibi davran.
-
-ROTA ÜZERİ ARAMA KURALI:
-1. `get_route_data` çalışınca rota Redis'e kaydolur.
-2. `search_places_google` için `route_polyline` parametresine sadece "LATEST" yaz.
-3. Uzun polyline stringi kopyalama.
-
-HAFIZA KURALI:
-- Kullanıcı "Orayı kaydet" veya "Bahsettiğin yer" derse, geçmiş mesajlardaki mekan bilgilerini ve koordinatlarını hatırla.
-
-
-
-SONUÇ SUNUMU: Cevabının en sonuna veya ilgili yerin yanına mutlaka **(Enlem, Boylam)** formatında koordinatı yaz. 
- Örn: "Rize Havalimanı (41.1803, 40.9950) konumuna gidiyoruz."
- Bunu yazmazsan harita güncellenmez!
-"""
-
-# --- GÜNCELLENEN REQUEST MODELİ (Session ID Eklendi) ---
 class ChatRequest(BaseModel):
-    session_id: str = "default_session"  # EKLENDİ
+    session_id: str = "default_session"
     message: str
-    
+
+# --- CHAT ENDPOINT (MODÜLER) ---
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
-    if not RUNTIME_TOOLS: return {"error": "Araçlar yok."}
+    if not RUNTIME_TOOLS: return {"error": "Araçlar yüklenmedi."}
     
+    # 1. Profil Yöneticisinden Veriyi Çek
+    user_context_str = await ProfileManager.get_user_context("test_pilot")
+    
+    # 2. Prompt Yöneticisinden Dinamik Promptu Al
+    # (Burada kod kısalıyor, mantık prompt_manager.py içinde)
+    dynamic_prompt = get_dynamic_system_prompt(user_context_str, request.message)
+    
+    # 3. Model Bağlama
     model_with_tools = llm.bind_tools(RUNTIME_TOOLS)
     tool_node = ToolNode(RUNTIME_TOOLS)
     
-    # 1. GEÇMİŞİ REDIS'TEN YÜKLE
+    # 4. Geçmiş Yükle
     history = []
     if redis_client:
         try:
@@ -262,15 +236,15 @@ async def chat_endpoint(request: ChatRequest):
                 elif msg["role"] == "assistant": history.append(AIMessage(content=msg["content"]))
         except: pass
 
+    # 5. Graph
     class AgentState(TypedDict):
         messages: Annotated[List[Any], operator.add]
 
     def agent_node(state: AgentState):
-        msgs = [SystemMessage(content=SYSTEM_PROMPT)] + history + state["messages"]
+        msgs = [SystemMessage(content=dynamic_prompt)] + history + state["messages"]
         return {"messages": [model_with_tools.invoke(msgs)]}
 
     def should_continue(state: AgentState):
-        last_msg = state["messages"][-1]
         return "tools" if state["messages"][-1].tool_calls else END
 
     workflow = StateGraph(AgentState)
@@ -280,31 +254,20 @@ async def chat_endpoint(request: ChatRequest):
     workflow.add_conditional_edges("agent", should_continue)
     workflow.add_edge("tools", "agent")
     
-    # 2. ÇALIŞTIR
+    # 6. Çalıştır
     final_state = await workflow.compile().ainvoke({"messages": [HumanMessage(content=request.message)]})
     final_response = final_state["messages"][-1].content
 
-    # --- YENİ KISIM: ROTA POLYLINE VERİSİNİ ÇEK ---
+    # 7. Kaydet ve Bitir
     route_polyline = None
     if redis_client:
-        # Eğer bu turda 'get_route_data' aracı çalıştıysa, Redis'teki taze rotayı alalım
-        # Basitçe: Her zaman 'latest_route' keyine bakıyoruz.
         try:
             route_polyline = redis_client.get("latest_route")
-        except: pass
-    # ----------------------------------------------
-
-    # 3. YENİ MESAJLARI REDIS'E KAYDET
-    if redis_client:
-        try:
             redis_client.rpush(f"chat:{request.session_id}", json.dumps({"role": "user", "content": request.message}))
             redis_client.rpush(f"chat:{request.session_id}", json.dumps({"role": "assistant", "content": final_response}))
             redis_client.expire(f"chat:{request.session_id}", 86400)
-            redis_client.ltrim(f"chat:{request.session_id}", -20, -1)
-        except Exception as e:
-            log.warning(f"Geçmiş kaydedilemedi: {e}")
+        except: pass
 
-    # JSON cevabına 'route_polyline' ekledik
     return {
         "response": final_response, 
         "route_polyline": route_polyline 
