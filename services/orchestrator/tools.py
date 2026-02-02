@@ -55,6 +55,17 @@ MANUAL_TOOLS = [
             "required": ["lat", "lon"]
         }
     },
+   {
+        "name": "analyze_route_weather",
+        "description": "WEATHER SHIELD: Rota üzerindeki hava durumunu topluca tarar. Eğer kullanıcı 'Yol durumu nasıl?', 'Yolda yağmur var mı?', 'Hava yüzünden rota değişmeli mi?' gibi sorular sorarsa MUTLAKA bunu kullan. Tek tek hava durumu sormaktan çok daha etkilidir. Girdi olarak 'polyline' parametresi ister ama sen buraya her zaman 'LATEST' stringini gönder.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "polyline": {"type": "string", "description": "Her zaman 'LATEST' olarak gönderilmeli."}
+            },
+            "required": ["polyline"]
+        }
+    },
     {
         "name": "save_location",
         "description": "Kullanıcının beğendiği veya kaydetmek istediği bir konumu veritabanına işler.",

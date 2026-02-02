@@ -9,22 +9,46 @@ from .cache import redis_store
 # --- YENİ EKLENEN: İSİMDEN KOORDİNAT BULUCU ---
 async def _resolve_coordinates(location: str) -> str:
     """
-    'Rize' gibi metinleri '41.02,40.52' formatına çevirir.
-    Zaten koordinatsa dokunmaz.
+    Konum ismini koordinata çevirir.
+    Önce Google Maps Geocoding dener (Daha zeki),
+    Patlarsa OSM Nominatim dener (Yedek).
     """
-    # 1. Zaten koordinat mı? (Basit kontrol)
+    # 1. Zaten koordinatsa dokunma
     if "," in location:
         parts = location.split(",")
-        # Sayısal kontrol (basit regex yerine try-float mantığı daha hızlı)
         try:
             float(parts[0])
             float(parts[1])
             return location.replace(" ", "")
         except ValueError:
-            pass # Sayı değilse devam et (Örn: "Rize, Merkez")
+            pass 
 
-    # 2. OSM Nominatim ile Çözümle
-    log.info(f"🌍 Konum çözümleniyor: {location}")
+    # 2. ÖNCE GOOGLE MAPS DENEYELİM (İnsan niyetini daha iyi anlar)
+    if settings.GOOGLE_MAPS_API_KEY:
+        log.info(f"🌍 [Google] Konum çözümleniyor: {location}")
+        url = "https://maps.googleapis.com/maps/api/geocode/json"
+        params = {
+            "address": location,
+            "key": settings.GOOGLE_MAPS_API_KEY,
+            "language": "tr",
+            "region": "tr" # Türkiye sonuçlarını öncele
+        }
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, params=params, timeout=10.0)
+                data = resp.json()
+                
+                if data.get("status") == "OK" and data.get("results"):
+                    loc = data["results"][0]["geometry"]["location"]
+                    lat, lon = loc["lat"], loc["lng"]
+                    log.success(f"✅ [Google] Bulundu: {location} -> {lat},{lon}")
+                    return f"{lat},{lon}"
+        except Exception as e:
+            log.error(f"Google Geocoding Hatası: {e}")
+
+    # 3. GOOGLE PATLARSA OSM NOMINATIM (YEDEK)
+    log.info(f"🌍 [OSM] Konum çözümleniyor (Yedek): {location}")
     url = "https://nominatim.openstreetmap.org/search"
     params = {
         "q": location,
@@ -41,12 +65,12 @@ async def _resolve_coordinates(location: str) -> str:
             if data:
                 lat = data[0]["lat"]
                 lon = data[0]["lon"]
-                log.success(f"✅ Bulundu: {location} -> {lat},{lon}")
+                log.success(f"✅ [OSM] Bulundu: {location} -> {lat},{lon}")
                 return f"{lat},{lon}"
     except Exception as e:
-        log.error(f"Geocoding hatası: {e}")
+        log.error(f"OSM Geocoding Hatası: {e}")
     
-    # Bulamazsa orijinali döndür (Belki HERE API anlar diye)
+    # Hiçbiri bulamazsa orijinali dön
     return location
 
 # YARDIMCI FONKSİYON: Koordinatın Adını Bul (Tersine Geocoding)

@@ -7,6 +7,7 @@ import os
 from datetime import datetime
 from typing import TypedDict, Annotated, List, Any, Dict
 from contextlib import asynccontextmanager
+from typing import Union
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +33,12 @@ RUNTIME_TOOLS = []
 MCP_SESSIONS: Dict[str, str] = {}
 PENDING_REQUESTS: Dict[str, asyncio.Future] = {}
 
+
+# --- CIRCUIT BREAKER AYARLARI ---
+RPC_TIMEOUT = 25.0  # 25 saniye içinde cevap gelmezse kes
+CIRCUIT_STATES = {}
+
+
 # --- REDIS KURULUMU ---
 try:
     # Config'den veya direkt string olarak alabilirsin
@@ -49,6 +56,7 @@ TOOL_ROUTER = {
     "search_places_google": "city",
     "get_route_data": "city",
     "get_weather": "city",
+    "analyze_route_weather": "city",
     "save_location": "city",
     "get_toll_prices": "city",
     # INTEL
@@ -61,48 +69,81 @@ TOOL_ROUTER = {
 }
 
 # --- RPC ÇAĞRISI (SAĞLAM BAĞLANTI MANTIĞI) ---
-async def mcp_rpc_call(service_name: str, method: str, params: dict = None):
-    # Session ID bekleme döngüsü
-    for _ in range(20): 
-        if MCP_SESSIONS.get(service_name): break
-        await asyncio.sleep(0.5)
-    
+async def mcp_rpc_call(service_name: str, method: str, params: dict = None) -> Union[dict, str]:
+    """
+    Güçlendirilmiş RPC Çağrısı (Circuit Breaker & Fallback Dahil)
+    """
+    # 1. Session Kontrolü
     session_url = MCP_SESSIONS.get(service_name)
-    if not session_url: return f"Hata: {service_name.upper()} Ajanı çevrimdışı."
+    if not session_url:
+        log.warning(f"⚠️ [CIRCUIT] {service_name} oturumu yok, tekrar deneniyor...")
+        # Basit bir retry mekanizması (1 saniye bekle)
+        await asyncio.sleep(1)
+        session_url = MCP_SESSIONS.get(service_name)
+        if not session_url:
+            return {
+                "status": "error", 
+                "error": f"{service_name.upper()} ajanı çevrimdışı.", 
+                "data": []
+            }
 
     req_id = str(int(datetime.now().timestamp() * 1000))
-    json_id = int(req_id)
-    
-    payload = {"jsonrpc": "2.0", "method": method, "params": params or {}, "id": json_id}
+    payload = {"jsonrpc": "2.0", "method": method, "params": params or {}, "id": int(req_id)}
     
     loop = asyncio.get_running_loop()
     future = loop.create_future()
     PENDING_REQUESTS[req_id] = future
     
     try:
-        # Timeout süresini uzun tutuyoruz (Scraperlar için)
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            await client.post(session_url, json=payload)
-            response_data = await asyncio.wait_for(future, timeout=80.0)
+        log.info(f"⚡ [RPC -> {service_name.upper()}] Metod: {method}")
+        
+        async with httpx.AsyncClient(timeout=RPC_TIMEOUT + 5.0) as client:
+            # İsteği gönder
+            resp = await client.post(session_url, json=payload)
             
+            if resp.status_code not in [200, 202]:
+                raise Exception(f"HTTP {resp.status_code} - {resp.text}")
+
+            # Cevabı bekle (Zaman aşımı kontrolü burada)
+            response_data = await asyncio.wait_for(future, timeout=RPC_TIMEOUT)
+            
+            # --- BAŞARILI YANIT İŞLEME ---
             if "error" in response_data:
-                err = response_data["error"]
-                log.error(f"❌ RPC Hata ({service_name}): {err}")
-                return f"Hata: {err}"
+                err_msg = response_data["error"]
+                log.error(f"❌ [RPC ERROR] {service_name}: {err_msg}")
+                return {"status": "error", "error": str(err_msg)}
             
-            # MCP sonucunu temizle
+            # MCP sonucunu temizle ve döndür
             result = response_data.get("result")
+            
+            # FastMCP bazen content listesi döner, bazen direkt dict. 
+            # Bunu standartlaştıralım:
             if isinstance(result, dict) and "content" in result:
-                 # İçerik varsa text kısmını al
-                content_list = result["content"]
-                if isinstance(content_list, list) and content_list:
-                    return content_list[0].get("text", str(content_list))
+                # Text içeriğini ayıkla
+                content = result["content"]
+                if isinstance(content, list) and len(content) > 0:
+                    text_data = content[0].get("text")
+                    try:
+                        # Eğer içindeki text JSON ise parse et
+                        return json.loads(text_data)
+                    except:
+                        return text_data # JSON değilse düz metin dön
+            
             return result
 
     except asyncio.TimeoutError:
-        return "Timeout (Servis geç yanıt verdi)"
+        log.error(f"⏱️ [TIMEOUT] {service_name} yanıt vermedi ({RPC_TIMEOUT}s). Devre kesildi.")
+        # FALLBACK: Eğer Redis varsa eski veriyi ara (İleride burası gelişecek)
+        return {
+            "status": "partial_error",
+            "error": "Servis zaman aşımına uğradı.",
+            "message": "Güncel veriye ulaşılamadı, lütfen daha sonra tekrar deneyin."
+        }
+
     except Exception as e:
-        return f"RPC Exception: {e}"
+        log.error(f"🔥 [CRITICAL] RPC Patladı: {e}")
+        return {"status": "error", "error": str(e)}
+        
     finally:
         if req_id in PENDING_REQUESTS: del PENDING_REQUESTS[req_id]
 

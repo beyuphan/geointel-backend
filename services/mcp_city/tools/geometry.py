@@ -2,6 +2,68 @@
 import flexpolyline
 from shapely.geometry import Point, LineString
 from logger import log
+from shapely.ops import transform
+import pyproj
+
+# WGS84 (GPS) -> Web Mercator (Metre) Dönüşümcüleri
+project_to_meters = pyproj.Transformer.from_proj(
+    pyproj.Proj('epsg:4326'), # GPS
+    pyproj.Proj('epsg:3857'), # Metre
+    always_xy=True
+).transform
+
+project_to_gps = pyproj.Transformer.from_proj(
+    pyproj.Proj('epsg:3857'), # Metre
+    pyproj.Proj('epsg:4326'), # GPS
+    always_xy=True
+).transform
+
+def sample_route_points(encoded_polyline: str, interval_km: int = 40) -> list:
+    """
+    Rotayı analiz eder ve her 'interval_km' mesafede bir koordinat örnekler.
+    Örn: 400km yol için ~10 nokta döndürür.
+    """
+    if not encoded_polyline or encoded_polyline == "LATEST":
+        return []
+
+    try:
+        # 1. Polyline çöz (Decode)
+        coords = flexpolyline.decode(encoded_polyline) # [(lat, lon), ...]
+        # Shapely (lon, lat) ister, flexpolyline (lat, lon) verir. Ters çevir:
+        line_coords = [(lon, lat) for lat, lon in coords]
+        
+        if not line_coords: return []
+        
+        # 2. Geometriyi oluştur ve Metreye çevir
+        route_line = LineString(line_coords)
+        route_line_m = transform(project_to_meters, route_line)
+        
+        total_length_m = route_line_m.length
+        interval_m = interval_km * 1000
+        
+        # 3. Örnekleme (Sampling)
+        sampled_points = []
+        current_dist = 0
+        
+        while current_dist <= total_length_m:
+            # Noktayı bul (Metre uzayında)
+            point_m = route_line_m.interpolate(current_dist)
+            # GPS'e geri çevir
+            point_gps = transform(project_to_gps, point_m)
+            
+            sampled_points.append({
+                "lat": point_gps.y,
+                "lon": point_gps.x,
+                "km_point": int(current_dist / 1000) # Kaçıncı km?
+            })
+            current_dist += interval_m
+            
+        log.info(f"📏 [GEO] Rota {int(total_length_m/1000)} km, {len(sampled_points)} noktaya bölündü.")
+        return sampled_points
+
+    except Exception as e:
+        log.error(f"❌ Geometri Hatası: {e}")
+        return []
 
 def filter_places_by_polyline(places: list, encoded_polyline: str) -> list:
     """

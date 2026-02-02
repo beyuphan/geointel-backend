@@ -37,3 +37,32 @@ class RouteRequest(BaseModel):
             raise ValueError(f"Sayısal koordinat girilmeli: '{v}'")
             
         return v
+    
+
+# --- ÇIKIŞ MODELLERİ (OUTPUT MODELS) ---
+
+class StandardPlace(BaseModel):
+    """Google ve OSM sonuçlarını bu formatta eşitleyeceğiz."""
+    name: str
+    address: Optional[str] = "Adres yok"
+    lat: float
+    lon: float
+    category: str = "general"
+    rating: Optional[float] = None
+    is_open: Optional[str] = None
+    source: str = "unknown" # 'google', 'osm'
+
+class WeatherResponse(BaseModel):
+    location: str
+    current_temp: str
+    feels_like: str
+    condition: str
+    forecast_hourly: list[dict]
+    warning: Optional[str] = None
+
+class RouteResponse(BaseModel):
+    distance_km: float
+    duration_min: float
+    polyline: str
+    summary: str
+    checkpoints: dict
