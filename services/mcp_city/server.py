@@ -4,7 +4,7 @@ from tools.google import search_places_google_handler
 from tools.here import get_route_data_handler
 from tools.weather import get_weather_handler
 from tools.db import save_location_handler
-
+from tools.toll import get_toll_prices_handler 
 # --- MCP KURULUMU ---
 mcp = FastMCP(name="City Agent")
 
@@ -34,6 +34,11 @@ async def get_weather(lat: float, lon: float) -> dict:
 async def save_location(name: str, lat: float, lon: float, category: str = "Genel", note: str = "") -> str:
     """Konumu veritabanına kaydeder."""
     return await save_location_handler(name, lat, lon, category, note)
+
+@mcp.tool()
+async def get_toll_prices(filter_region: str = None) -> str:
+    """Köprü, tünel ve otoyol geçiş ücretlerini sorgular."""
+    return await get_toll_prices_handler(filter_region)
 
 if __name__ == "__main__":
     mcp.run(transport="sse", host="0.0.0.0", port=8000)

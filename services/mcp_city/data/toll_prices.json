@@ -1,0 +1,107 @@
+{
+  "metadata": {
+    "version": "2.0",
+    "year": "2026 (Tahmini)",
+    "vehicle_class": "1 (Otomobil)"
+  },
+  "bridges": [
+    {
+      "name": "15 Temmuz Şehitler & FSM Köprüsü",
+      "location": "İstanbul (Boğaz)",
+      "price_tl": 33.00,
+      "direction": "Tek Yön (Asya -> Avrupa)"
+    },
+    {
+      "name": "Yavuz Sultan Selim Köprüsü (3. Köprü)",
+      "location": "İstanbul (Kuzey Marmara)",
+      "price_tl": 70.00,
+      "direction": "Tek Yön"
+    },
+    {
+      "name": "Osmangazi Köprüsü",
+      "location": "Kocaeli (İzmit Körfezi)",
+      "price_tl": 555.00,
+      "direction": "Geçiş Başına"
+    },
+    {
+      "name": "1915 Çanakkale Köprüsü",
+      "location": "Çanakkale (Boğaz)",
+      "price_tl": 585.00,
+      "direction": "Geçiş Başına"
+    },
+    {
+      "name": "Avrasya Tüneli",
+      "location": "İstanbul (Tüp Geçit)",
+      "price_tl": 156.00,
+      "direction": "Geçiş Başına (Gündüz)"
+    }
+  ],
+  "highways": [
+    {
+      "name": "O-5 İstanbul - İzmir Otoyolu (Tamamı)",
+      "route": "İstanbul <-> İzmir",
+      "price_tl": 1370.00,
+      "note": "Osmangazi Köprüsü Dahil Toplam"
+    },
+    {
+      "name": "O-5 (Bursa - İzmir Etabı)",
+      "route": "Bursa <-> İzmir",
+      "price_tl": 650.00,
+      "note": "Köprü hariç, sadece otoyol"
+    },
+    {
+      "name": "O-4 Anadolu Otoyolu",
+      "route": "İstanbul <-> Ankara",
+      "price_tl": 187.00,
+      "note": "Çamlıca - Akıncı arası"
+    },
+    {
+      "name": "O-6 Kuzey Marmara Otoyolu (Avrupa)",
+      "route": "Kınalı <-> Odayeri",
+      "price_tl": 160.00,
+      "note": "Giriş çıkışa göre değişir"
+    },
+    {
+      "name": "O-7 Kuzey Marmara Otoyolu (Asya)",
+      "route": "Kurtköy <-> Akyazı",
+      "price_tl": 290.00,
+      "note": "Sakarya çıkışı"
+    },
+    {
+      "name": "O-21 Ankara - Niğde Otoyolu",
+      "route": "Ankara <-> Niğde",
+      "price_tl": 420.00,
+      "note": "Tamamı"
+    },
+    {
+      "name": "O-31 İzmir - Aydın Otoyolu",
+      "route": "İzmir <-> Aydın",
+      "price_tl": 60.00,
+      "note": "Işıkkent - Aydın"
+    },
+    {
+      "name": "O-32 İzmir - Çeşme Otoyolu",
+      "route": "İzmir <-> Çeşme",
+      "price_tl": 55.00,
+      "note": "Seferihisar çıkışı dahil"
+    },
+    {
+      "name": "O-52 (TAG) Adana - Şanlıurfa",
+      "route": "Adana <-> Şanlıurfa",
+      "price_tl": 145.00,
+      "note": "Gaziantep geçişi dahil"
+    },
+    {
+      "name": "O-3 Avrupa Otoyolu",
+      "route": "Edirne <-> İstanbul",
+      "price_tl": 85.00,
+      "note": "Mahmutbey - Edirne"
+    },
+    {
+      "name": "O-33 Kuzey Ege Otoyolu",
+      "route": "Menemen <-> Çandarlı",
+      "price_tl": 130.00,
+      "note": "Tamamı"
+    }
+  ]
+}

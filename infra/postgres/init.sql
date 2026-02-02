@@ -23,9 +23,9 @@ CREATE TABLE IF NOT EXISTS fuel_prices (
     city VARCHAR(50) NOT NULL,      -- örn: 'samsun'
     district VARCHAR(50) NOT NULL,  -- örn: 'atakum'
     company VARCHAR(50) NOT NULL,   -- örn: 'Opet'
-    gasoline NUMERIC(5,2),          -- Benzin Fiyatı
-    diesel NUMERIC(5,2),            -- Motorin Fiyatı
-    lpg NUMERIC(5,2),               -- LPG Fiyatı
+    gasoline NUMERIC(10,2),          -- Benzin Fiyatı
+    diesel NUMERIC(10,2),            -- Motorin Fiyatı
+    lpg NUMERIC(10,2),               -- LPG Fiyatı
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(city, district, company) -- Aynı firmanın aynı ilçedeki verisi tekrar etmesin
 );

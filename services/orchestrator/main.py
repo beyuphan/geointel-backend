@@ -12,26 +12,20 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, create_model
 
-# --- MODÜLER İMPORTLAR (JİLET GİBİ OLDU) ---
-from profile_manager import ProfileManager          # Hafıza Yöneticisi
-from tools import MANUAL_TOOLS                      # Araç Tanımları
+# --- MODÜLER İMPORTLAR (JİLET GİBİ YAPIDAN DEVAM) ---
+from profile_manager import ProfileManager           # Hafıza Yöneticisi
+from tools import MANUAL_TOOLS                       # Araç Tanımları (tools.py'den)
 from prompt_manager import get_dynamic_system_prompt # Zeka/Prompt Yöneticisi
 
-# --- LANGCHAIN ---
-from langchain_openai import ChatOpenAI 
-# (Eğer Claude kullanıyorsan: from langchain_anthropic import ChatAnthropic)
+# --- LANGCHAIN & ANTHROPIC (GERİ GELDİ) ---
+from langchain_anthropic import ChatAnthropic        # <--- İŞTE BU!
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import StructuredTool
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 
-from loguru import logger as log
-
-# --- AYARLAR ---
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-CITY_AGENT_URL = "http://geo_mcp_city:8000"
-INTEL_AGENT_URL = "http://geo_mcp_intel:8001"
-REDIS_HOST = "geo_redis"
+from config import settings  # Senin config dosyan
+from logger import log
 
 # --- GLOBAL DURUM ---
 RUNTIME_TOOLS = []
@@ -40,7 +34,8 @@ PENDING_REQUESTS: Dict[str, asyncio.Future] = {}
 
 # --- REDIS KURULUMU ---
 try:
-    redis_client = redis.Redis(host=REDIS_HOST, port=6379, db=0, decode_responses=True)
+    # Config'den veya direkt string olarak alabilirsin
+    redis_client = redis.Redis(host="geo_redis", port=6379, db=0, decode_responses=True)
     redis_client.ping()
     log.success("✅ [Orchestrator] Redis Hafızası Aktif")
 except Exception as e:
@@ -55,6 +50,7 @@ TOOL_ROUTER = {
     "get_route_data": "city",
     "get_weather": "city",
     "save_location": "city",
+    "get_toll_prices": "city",
     # INTEL
     "get_pharmacies": "intel",
     "get_fuel_prices": "intel",
@@ -84,6 +80,7 @@ async def mcp_rpc_call(service_name: str, method: str, params: dict = None):
     PENDING_REQUESTS[req_id] = future
     
     try:
+        # Timeout süresini uzun tutuyoruz (Scraperlar için)
         async with httpx.AsyncClient(timeout=90.0) as client:
             await client.post(session_url, json=payload)
             response_data = await asyncio.wait_for(future, timeout=80.0)
@@ -184,8 +181,8 @@ async def create_dynamic_tool(tool_def: dict):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Dinleyicileri başlat
-    asyncio.create_task(sse_listener_loop("city", f"{CITY_AGENT_URL}/sse"))
-    asyncio.create_task(sse_listener_loop("intel", f"{INTEL_AGENT_URL}/sse"))
+    asyncio.create_task(sse_listener_loop("city", f"{settings.MCP_CITY_URL}/sse"))
+    asyncio.create_task(sse_listener_loop("intel", f"{settings.MCP_INTEL_URL}/sse"))
     
     await asyncio.sleep(2) 
     
@@ -199,11 +196,23 @@ async def lifespan(app: FastAPI):
     yield
     RUNTIME_TOOLS.clear()
 
-app = FastAPI(title="GeoIntel Orchestrator", lifespan=lifespan)
+app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
 
-# --- LLM AYARLARI ---
-# Eğer Claude kullanıyorsan burayı ChatAnthropic yapabilirsin
-llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- LLM AYARLARI (ANTHROPIC) ---
+# Burada senin config dosyanı kullanıyoruz
+llm = ChatAnthropic(
+    model="claude-sonnet-4-5-20250929", 
+    temperature=0,
+    api_key=settings.ANTHROPIC_API_KEY
+)
 
 class ChatRequest(BaseModel):
     session_id: str = "default_session"
@@ -218,7 +227,6 @@ async def chat_endpoint(request: ChatRequest):
     user_context_str = await ProfileManager.get_user_context("test_pilot")
     
     # 2. Prompt Yöneticisinden Dinamik Promptu Al
-    # (Burada kod kısalıyor, mantık prompt_manager.py içinde)
     dynamic_prompt = get_dynamic_system_prompt(user_context_str, request.message)
     
     # 3. Model Bağlama
@@ -266,6 +274,7 @@ async def chat_endpoint(request: ChatRequest):
             redis_client.rpush(f"chat:{request.session_id}", json.dumps({"role": "user", "content": request.message}))
             redis_client.rpush(f"chat:{request.session_id}", json.dumps({"role": "assistant", "content": final_response}))
             redis_client.expire(f"chat:{request.session_id}", 86400)
+            redis_client.ltrim(f"chat:{request.session_id}", -20, -1)
         except: pass
 
     return {

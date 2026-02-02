@@ -71,6 +71,21 @@ MANUAL_TOOLS = [
         }
     },
 
+    {
+        "name": "get_toll_prices",
+        "description": "Köprü, tünel ve otoyol geçiş ücretlerini sorgular. Rota planlamasında maliyet hesabı için kullanılır. Eğer kullanıcı 'Maliyet ne kadar?' diye sorarsa mutlaka bunu ve yakıt fiyatını kontrol et.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "filter_region": {
+                    "type": "string", 
+                    "description": "Filtrelemek için şehir veya bölge adı (Örn: 'İstanbul'). Hepsi için boş bırak."
+                }
+            },
+            "required": []
+        }
+    },
+
     # ==========================================
     # 🕵️ INTEL AGENT ARAÇLARI
     # ==========================================
