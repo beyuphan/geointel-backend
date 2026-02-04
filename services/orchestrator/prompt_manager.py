@@ -1,4 +1,5 @@
 # services/orchestrator/prompt_manager.py
+from typing import Dict, Any
 
 BASE_SYSTEM_PROMPT = """
 Sen **GeoIntel**, konum tabanlı, gerçek zamanlı veriyle çalışan akıllı bir seyahat asistanısın.
@@ -13,39 +14,52 @@ Amacın: Kullanıcının sorusunu analiz etmek, doğru araçları seçmek ve ver
 Rota çizdiysen, harita gösterimi için `route_polyline="LATEST"` parametresini kullanmayı unutma.
 """
 
-def get_dynamic_system_prompt(user_context_str: str, user_message: str) -> str:
+def get_dynamic_system_prompt(user_context_str: str, intent_dict: Dict[str, Any]) -> str:
     """
-    Kullanıcının mesajına göre özel talimatlar eklenmiş System Prompt üretir.
+    LangGraph Classifier düğümünden gelen intent analizine göre 
+    dinamik ve göreve özel bir System Prompt üretir.
     """
-    msg_lower = user_message.lower()
+    category = intent_dict.get("category", "general")
+    focus_points = intent_dict.get("focus_points", [])
+    urgency = intent_dict.get("urgency", False)
+    
     intent_instructions = ""
+    focus_str = ", ".join(focus_points) if focus_points else "Genel konular"
 
-    # SENARYO A: YAKIT SORGUSU
-    if any(x in msg_lower for x in ["benzin", "mazot", "yakıt", "lpg", "fiyat", "dizel"]):
-        intent_instructions += """
+    # 🎯 KATEGORİ BAZLI TALİMATLAR (Router Node Sonucuna Göre)
+    if category == "fuel":
+        intent_instructions = """
 👉 [GÖREV: YAKIT ANALİZİ]
-- Fiyatları ilçe ve firma bazında karşılaştıran net bir tablo yap.
-- Sadece rota üzerindeki (gidilen yöndeki) istasyonları öner. Ters yöndekileri (örn: Rize'den Trabzon'a giderken Pazar'ı) önerme.
-- Eğer rota üzerindeki ucuzluk, gitmeye değecek kadar büyükse (örn: depo başı >50 TL) öner, değilse "fark yok" de.
+- Fiyatları ilçe ve firma bazında karşılaştıran net bir Markdown tablosu yap.
+- Sadece rota üzerindeki istasyonları öner. Ters yöndekileri kesinlikle ele.
+- Eğer ciddi bir fiyat avantajı varsa (>50 TL depo başı) özellikle vurgula.
 """
-        
-    # SENARYO B: MAÇ / ETKİNLİK
-    if any(x in msg_lower for x in ["maç", "stadyum", "futbol", "konser", "etkinlik", "fikstür"]):
-        intent_instructions += """
-👉 [GÖREV: ETKİNLİK/TRAFİK]
-- Etkinliğin başlama saatine göre trafik yoğunluğunu tahmin et.
-- Eğer kullanıcının tuttuğu takımı biliyorsan (hafızadan), ona göre başarı dile veya yorum yap.
-- Stadyum çevresine girmeden alternatif rota gerekip gerekmediğini değerlendir.
-"""
-
-    # SENARYO C: ECZANE
-    if "eczane" in msg_lower:
-        intent_instructions += """
+    elif category == "pharmacy":
+        intent_instructions = """
 👉 [GÖREV: ACİLİYET]
-- En yakın nöbetçi eczaneyi en başa yaz.
-- Telefon numarasını kalın harfle belirt.
-- Konum tarifini basit yap.
+- En yakın nöbetçi eczaneyi en başa yaz ve mesafesini belirt.
+- Telefon numarasını **kalın** formatta ver.
+- Kullanıcıya geçmiş olsun dileklerini iletmeyi unutma.
 """
+    elif category == "event":
+        intent_instructions = """
+👉 [GÖREV: ETKİNLİK & TRAFİK]
+- Etkinlik saati ile trafik yoğunluğunu ilişkilendir.
+- Kullanıcının tuttuğu takımı biliyorsan (hafızadan), ona göre samimi bir yorum ekle.
+- Kalabalık uyarısı yaparak alternatif park veya ulaşım yolları öner.
+"""
+    elif category == "routing":
+        intent_instructions = """
+👉 [GÖREV: ROTA PLANLAMA]
+- Mesafeyi ve tahmini süreyi açıkça belirt.
+- Rota üzerindeki hava durumu risklerini (Weather Shield) mutlaka kontrol et.
+- Eğer yolda kar/fırtına varsa proaktif olarak uyar.
+"""
+    else:
+        intent_instructions = "Yardımsever bir asistan olarak genel soruları yanıtla ve gerekirse araçları kullan."
+
+    # ACİLİYET MODU (Extra Prompt)
+    urgency_note = "\n⚠️ **KRİTİK:** Kullanıcı acil bir durumda, yanıtı kısa, net ve aksiyon odaklı tut!" if urgency else ""
 
     return f"""
 {BASE_SYSTEM_PROMPT}
@@ -53,7 +67,12 @@ def get_dynamic_system_prompt(user_context_str: str, user_message: str) -> str:
 === 🧠 HAFIZA (KULLANICI BİLGİLERİ) ===
 {user_context_str}
 
-=== 🎯 ANLIK GÖREV TALİMATLARI ===
-{intent_instructions if intent_instructions else "Genel sohbet modunda, yardımsever ol."}
+=== 🎯 ANLIK GÖREV ANALİZİ ===
+- **Kategori:** {category.upper()}
+- **Odak Noktaları:** {focus_str}
+{urgency_note}
+
+=== 📝 ÖZEL TALİMATLAR ===
+{intent_instructions}
 =======================================
 """

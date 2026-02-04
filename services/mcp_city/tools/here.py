@@ -6,14 +6,14 @@ from .models import RouteRequest
 # REDIS STORE'U ÇAĞIRIYORUZ
 from .cache import redis_store
 
-# --- YENİ EKLENEN: İSİMDEN KOORDİNAT BULUCU ---
+# --- GÜNCELLENEN: İSİMDEN KOORDİNAT BULUCU ---
 async def _resolve_coordinates(location: str) -> str:
     """
     Konum ismini koordinata çevirir.
     Önce Google Maps Geocoding dener (Daha zeki),
     Patlarsa OSM Nominatim dener (Yedek).
     """
-    # 1. Zaten koordinatsa dokunma
+    # 1. Zaten koordinatsa dokunma (Örn: "41.02,40.52")
     if "," in location:
         parts = location.split(",")
         try:
@@ -21,9 +21,10 @@ async def _resolve_coordinates(location: str) -> str:
             float(parts[1])
             return location.replace(" ", "")
         except ValueError:
-            pass 
+            pass # Sayı değilse devam et (Örn: "Rize, Merkez")
 
     # 2. ÖNCE GOOGLE MAPS DENEYELİM (İnsan niyetini daha iyi anlar)
+    # Google "Rize" denince valiliği/merkezi verir, OSM ise il sınırının ortasını (dağı) verir.
     if settings.GOOGLE_MAPS_API_KEY:
         log.info(f"🌍 [Google] Konum çözümleniyor: {location}")
         url = "https://maps.googleapis.com/maps/api/geocode/json"
@@ -70,7 +71,7 @@ async def _resolve_coordinates(location: str) -> str:
     except Exception as e:
         log.error(f"OSM Geocoding Hatası: {e}")
     
-    # Hiçbiri bulamazsa orijinali dön
+    # Hiçbiri bulamazsa orijinali dön (HERE API belki anlar diye)
     return location
 
 # YARDIMCI FONKSİYON: Koordinatın Adını Bul (Tersine Geocoding)
@@ -93,12 +94,11 @@ async def get_location_name(lat, lon):
 async def get_route_data_handler(origin: str, destination: str) -> dict:
     """HERE Maps API ile rota hesaplar ve REDIS'E KAYDEDER."""
     try:
-        # --- ÖNCE KOORDİNATLARI ÇÖZ ---
+        # --- ÖNCE KOORDİNATLARI ÇÖZ (Google Öncelikli) ---
         origin_coord = await _resolve_coordinates(origin)
         dest_coord = await _resolve_coordinates(destination)
         
         # --- SONRA REQUEST MODELİNE VER ---
-        # (Artık koordinat olduğu için validation hatası vermez)
         req = RouteRequest(origin=origin_coord, destination=dest_coord)
         
         params = {

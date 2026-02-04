@@ -113,25 +113,8 @@ async def get_weather(lat: float, lon: float) -> str:
 
 @mcp.tool()
 async def analyze_route_weather(polyline: str) -> str:
-    """Rota boyunca hava durumu analizi yapar (Weather Shield). JSON String döner."""
-    
-    target_polyline = polyline
-
-    # 1. Eğer 'LATEST' komutu geldiyse Redis'e bak
-    if polyline == "LATEST":
-        # RedisCache sınıfındaki get_route metodunu kullanıyoruz
-        stored_route = redis_store.get_route()
-        
-        if not stored_route:
-            return json.dumps({
-                "status": "error", 
-                "message": "Hafızada (Redis) son hesaplanan rota bulunamadı. Lütfen önce 'get_route_data' ile bir rota oluşturun."
-            }, ensure_ascii=False)
-            
-        target_polyline = stored_route
-
-    # 2. Gerçek polyline verisiyle analizi başlat
-    result = await analyze_route_weather_handler(target_polyline)
+    # Redis bağımlılığı bitti, sadece işini yap.
+    result = await analyze_route_weather_handler(polyline)
     return json.dumps(result, ensure_ascii=False)
 
 @mcp.tool()

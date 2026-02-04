@@ -5,14 +5,13 @@ import asyncio
 import redis
 import os
 from datetime import datetime
-from typing import TypedDict, Annotated, List, Any, Dict
 from contextlib import asynccontextmanager
-from typing import Union
+from typing import Literal, List, Dict, Any, Union, Annotated, TypedDict
+from pydantic import BaseModel, create_model, Field
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, create_model
-
+from langchain_core.pydantic_v1 import BaseModel, Field
 # --- MODÜLER İMPORTLAR (JİLET GİBİ YAPIDAN DEVAM) ---
 from profile_manager import ProfileManager           # Hafıza Yöneticisi
 from tools import MANUAL_TOOLS                       # Araç Tanımları (tools.py'den)
@@ -38,6 +37,67 @@ PENDING_REQUESTS: Dict[str, asyncio.Future] = {}
 RPC_TIMEOUT = 25.0  # 25 saniye içinde cevap gelmezse kes
 CIRCUIT_STATES = {}
 
+# Sınıflandırma şeması
+class IntentAnalysis(BaseModel):
+    category: Literal["fuel", "pharmacy", "event", "routing", "general"] = Field(
+        description="Kullanıcının isteğinin ana kategorisi"
+    )
+    urgency: bool = Field(description="İşlem acil mi? (Örn: Nöbetçi eczane)")
+    focus_points: List[str] = Field(description="Mesajdaki anahtar kelimeler (örn: 'ucuz', 'dizel')")
+
+# 🔄 Agent State Güncellemesi
+class AgentState(TypedDict):
+    messages: Annotated[List[Any], operator.add]
+    intent: Dict[str, Any]  # Classifier'dan gelen niyet
+    retry_count: int        # Hata döngüsü kontrolü için
+
+async def intent_node(state: AgentState):
+    # Bu düğümde Gemini 1.5 Flash kullanmanı öneririm (Hız ve maliyet için)
+    # Şimdilik ana llm üzerinden gidiyoruz:
+    msg = state["messages"][-1].content
+    
+    # Modelin yapılandırılmış çıktı (Structured Output) vermesini sağlıyoruz
+    model_with_structure = llm.with_structured_output(IntentAnalysis)
+    
+    intent_result = await model_with_structure.ainvoke(
+        f"Aşağıdaki kullanıcı mesajının niyetini analiz et: {msg}"
+    )
+    
+    return {"intent": intent_result.dict()}
+
+# --- 1. CLASSIFIER NODE (Niyet Belirleyici) ---
+async def classifier_node(state: AgentState):
+    msg = state["messages"][-1].content
+    
+    # Gemini 1.5 Flash veya Claude Haiku kullanarak hızlıca niyet analizi yap
+    # Structured output özelliği sayesinde model direkt Pydantic döner
+    model_with_structure = llm.with_structured_output(IntentAnalysis)
+    
+    try:
+        intent_result = await model_with_structure.ainvoke(
+            f"Kullanıcı mesajını analiz et ve GeoIntel asistanı için niyetini belirle: {msg}"
+        )
+        return {"intent": intent_result.dict(), "retry_count": 0}
+    except Exception as e:
+        log.error(f"❌ Niyet analizi hatası: {e}")
+        return {"intent": {"category": "general", "focus_points": [], "urgency": False}}
+
+# --- 2. VALIDATOR LOGIC (Döngü Kararı) ---
+def should_continue(state: AgentState):
+    last_message = state["messages"][-1]
+    
+    # Eğer model tool çağrısı yaptıysa tools düğümüne git
+    if last_message.tool_calls:
+        return "tools"
+    
+    # HATA YÖNETİMİ: Eğer cevapta 'bulunamadı' gibi bir ibare varsa ve 
+    # henüz çok fazla deneme yapmadıysak ajanı tekrar çalıştır (Retry Loop)
+    if "üzgünüm" in last_message.content.lower() or "bulunamadı" in last_message.content.lower():
+        if state.get("retry_count", 0) < 2:
+            log.warning("🔄 [Retry] Ajan tatmin edici sonuç bulamadı, tekrar deniyor...")
+            return "agent" 
+
+    return END
 
 # --- REDIS KURULUMU ---
 try:
@@ -201,6 +261,17 @@ async def create_dynamic_tool(tool_def: dict):
     async def execution_wrapper(**kwargs):
         target_service = TOOL_ROUTER.get(name)
         
+        # 1. ENJEKSİYON: Ajan 'analyze_route_weather' çağırdığında hafızayı kontrol et
+        if name == "analyze_route_weather" and redis_client:
+            # Eğer polyline hiç gelmediyse veya 'LATEST' olarak geldiyse
+            if not kwargs.get("polyline") or kwargs.get("polyline") == "LATEST":
+                latest_route = redis_client.get("latest_route")
+                if latest_route:
+                    kwargs["polyline"] = latest_route
+                    log.info("🧠 [Memory] Son rota hafızadan çekildi ve enjekte edildi.")
+                else:
+                    return "Hata: Henüz bir rota oluşturulmamış. Lütfen önce bir rota hesaplatın."
+
         # Yerel (Orchestrator) Araçları
         if target_service == "orchestrator":
             if name == "remember_info":
@@ -212,7 +283,22 @@ async def create_dynamic_tool(tool_def: dict):
             return f"Hata: '{name}' aracı yönlendirilmemiş."
 
         log.info(f"🚀 [MCP -> {target_service.upper()}] {name} Args: {kwargs}")
-        return await mcp_rpc_call(target_service, "tools/call", {"name": name, "arguments": kwargs})
+        
+        # 2. RPC ÇAĞRISINI YAP
+        result = await mcp_rpc_call(target_service, "tools/call", {"name": name, "arguments": kwargs})
+
+        # 3. KAYIT: Eğer bir rota oluşturulduysa (get_route_data), polyline'ı Redis'e kaydet
+        if name == "get_route_data" and redis_client:
+            # result bazen parse edilmiş bir dict, bazen düz string olabilir.
+            # get_route_data_handler çıktısına göre 'polyline_encoded' veya 'polyline' aranmalı.
+            if isinstance(result, dict) and result.get("polyline"):
+                redis_client.set("latest_route", result["polyline"])
+                log.info("💾 [Memory] Yeni rota polyline verisi Redis'e kaydedildi.")
+            elif isinstance(result, dict) and result.get("polyline_encoded"): # Handler ismine göre alternatif
+                redis_client.set("latest_route", result["polyline_encoded"])
+                log.info("💾 [Memory] Yeni rota polyline verisi Redis'e kaydedildi.")
+
+        return result
 
     return StructuredTool.from_function(
         func=None, coroutine=execution_wrapper, name=name, description=desc, args_schema=DynamicSchema
@@ -288,23 +374,49 @@ async def chat_endpoint(request: ChatRequest):
     # 5. Graph
     class AgentState(TypedDict):
         messages: Annotated[List[Any], operator.add]
-
+        intent: Dict[str, Any]  
     def agent_node(state: AgentState):
-        msgs = [SystemMessage(content=dynamic_prompt)] + history + state["messages"]
-        return {"messages": [model_with_tools.invoke(msgs)]}
+        dynamic_prompt = get_dynamic_system_prompt(user_context_str, state["intent"])
+        retry_note = ""
+        if state.get("retry_count", 0) > 0:
+            retry_note = "\n\nNOT: Önceki denemede sonuç bulunamadı. Lütfen arama parametrelerini genişlet."
+
+        msgs = [SystemMessage(content=dynamic_prompt + retry_note)] + history + state["messages"]
+        
+        # retry_count'u artırarak state'i güncelle
+        return {
+            "messages": [model_with_tools.invoke(msgs)],
+            "retry_count": state.get("retry_count", 0) + 1
+        }
 
     def should_continue(state: AgentState):
         return "tools" if state["messages"][-1].tool_calls else END
 
     workflow = StateGraph(AgentState)
-    workflow.add_node("agent", agent_node)
-    workflow.add_node("tools", tool_node)
-    workflow.set_entry_point("agent")
-    workflow.add_conditional_edges("agent", should_continue)
+    workflow.add_node("classifier", intent_node) # 1. Adım: Sınıflandır
+    workflow.add_node("agent", agent_node)       # 2. Adım: Cevap üret
+    workflow.add_node("tools", tool_node)        # 3. Adım: Gerekirse araç kullan
+
+    workflow.set_entry_point("classifier")       # Giriş artık classifier!
+    workflow.add_edge("classifier", "agent")     # Sınıflandırmadan ajana geç
+    workflow.add_conditional_edges("agent", should_continue, {
+    "tools": "tools",
+    "agent": "agent", # Retry döngüsü
+    END: END
+    })
     workflow.add_edge("tools", "agent")
     
-    # 6. Çalıştır
-    final_state = await workflow.compile().ainvoke({"messages": [HumanMessage(content=request.message)]})
+    # Derle ve Çalıştır
+    app_graph = workflow.compile()
+    
+    # İlk mesajı gönderirken retry_count ve intent'i başlatıyoruz
+    initial_input = {
+        "messages": [HumanMessage(content=request.message)],
+        "intent": {}, 
+        "retry_count": 0
+    }
+    
+    final_state = await app_graph.ainvoke(initial_input)
     final_response = final_state["messages"][-1].content
 
     # 7. Kaydet ve Bitir
