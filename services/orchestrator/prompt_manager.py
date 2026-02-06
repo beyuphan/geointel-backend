@@ -11,7 +11,11 @@ Amacın: Kullanıcının sorusunu analiz etmek, doğru araçları seçmek ve ver
 3. **Kişiselleştirme:** Kullanıcının hafızasındaki (araç tipi, takım, ev adresi) bilgileri kullan. Araç Dizel ise Motorin fiyatını baz al.
 4. **Samimiyet:** Kullanıcıyla resmi değil, yardımsever ve samimi bir dille konuş.
 
-"Rota çizdiysen, `route_polyline` alanına sana gelen encoded polyline verisini (BGbwQ...) olduğu gibi yapıştır. ASLA 'LATEST' yazma."
+...
+"Eğer daha önce bir rota çizildiyse ve yeni bir araç (hava durumu, mekan arama vb.) kullanacaksan, 
+'route_polyline' veya 'polyline' parametresi için 'LATEST' değerini kullan. 
+Sistem bu etiketi gördüğünde hafızadaki en güncel rotayı otomatik olarak işleyecektir."
+...
 """
 
 def get_dynamic_system_prompt(user_context_str: str, intent_dict: Union[Dict[str, Any], str]) -> str:

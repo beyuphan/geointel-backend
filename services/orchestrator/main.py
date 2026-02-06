@@ -13,18 +13,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, create_model, Field
 
 # --- MODÜLER İMPORTLAR ---
-from profile_manager import ProfileManager           # Hafıza Yöneticisi
-from tools import MANUAL_TOOLS                       # Araç Tanımları
-from prompt_manager import get_dynamic_system_prompt # Zeka/Prompt Yöneticisi
+from profile_manager import ProfileManager           
+from tools import MANUAL_TOOLS                       
+from prompt_manager import get_dynamic_system_prompt 
 
 # --- LANGCHAIN & AI ---
 from langchain_anthropic import ChatAnthropic        
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
-
-# from langchain_google_genai import ChatGoogleGenerativeAI # İstersen açarsın
 
 from config import settings
 from logger import log
@@ -33,10 +30,7 @@ from logger import log
 RUNTIME_TOOLS = []
 MCP_SESSIONS: Dict[str, str] = {}
 PENDING_REQUESTS: Dict[str, asyncio.Future] = {}
-
-# --- CIRCUIT BREAKER AYARLARI ---
 RPC_TIMEOUT = 25.0
-CIRCUIT_STATES = {}
 
 # --- 1. MODELLER VE STATE ---
 
@@ -44,13 +38,14 @@ class IntentAnalysis(BaseModel):
     category: Literal["fuel", "pharmacy", "event", "routing", "general"] = Field(
         description="Kullanıcının isteğinin ana kategorisi"
     )
-    urgency: bool = Field(description="İşlem acil mi? (Örn: Nöbetçi eczane)")
-    focus_points: List[str] = Field(description="Mesajdaki anahtar kelimeler (örn: 'ucuz', 'dizel')")
+    urgency: bool = Field(description="İşlem acil mi?")
+    focus_points: List[str] = Field(description="Anahtar kelimeler")
 
 class AgentState(TypedDict):
     messages: Annotated[List[Any], operator.add]
-    intent: Dict[str, Any]  # Classifier'dan gelen niyet
-    retry_count: int        # Hata döngüsü kontrolü için
+    intent: Dict[str, Any]
+    retry_count: int
+    session_id: str 
 
 # --- REDIS KURULUMU ---
 try:
@@ -77,7 +72,6 @@ TOOL_ROUTER = {
     "remember_info": "orchestrator",  
 }
 
-# --- LLM AYARLARI (GLOBAL OLARAK TANIMLIYORUZ Kİ FONKSİYONLAR GÖRSÜN) ---
 llm = ChatAnthropic(
     model="claude-sonnet-4-5-20250929", 
     temperature=0,
@@ -87,49 +81,39 @@ llm = ChatAnthropic(
 # --- 2. NODE FONKSİYONLARI ---
 
 async def intent_node(state: AgentState):
-    """Kullanıcının niyetini analiz eder."""
     msg = state["messages"][-1].content
-    
-    # Modelin yapılandırılmış çıktı (Structured Output) vermesini sağlıyoruz
+    log.info(f"🔍 [Classifier] Niyet analizi yapılıyor: '{msg[:50]}...'")
     model_with_structure = llm.with_structured_output(IntentAnalysis)
-    
     try:
-        intent_result = await model_with_structure.ainvoke(
-            f"Aşağıdaki kullanıcı mesajının niyetini analiz et: {msg}"
-        )
-        return {"intent": intent_result.dict(), "retry_count": 0}
+        intent_result = await model_with_structure.ainvoke(f"Analiz et: {msg}")
+        log.success(f"🎯 [Classifier] Kategori: {intent_result.category.upper()}")
+        return {"intent": intent_result.dict()}
     except Exception as e:
-        log.error(f"❌ Niyet analizi hatası: {e}")
+        log.error(f"❌ [Classifier] Hata: {e}")
         return {"intent": {"category": "general", "focus_points": [], "urgency": False}}
 
 def should_continue(state: AgentState):
-    """Akışın nereye gideceğine karar verir."""
     last_message = state["messages"][-1]
     
-    # 1. Eğer model tool çağrısı yaptıysa -> tools düğümüne
     if last_message.tool_calls:
+        log.info(f"🛠️ [Router] Ajan {len(last_message.tool_calls)} araç çağrısı yaptı.")
         return "tools"
     
-    # 2. HATA YÖNETİMİ: Cevap tatmin edici değilse -> agent düğümüne (Retry)
-    # Burası senin asıl istediğin mantık
-    if "üzgünüm" in last_message.content.lower() or "bulunamadı" in last_message.content.lower():
-        if state.get("retry_count", 0) < 2:
-            log.warning("🔄 [Retry] Ajan tatmin edici sonuç bulamadı, tekrar deniyor...")
-            return "agent" 
+    if state.get("retry_count", 0) < 2:
+        if not last_message.content or "üzgünüm" in last_message.content.lower():
+            log.warning(f"🔄 [Router] Sonuç yetersiz, Retry #{state.get('retry_count', 0) + 1} başlatılıyor.")
+            return "agent"
 
-    # 3. Yoksa bitir
+    log.info("🏁 [Router] Akış sonlandırılıyor.")
     return END
 
 # --- 3. MCP & SSE ALTYAPISI ---
-# (Buradaki fonksiyonlar sağlamdı, aynen korudum)
 
 async def mcp_rpc_call(service_name: str, method: str, params: dict = None) -> Union[dict, str]:
     session_url = MCP_SESSIONS.get(service_name)
     if not session_url:
-        await asyncio.sleep(1)
-        session_url = MCP_SESSIONS.get(service_name)
-        if not session_url:
-            return {"status": "error", "error": f"{service_name.upper()} ajanı çevrimdışı."}
+        log.error(f"🚫 [RPC] {service_name.upper()} ajanı bulunamadı.")
+        return {"status": "error", "error": f"{service_name.upper()} ajanı çevrimdışı."}
 
     req_id = str(int(datetime.now().timestamp() * 1000))
     payload = {"jsonrpc": "2.0", "method": method, "params": params or {}, "id": int(req_id)}
@@ -139,224 +123,192 @@ async def mcp_rpc_call(service_name: str, method: str, params: dict = None) -> U
     PENDING_REQUESTS[req_id] = future
     
     try:
-        log.info(f"⚡ [RPC -> {service_name.upper()}] Metod: {method}")
+        log.info(f"📤 [RPC -> {service_name.upper()}] Metod: {method} | ID: {req_id}")
         async with httpx.AsyncClient(timeout=RPC_TIMEOUT + 5.0) as client:
             resp = await client.post(session_url, json=payload)
-            if resp.status_code not in [200, 202]: raise Exception(f"HTTP {resp.status_code}")
-
-            response_data = await asyncio.wait_for(future, timeout=RPC_TIMEOUT)
+            if resp.status_code not in [200, 202]: 
+                raise Exception(f"HTTP {resp.status_code}: {resp.text}")
             
-            if "error" in response_data: return {"status": "error", "error": str(response_data["error"])}
+            response_data = await asyncio.wait_for(future, timeout=RPC_TIMEOUT)
+            log.success(f"📥 [RPC <- {service_name.upper()}] Yanıt alındı.")
             
             result = response_data.get("result")
             if isinstance(result, dict) and "content" in result:
-                content = result["content"]
-                if isinstance(content, list) and len(content) > 0:
-                    text_data = content[0].get("text")
-                    try: return json.loads(text_data)
-                    except: return text_data
+                text_data = result["content"][0].get("text")
+                try: return json.loads(text_data)
+                except: return text_data
             return result
-
-    except asyncio.TimeoutError:
-        return {"status": "partial_error", "error": "Servis zaman aşımı."}
     except Exception as e:
-        log.error(f"🔥 [CRITICAL] RPC Patladı: {e}")
+        log.error(f"🔥 [RPC CRITICAL] {service_name.upper()} hatası: {e}")
         return {"status": "error", "error": str(e)}
     finally:
         if req_id in PENDING_REQUESTS: del PENDING_REQUESTS[req_id]
 
 async def sse_listener_loop(service_name: str, base_url: str):
-    log.info(f"🎧 [{service_name.upper()}] SSE Dinleniyor: {base_url}")
+    if not base_url.startswith("http"):
+        base_url = f"http://{base_url}"
+        
+    log.info(f"🎧 [{service_name.upper()}] SSE Dinleme Başladı: {base_url}")
     async with httpx.AsyncClient(timeout=None) as client:
         try:
             async with client.stream("GET", base_url) as response:
                 async for line in response.aiter_lines():
-                    if not line or line.startswith("event: endpoint"): continue
                     if line.startswith("data: "):
                         data_str = line.replace("data: ", "").strip()
-                        if data_str.startswith("/") or "http" in data_str:
-                            root = base_url.replace("/sse", "")
-                            final_url = f"{root}{data_str}" if data_str.startswith("/") else data_str
-                            MCP_SESSIONS[service_name] = final_url
-                            log.success(f"✅ [{service_name.upper()}] Kanal Açık: {final_url}")
-                            asyncio.create_task(mcp_rpc_call(service_name, "initialize", {
-                                "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "Orchestrator", "version": "1.0"}
-                            }))
-                            continue
+                        # 1. ÖNCE JSON MU DİYE BAK (Eğer JSON ise bu bir mesajdır, URL değildir)
                         if data_str.startswith("{"):
                             try:
                                 msg = json.loads(data_str)
                                 if "id" in msg and str(msg["id"]) in PENDING_REQUESTS:
                                     future = PENDING_REQUESTS[str(msg["id"])]
                                     if not future.done(): future.set_result(msg)
+                                continue # JSON ise aşağıya (URL kontrolüne) geçme!
                             except: pass
+                            
+                        if data_str.startswith("/") or "http" in data_str:
+                            root = base_url.replace("/sse", "")
+                            final_url = f"{root}{data_str}" if data_str.startswith("/") else data_str
+                            MCP_SESSIONS[service_name] = final_url
+                            log.success(f"🔗 [{service_name.upper()}] MCP Kanalı Kuruldu: {final_url}")
+                            asyncio.create_task(mcp_rpc_call(service_name, "initialize", {
+                                "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "Orchestrator", "version": "1.0"}
+                            }))
+                        elif data_str.startswith("{"):
+                            msg = json.loads(data_str)
+                            if "id" in msg and str(msg["id"]) in PENDING_REQUESTS:
+                                future = PENDING_REQUESTS[str(msg["id"])]
+                                if not future.done(): future.set_result(msg)
         except Exception as e:
-            log.error(f"🔥 [{service_name.upper()}] SSE Koptu: {e}")
+            log.error(f"📡 [{service_name.upper()}] SSE Bağlantısı Koptu: {e}")
             await asyncio.sleep(3)
             asyncio.create_task(sse_listener_loop(service_name, base_url))
+
+# --- 4. TOOL INJECTION & EXECUTION ---
 
 async def create_dynamic_tool(tool_def: dict):
     name = tool_def["name"]
     desc = tool_def.get("description", "")
     schema = tool_def.get("inputSchema", {"properties": {}})
+    
     fields = {k: (Any, ...) for k in schema.get("properties", {}).keys()}
+    fields["session_id"] = (str, "default_session") 
     DynamicSchema = create_model(f"{name}_Schema", **fields)
 
     async def execution_wrapper(**kwargs):
         target_service = TOOL_ROUTER.get(name)
+        sid = kwargs.get("session_id", "default_session")
+        route_key = f"route:{sid}"
         
-        # Enjeksiyonlar
-        if name == "analyze_route_weather" and redis_client:
-            if not kwargs.get("polyline") or kwargs.get("polyline") == "LATEST":
-                latest_route = redis_client.get("latest_route")
-                if latest_route:
-                    kwargs["polyline"] = latest_route
-                    log.info("🧠 [Memory] Son rota hafızadan çekildi.")
+        # 🧠 Rota Enjeksiyonu
+        if name in ["analyze_route_weather", "search_places_google"] and redis_client:
+            poly_param = "polyline" if name == "analyze_route_weather" else "route_polyline"
+            if not kwargs.get(poly_param) or kwargs.get(poly_param) == "LATEST":
+                latest = redis_client.get(route_key)
+                if latest:
+                    kwargs[poly_param] = latest
+                    log.info(f"🧠 [Memory] '{name}' için '{sid}' rotası enjekte edildi.")
                 else:
-                    return "Hata: Önce bir rota oluşturulmalı."
+                    log.warning(f"⚠️ [Memory] '{sid}' için rota bulunamadı, '{name}' boş polyline ile çalışıyor.")
 
         if target_service == "orchestrator":
-            if name == "remember_info":
-                return await ProfileManager.update_memory(kwargs.get("category"), kwargs.get("value"))
-            return "Bilinmeyen yerel araç."
+            log.info(f"🧠 [Local] {name} çalıştırılıyor...")
+            return await ProfileManager.update_memory(kwargs.get("category"), kwargs.get("value"))
+        mcp_args = {k: v for k, v in kwargs.items() if k != "session_id"}
         
-        if not target_service: return f"Hata: '{name}' yönlendirilmemiş."
+        log.info(f"🚀 [Tool Execute] {name} (Service: {target_service.upper()})")
+        result = await mcp_rpc_call(target_service, "tools/call", {"name": name, "arguments": mcp_args})
 
-        log.info(f"🚀 [MCP -> {target_service.upper()}] {name} Args: {kwargs}")
-        result = await mcp_rpc_call(target_service, "tools/call", {"name": name, "arguments": kwargs})
-
-        if name == "get_route_data" and redis_client:
-            if isinstance(result, dict):
-                poly = result.get("polyline") or result.get("polyline_encoded")
-                if poly:
-                    redis_client.set("latest_route", poly)
-                    log.info("💾 [Memory] Rota kaydedildi.")
+        # 💾 Rota Kaydı
+        if name == "get_route_data" and redis_client and isinstance(result, dict):
+            poly = result.get("polyline") or result.get("polyline_encoded")
+            if poly:
+                redis_client.set(route_key, poly)
+                redis_client.expire(route_key, 3600)
+                log.success(f"💾 [Memory] Yeni rota '{sid}' için kaydedildi.")
 
         return result
 
-    return StructuredTool.from_function(
-        func=None, coroutine=execution_wrapper, name=name, description=desc, args_schema=DynamicSchema
-    )
+    return StructuredTool.from_function(func=None, coroutine=execution_wrapper, name=name, description=desc, args_schema=DynamicSchema)
 
-# --- FASTAPI SETUP ---
+async def custom_tool_node(state: AgentState):
+    msgs = []
+    last_msg = state["messages"][-1]
+    for tool_call in last_msg.tool_calls:
+        log.info(f"🛠️ [Node: Tools] Çağrılıyor: {tool_call['name']}")
+        tool_call["args"]["session_id"] = state["session_id"]
+        tool = next(t for t in RUNTIME_TOOLS if t.name == tool_call["name"])
+        result = await tool.ainvoke(tool_call["args"])
+        msgs.append(ToolMessage(content=json.dumps(result) if isinstance(result, dict) else str(result), tool_call_id=tool_call["id"]))
+    return {"messages": msgs}
+
+# --- 5. APP SETUP & GRAPH ---
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     asyncio.create_task(sse_listener_loop("city", f"{settings.MCP_CITY_URL}/sse"))
     asyncio.create_task(sse_listener_loop("intel", f"{settings.MCP_INTEL_URL}/sse"))
-    await asyncio.sleep(2)
-    
-    log.info("🛠️ Araçlar Yükleniyor...")
+    await asyncio.sleep(2) # Ajanların bağlanması için kısa bir beklemeawait asyncio.sleep(2)
+    log.info("🛠️ Araçlar yükleniyor...")
     for t_def in MANUAL_TOOLS:
-        tool_obj = await create_dynamic_tool(t_def)
-        RUNTIME_TOOLS.append(tool_obj)
-    
-    log.success(f"✅ {len(RUNTIME_TOOLS)} Araç Hazır.")
+        RUNTIME_TOOLS.append(await create_dynamic_tool(t_def))
+    log.success(f"✅ {len(RUNTIME_TOOLS)} Araç hazır.")
     yield
     RUNTIME_TOOLS.clear()
 
 app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 class ChatRequest(BaseModel):
     session_id: str = "default_session"
     message: str
 
-# --- 4. CHAT ENDPOINT (DÜZELTİLDİ) ---
-
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
-    if not RUNTIME_TOOLS: return {"error": "Araçlar yüklenmedi."}
-    
-    # 1. Profil Verisi
-    user_context_str = await ProfileManager.get_user_context("test_pilot")
-    
-    # 2. Modeli Bağla
+    log.info(f"📩 [New Request] Session: {request.session_id} | Msg: {request.message[:30]}...")
+    user_context = await ProfileManager.get_user_context(request.session_id)
     model_with_tools = llm.bind_tools(RUNTIME_TOOLS)
-    tool_node = ToolNode(RUNTIME_TOOLS)
     
-    # 3. Geçmişi Yükle
     history = []
     if redis_client:
-        try:
-            stored = redis_client.lrange(f"chat:{request.session_id}", 0, -1)
-            for item in stored:
-                msg = json.loads(item)
-                if msg["role"] == "user": history.append(HumanMessage(content=msg["content"]))
-                elif msg["role"] == "assistant": history.append(AIMessage(content=msg["content"]))
-        except: pass
+        stored = redis_client.lrange(f"chat:{request.session_id}", 0, -1)
+        for item in stored:
+            m = json.loads(item)
+            history.append(HumanMessage(content=m["content"]) if m["role"]=="user" else AIMessage(content=m["content"]))
 
-    # 4. Ajan Düğümü (Context burada işleniyor)
     def agent_node(state: AgentState):
-        # Intent classifier'dan geliyor
-        intent_data = state["intent"]
-        
-        # Dinamik promptu burada oluşturuyoruz
-        dynamic_prompt = get_dynamic_system_prompt(user_context_str, intent_data)
-        
-        retry_note = ""
+        log.info(f"🤖 [Node: Agent] Çalışıyor (Retry: {state.get('retry_count', 0)})")
+        prompt = get_dynamic_system_prompt(user_context, state["intent"])
         if state.get("retry_count", 0) > 0:
-            retry_note = "\n\n⚠️ NOT: Önceki denemede sonuç bulunamadı veya eksik kaldı. Lütfen arama parametrelerini değiştir veya genişlet."
+            prompt += "\n⚠️ Önceki cevap yetersizdi. Lütfen araçları daha spesifik parametrelerle kullan."
+        msgs = [SystemMessage(content=prompt)] + history + state["messages"]
+        response = model_with_tools.invoke(msgs)
+        return {"messages": [response], "retry_count": state.get("retry_count", 0) + 1}
 
-        # Mesaj listesi: System Prompt + Geçmiş + Güncel Mesajlar
-        msgs = [SystemMessage(content=dynamic_prompt + retry_note)] + history + state["messages"]
-        
-        return {
-            "messages": [model_with_tools.invoke(msgs)],
-            "retry_count": state.get("retry_count", 0) + 1
-        }
-
-    # 5. Graph Oluşturma
     workflow = StateGraph(AgentState)
     workflow.add_node("classifier", intent_node)
     workflow.add_node("agent", agent_node)
-    workflow.add_node("tools", tool_node)
+    workflow.add_node("tools", custom_tool_node)
 
     workflow.set_entry_point("classifier")
-    
     workflow.add_edge("classifier", "agent")
-    
-    # BURASI DÜZELDİ: Global 'should_continue' fonksiyonunu kullanıyoruz!
-    workflow.add_conditional_edges(
-        "agent", 
-        should_continue, 
-        {
-            "tools": "tools",
-            "agent": "agent", # Retry döngüsü artık çalışacak
-            END: END
-        }
-    )
+    workflow.add_conditional_edges("agent", should_continue, {"tools": "tools", "agent": "agent", END: END})
     workflow.add_edge("tools", "agent")
     
-    app_graph = workflow.compile()
-    
-    # 6. Çalıştır
-    initial_input = {
+    executor = workflow.compile()
+    log.info("🚀 [Graph] Yürütme başlatıldı.")
+    final_state = await executor.ainvoke({
         "messages": [HumanMessage(content=request.message)],
-        "intent": {}, 
-        "retry_count": 0
-    }
+        "intent": {}, "retry_count": 0, "session_id": request.session_id
+    })
     
-    final_state = await app_graph.ainvoke(initial_input)
-    final_response = final_state["messages"][-1].content
-
-    # 7. Kaydet ve Bitir
-    route_polyline = None
+    response_text = final_state["messages"][-1].content
+    log.success("✅ [Graph] Yürütme tamamlandı.")
+    
     if redis_client:
-        try:
-            route_polyline = redis_client.get("latest_route")
-            redis_client.rpush(f"chat:{request.session_id}", json.dumps({"role": "user", "content": request.message}))
-            redis_client.rpush(f"chat:{request.session_id}", json.dumps({"role": "assistant", "content": final_response}))
-            redis_client.expire(f"chat:{request.session_id}", 86400)
-            redis_client.ltrim(f"chat:{request.session_id}", -20, -1)
-        except: pass
+        chat_key = f"chat:{request.session_id}"
+        redis_client.rpush(chat_key, json.dumps({"role": "user", "content": request.message}))
+        redis_client.rpush(chat_key, json.dumps({"role": "assistant", "content": response_text}))
+        redis_client.ltrim(chat_key, -20, -1)
+        redis_client.expire(chat_key, 86400)
 
-    # Frontend eğer "LATEST" görürse Redis'ten çekeceğini biliyor, 
-    # ama biz yine de varsa gönderelim.
-    if route_polyline and route_polyline == "LATEST":
-         # Zaten değişkende duruyor, pass
-         pass
-
-    return {
-        "response": final_response, 
-        "route_polyline": route_polyline 
-    }
+    return {"response": response_text, "route_polyline": redis_client.get(f"route:{request.session_id}") if redis_client else None}
