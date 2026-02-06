@@ -1,0 +1,57 @@
+Pilot Şehir Uygulama Dokümantasyonu: Samsun Operasyonu
+
+Bu doküman, Samsun'u projenin ilk "Analitik Pilot Bölgesi" yapmak için gereken uçtan uca adımları kapsar. Hedefimiz, sadece bir API çağrısı yapmak değil; Samsun'un sokaklarını veritabanına gömüp üzerlerinde kendi algoritmalarımızı (Cedge​) koşturmaktır.
+1. Aşama: Veri Edinimi ve Hazırlık
+
+Samsun'un dijital ikizini oluşturmak için OpenStreetMap (OSM) verilerine ihtiyacımız var.
+
+    Ham Veri: Geofabrik veya benzeri servislerden Samsun'a ait .osm.pbf dosyasını indir.
+
+    Filtreleme: Sadece ulaşım ağını (highway tagleri) ayıklayarak veri setini hafiflet.
+
+    Araç: Bu veriyi PostGIS'e aktarmak için osm2pgrouting aracını kullan. Bu araç, yolları sadece çizgi olarak değil, birbirine bağlı düğümler (topoloji) olarak içeri aktarır.
+
+2. Aşama: Veritabanı ve Topoloji Kurulumu
+
+Samsun sokaklarının "zeka" kazanması için PostgreSQL tarafında uzamsal motoru hazırlaman gerekiyor.
+
+    Uzantılar: Veritabanında postgis ve pgrouting eklentilerinin aktif olduğundan emin ol.
+
+    Topoloji Oluşturma: pgr_createTopology fonksiyonu ile yolların kesişim noktalarını (node) ve yönlerini (source/target) belirle.
+
+    İndeksleme: Uzamsal sorguların milisaniyeler içinde bitmesi için GIST indekslerini mutlaka tanımla.
+
+3. Aşama: Çevresel Maliyet Modellemesi (Cedge​)
+
+Samsun'un yollarına "dinamik ağırlık" verme zamanı. Raporda belirttiğimiz formülü SQL seviyesinde uygulayacağız:
+Cedge​=Vlimit​×(1−(Wfactor​×Sslope​))Ledge​​
+
+    Bileşenler:
+
+        Ledge​: Yolun gerçek uzunluğu.
+
+        Vlimit​: Hız sınırı (OSM'den gelir).
+
+        Wfactor​: Hava durumu katsayısı (Yağış anında maliyeti artırır).
+
+        Sslope​: Eğim katsayısı (Özellikle Samsun'un yokuşlu bölgeleri için kritik).
+
+4. Aşama: Analitik Rotalama Motoru
+
+Samsun sınırları içindeki bir sorgu geldiğinde devreye girecek motorun mantığı:
+
+    Algoritma: En kısa ve en güvenli yolu bulmak için pgr_dijkstra veya pgr_astar algoritmalarını kullan.
+
+    Dinamik Güncelleme: Hava durumu servisinden gelen veriye göre ways tablosundaki cost sütununu anlık olarak update eden bir trigger veya fonksiyon kurgula.
+
+5. Aşama: Ajan Entegrasyonu
+
+City Agent sunucusundaki get_route_data fonksiyonunu şu mantıkla güncelle:
+
+    Sınır Kontrolü (Geofencing): Gelen başlangıç ve bitiş koordinatları Samsun sınırları (Bounding Box) içinde mi?
+
+    Karar: * İçerideyse: pgRouting motorunu çalıştır (Analitik Rotalama).
+
+        Dışarıdaysa: HERE Maps API'sine fallback yap (Küresel Rotalama).
+
+    Çıktı: Her iki durumda da ajana aynı formatta (GeoJSON/Polyline) veri dön ki akış bozulmasın.

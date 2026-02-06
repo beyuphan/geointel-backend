@@ -1,7 +1,7 @@
 services:
   # 1. VERİTABANI (POSTGIS)
   postgres_postgis:
-    image: postgis/postgis:15-3.3
+    image: pgrouting/pgrouting:15-3.5-3.7
     container_name: geo_db
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
@@ -38,7 +38,10 @@ services:
     ports:
       - "8000:8000" # Dış dünyaya açık tek kapı
     environment:
+      - MCP_CITY_URL=http://mcp_city:8000
+      - MCP_INTEL_URL=http://mcp_intel:8001
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY} # Rota çizmek için gerekebilir
       - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_postgis:5432/${POSTGRES_DB}
     depends_on:

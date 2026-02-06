@@ -1,53 +1,95 @@
-# services/mcp_city/tools/osm.py
 import httpx
 from logger import log
 from .config import settings
 from .models import OSMRequest
 
-async def search_infrastructure_osm_handler(lat: float, lon: float, category: str) -> list:
+async def search_infrastructure_osm_handler(lat: float, lon: float, category: str, radius: int = 2000) -> list:
+    """
+    OpenStreetMap üzerinde optimize edilmiş dinamik arama.
+    """
     try:
-        req = OSMRequest(lat=lat, lon=lon, category=category)
-        radius = 50000 if req.category == "airport" else req.radius
-        tags = settings.OSM_TAG_MAP.get(req.category)
+        # Pydantic validasyonu
+        req = OSMRequest(lat=lat, lon=lon, category=category, radius=radius)
         
-        filters = "".join([f'nwr[{t}](around:{radius},{req.lat},{req.lon});' for t in tags])
-        query = f"[out:json][timeout:15];({filters});out center 5;" # Timeout'u kıstım, hızlı pes etsin
+        tag = req.category.strip().lower()
+        search_radius = 50000 if "airport" in tag else req.radius
 
-        # --- FALLBACK MEKANİZMASI ---
-        async with httpx.AsyncClient() as client:
+        # --- OPTİMİZE SORGUSU ---
+        # Timeout süresini 45 saniyeye çıkardık.
+        # Çok ağır olmaması için en kritik katmanları bıraktık.
+        query = f"""
+        [out:json][timeout:45];
+        (
+          nwr["amenity"="{tag}"](around:{search_radius},{req.lat},{req.lon});
+          nwr["shop"="{tag}"](around:{search_radius},{req.lat},{req.lon});
+          nwr["leisure"="{tag}"](around:{search_radius},{req.lat},{req.lon});
+          nwr["landuse"="{tag}"](around:{search_radius},{req.lat},{req.lon});
+          nwr["tourism"="{tag}"](around:{search_radius},{req.lat},{req.lon});
+          nwr["building"="{tag}"](around:{search_radius},{req.lat},{req.lon});
+        );
+        out center 10;
+        """
+
+        async with httpx.AsyncClient(timeout=60.0) as client: # Client timeout sunucudan uzun olmalı
             last_error = None
             
-            for url in settings.OVERPASS_URLS: # Listeyi geziyoruz
+            # Header ekleyelim ki bot sanıp engellemesinler
+            headers = {"Content-Type": "text/plain"}
+
+            for url in settings.OVERPASS_URLS:
                 try:
-                    log.info(f"🌍 [OSM] Deneniyor: {url}")
-                    resp = await client.post(url, data=query)
+                    log.info(f"🌍 [OSM] Deneniyor: {url} | Tag: {tag}")
+                    
+                    # --- FIX: data= yerine content= kullanıyoruz (Deprecation Fix) ---
+                    resp = await client.post(url, content=query, headers=headers)
                     
                     if resp.status_code == 200:
-                        # Başarılı oldu, veriyi işle ve döngüyü kır
+                        try:
+                            data = resp.json()
+                        except:
+                            log.warning(f"⚠️ [OSM] JSON Parse Hatası ({url})")
+                            continue
+
+                        elements = data.get("elements", [])
+                        
+                        if not elements:
+                            log.warning(f"⚠️ [OSM] Sonuç boş döndü ({url}) - Diğerleri deneniyor...")
+                            continue 
+                        
                         places = []
-                        for el in resp.json().get("elements", []):
+                        for el in elements:
                             tags = el.get("tags", {})
-                            name = tags.get("name") or tags.get("name:tr")
+                            name = tags.get("name") or tags.get("name:tr") or tags.get("name:en")
+                            
                             if not name: continue
+                            
+                            found_type = tags.get("amenity") or tags.get("shop") or tags.get("landuse") or tag
+
                             places.append({
                                 "isim": name,
-                                "kategori": req.category,
+                                "tur": found_type,
                                 "lat": el.get("lat") or el.get("center", {}).get("lat"),
                                 "lon": el.get("lon") or el.get("center", {}).get("lon")
                             })
-                        log.success(f"✅ [OSM] Başarılı ({url}) - {len(places)} yer.")
-                        return places[:5]
-                    
+                        
+                        if places:
+                            log.success(f"✅ [OSM] Başarılı ({url}) - {len(places)} yer bulundu.")
+                            return places[:10]
+                        
+                    elif resp.status_code == 429:
+                        log.warning(f"⚠️ [OSM] Çok Fazla İstek (429) - {url} bizi banladı, geçiyoruz.")
+                    elif resp.status_code == 504:
+                        log.warning(f"⚠️ [OSM] Sunucu Zaman Aşımı (504) - {url} çok yavaş.")
                     else:
-                        log.warning(f"⚠️ [OSM] Hata ({resp.status_code}) - Sıradakine geçiliyor...")
+                        log.warning(f"⚠️ [OSM] HTTP Hata ({resp.status_code}) - {url}")
                         last_error = f"HTTP {resp.status_code}"
 
                 except Exception as e:
-                    log.warning(f"⚠️ [OSM] Bağlantı Hatası: {e} - Sıradakine geçiliyor...")
+                    log.warning(f"⚠️ [OSM] Bağlantı Hatası ({url}): {e}")
                     last_error = str(e)
             
-            # Buraya geldiysek tüm URL'ler patlamıştır
-            return [{"error": f"Tüm OSM sunucuları yanıt vermedi. Son hata: {last_error}"}]
+            return [{"warning": f"Aradığın kriterde ('{tag}') sonuç alınamadı. (Sunucular yoğun olabilir)"}]
 
     except Exception as e:
-        return [{"error": str(e)}]
+        log.error(f"🔥 [OSM] Kritik Hata: {str(e)}")
+        return [{"error": f"OSM Sistem Hatası: {str(e)}"}]

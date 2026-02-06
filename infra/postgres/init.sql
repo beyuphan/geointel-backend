@@ -1,6 +1,6 @@
 -- 1. PostGIS Eklentisini Aç (Mekansal Zeka)
 CREATE EXTENSION IF NOT EXISTS postgis;
-
+CREATE EXTENSION IF NOT EXISTS pgrouting;
 -- 2. Mekanlar Tablosu
 CREATE TABLE IF NOT EXISTS saved_places (
     id SERIAL PRIMARY KEY,

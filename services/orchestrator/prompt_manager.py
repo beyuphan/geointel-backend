@@ -1,5 +1,5 @@
 # services/orchestrator/prompt_manager.py
-from typing import Dict, Any
+from typing import Dict, Any, Union
 
 BASE_SYSTEM_PROMPT = """
 Sen **GeoIntel**, konum tabanlı, gerçek zamanlı veriyle çalışan akıllı bir seyahat asistanısın.
@@ -11,18 +11,28 @@ Amacın: Kullanıcının sorusunu analiz etmek, doğru araçları seçmek ve ver
 3. **Kişiselleştirme:** Kullanıcının hafızasındaki (araç tipi, takım, ev adresi) bilgileri kullan. Araç Dizel ise Motorin fiyatını baz al.
 4. **Samimiyet:** Kullanıcıyla resmi değil, yardımsever ve samimi bir dille konuş.
 
-Rota çizdiysen, harita gösterimi için `route_polyline="LATEST"` parametresini kullanmayı unutma.
+"Rota çizdiysen, `route_polyline` alanına sana gelen encoded polyline verisini (BGbwQ...) olduğu gibi yapıştır. ASLA 'LATEST' yazma."
 """
 
-def get_dynamic_system_prompt(user_context_str: str, intent_dict: Dict[str, Any]) -> str:
+def get_dynamic_system_prompt(user_context_str: str, intent_dict: Union[Dict[str, Any], str]) -> str:
     """
     LangGraph Classifier düğümünden gelen intent analizine göre 
     dinamik ve göreve özel bir System Prompt üretir.
     """
-    category = intent_dict.get("category", "general")
-    focus_points = intent_dict.get("focus_points", [])
-    urgency = intent_dict.get("urgency", False)
     
+    # --- GÜVENLİK KONTROLÜ BAŞLANGICI (CRASH FIX) ---
+    # Gelen veri sözlük mü yoksa düz yazı mı kontrol ediyoruz.
+    if isinstance(intent_dict, dict):
+        category = intent_dict.get("category", "general")
+        focus_points = intent_dict.get("focus_points", [])
+        urgency = intent_dict.get("urgency", False)
+    else:
+        # Eğer string geldiyse (örn: "navigation"), direkt kategori kabul et.
+        category = str(intent_dict)
+        focus_points = []
+        urgency = False
+    # --- GÜVENLİK KONTROLÜ BİTİŞİ ---
+
     intent_instructions = ""
     focus_str = ", ".join(focus_points) if focus_points else "Genel konular"
 
@@ -68,7 +78,7 @@ def get_dynamic_system_prompt(user_context_str: str, intent_dict: Dict[str, Any]
 {user_context_str}
 
 === 🎯 ANLIK GÖREV ANALİZİ ===
-- **Kategori:** {category.upper()}
+- **Kategori:** {str(category).upper()}
 - **Odak Noktaları:** {focus_str}
 {urgency_note}
 

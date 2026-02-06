@@ -7,7 +7,6 @@ from tools.here import get_route_data_handler
 from tools.weather import get_weather_handler, analyze_route_weather_handler
 from tools.db import save_location_handler
 from tools.toll import get_toll_prices_handler 
-from tools.cache import redis_store
 
 # --- MCP KURULUMU ---
 mcp = FastMCP(name="City Agent")

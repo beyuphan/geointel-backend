@@ -3,40 +3,39 @@ import flexpolyline
 from logger import log
 from .config import settings
 from .models import RouteRequest
-# REDIS STORE'U ÇAĞIRIYORUZ
 from .cache import redis_store
+# Hibrit Yapı İçin Yerel Modül
+from .local_routing import is_in_samsun, get_local_route
 
-# --- GÜNCELLENEN: İSİMDEN KOORDİNAT BULUCU ---
-async def _resolve_coordinates(location: str) -> str:
+# --- 1. KOORDİNAT ÇÖZÜCÜ (Google > OSM) ---
+async def _resolve_coordinates(location: str) -> str | None:
     """
     Konum ismini koordinata çevirir.
-    Önce Google Maps Geocoding dener (Daha zeki),
-    Patlarsa OSM Nominatim dener (Yedek).
+    Bulamazsa 'Atakum' stringini değil, NONE döner. (Sistemin patlamaması için kritik nokta burası)
     """
-    # 1. Zaten koordinatsa dokunma (Örn: "41.02,40.52")
+    # 1. Eğer gelen veri zaten koordinatsa (Örn: "41.02,40.52") doğrudan döndür.
     if "," in location:
         parts = location.split(",")
         try:
-            float(parts[0])
-            float(parts[1])
+            # Sadece sayı mı diye kontrol et (Validation)
+            float(parts[0].strip())
+            float(parts[1].strip())
             return location.replace(" ", "")
         except ValueError:
-            pass # Sayı değilse devam et (Örn: "Rize, Merkez")
+            pass # İçinde virgül var ama sayı değil (Örn: "Rize, Merkez"), devam et.
 
-    # 2. ÖNCE GOOGLE MAPS DENEYELİM (İnsan niyetini daha iyi anlar)
-    # Google "Rize" denince valiliği/merkezi verir, OSM ise il sınırının ortasını (dağı) verir.
+    # 2. A PLANI: GOOGLE MAPS (Daha Zeki)
     if settings.GOOGLE_MAPS_API_KEY:
         log.info(f"🌍 [Google] Konum çözümleniyor: {location}")
-        url = "https://maps.googleapis.com/maps/api/geocode/json"
-        params = {
-            "address": location,
-            "key": settings.GOOGLE_MAPS_API_KEY,
-            "language": "tr",
-            "region": "tr" # Türkiye sonuçlarını öncele
-        }
-        
         try:
             async with httpx.AsyncClient() as client:
+                url = "https://maps.googleapis.com/maps/api/geocode/json"
+                params = {
+                    "address": location,
+                    "key": settings.GOOGLE_MAPS_API_KEY,
+                    "language": "tr",
+                    "region": "tr"
+                }
                 resp = await client.get(url, params=params, timeout=10.0)
                 data = resp.json()
                 
@@ -48,19 +47,18 @@ async def _resolve_coordinates(location: str) -> str:
         except Exception as e:
             log.error(f"Google Geocoding Hatası: {e}")
 
-    # 3. GOOGLE PATLARSA OSM NOMINATIM (YEDEK)
+    # 3. B PLANI: OSM NOMINATIM (Yedek)
     log.info(f"🌍 [OSM] Konum çözümleniyor (Yedek): {location}")
-    url = "https://nominatim.openstreetmap.org/search"
-    params = {
-        "q": location,
-        "format": "json",
-        "limit": 1,
-        "countrycodes": "tr" 
-    }
-    headers = {"User-Agent": "GeoIntel_City/1.0"}
-
     try:
         async with httpx.AsyncClient() as client:
+            url = "https://nominatim.openstreetmap.org/search"
+            headers = {"User-Agent": "GeoIntel_City/1.0"}
+            params = {
+                "q": location,
+                "format": "json",
+                "limit": 1,
+                "countrycodes": "tr" 
+            }
             resp = await client.get(url, params=params, headers=headers, timeout=10.0)
             data = resp.json()
             if data:
@@ -71,10 +69,13 @@ async def _resolve_coordinates(location: str) -> str:
     except Exception as e:
         log.error(f"OSM Geocoding Hatası: {e}")
     
-    # Hiçbiri bulamazsa orijinali dön (HERE API belki anlar diye)
-    return location
+    # 4. HİÇBİRİ BULAMAZSA
+    # Eski kod burada 'return location' yapıyordu, bu da hataya sebep oluyordu.
+    # Artık None dönüyoruz ki aşağıda kontrol edebilelim.
+    log.warning(f"❌ Konum hiçbir serviste bulunamadı: {location}")
+    return None
 
-# YARDIMCI FONKSİYON: Koordinatın Adını Bul (Tersine Geocoding)
+# --- 2. YARDIMCI: KONUM ADI BULMA (Reverse Geocoding) ---
 async def get_location_name(lat, lon):
     try:
         url = "https://maps.googleapis.com/maps/api/geocode/json"
@@ -84,23 +85,64 @@ async def get_location_name(lat, lon):
             data = resp.json()
             if data.get("results"):
                 for comp in data["results"][0]["address_components"]:
-                    if "administrative_area_level_2" in comp["types"]: # İlçe adı
+                    if "administrative_area_level_2" in comp["types"]: 
                         return comp["long_name"]
                 return data["results"][0]["formatted_address"]
     except:
         return "Bilinmeyen Konum"
     return "Bilinmeyen Konum"
 
+# --- 3. ANA ROTA HANDLER (HİBRİT BEYİN) ---
 async def get_route_data_handler(origin: str, destination: str) -> dict:
-    """HERE Maps API ile rota hesaplar ve REDIS'E KAYDEDER."""
+    """
+    Samsun içindeyse -> Yerel DB (PostGIS)
+    Dışındaysa -> HERE Maps API
+    """
     try:
-        # --- ÖNCE KOORDİNATLARI ÇÖZ (Google Öncelikli) ---
+        # A. Koordinatları Çöz
         origin_coord = await _resolve_coordinates(origin)
         dest_coord = await _resolve_coordinates(destination)
         
-        # --- SONRA REQUEST MODELİNE VER ---
-        req = RouteRequest(origin=origin_coord, destination=dest_coord)
+        # --- KRİTİK GÜVENLİK KONTROLÜ ---
+        # Eğer koordinat bulunamadıysa (None geldiyse) işlemi burada durdur.
+        # Float çevirme hatasını engelleyen kısım burası.
+        if not origin_coord:
+            return {"error": f"Başlangıç konumu haritada bulunamadı: {origin}"}
+        if not dest_coord:
+            return {"error": f"Bitiş konumu haritada bulunamadı: {destination}"}
+
+        # B. Float Dönüşümü (Artık güvenli çünkü None olmadığını biliyoruz)
+        try:
+            lat1, lon1 = map(float, origin_coord.split(","))
+            lat2, lon2 = map(float, dest_coord.split(","))
+        except ValueError:
+             return {"error": "Koordinat formatı hatalı, işlem yapılamadı."}
+
+        # C. SAMSUN KONTROLÜ (YEREL ROTA)
+        if is_in_samsun(lat1, lon1) and is_in_samsun(lat2, lon2):
+            log.info(f"🏙️ [SAMSUN OPS] Yerel Veritabanı Devrede: {origin} -> {destination}")
+            
+            local_rows = await get_local_route(lat1, lon1, lat2, lon2)
+            
+            if local_rows:
+                return {
+                    "source": "Samsun_Local_DB",
+                    "mesafe_km": "Hesaplaniyor (PostGIS)", 
+                    "sure_dk": "Hava Durumlu (PostGIS)",
+                    "analiz_noktalari": {
+                        "baslangic": {"coords": [lat1, lon1], "ad": origin},
+                        "bitis": {"coords": [lat2, lon2], "ad": destination}
+                    },
+                    "polyline_encoded": "LOCAL_DB_ROUTE",
+                    "not": "Bu rota Samsun yerel veritabanından, hava durumu faktörü eklenerek çekilmiştir."
+                }
+            else:
+                log.warning("⚠️ Yerel rota hesaplanamadı, HERE API deneniyor.")
+
+        # D. HERE MAPS API (FALLBACK / DIŞ HAT)
+        log.info(f"🌍 [HERE API] Dış Hat Rotası Hesaplanıyor: {origin} -> {destination}")
         
+        req = RouteRequest(origin=origin_coord, destination=dest_coord)
         params = {
             "transportMode": "car",
             "origin": req.origin,
@@ -118,32 +160,28 @@ async def get_route_data_handler(origin: str, destination: str) -> dict:
                 summary = section["summary"]
                 encoded_polyline = section["polyline"]
                 
-                # --- REDIS KAYDI ---
+                # Redis'e Kaydet
                 redis_store.set_route(encoded_polyline)
-                log.info("💾 Rota başarıyla REDIS'e önbelleklendi.")
                 
-                # Koordinatları çöz (Orta nokta hesabı için)
+                # Analiz Noktaları (Orta Nokta vb.)
                 decoded_coords = list(flexpolyline.decode(encoded_polyline))
-                
-                # Orta noktayı al
                 mid_point = decoded_coords[len(decoded_coords) // 2]
                 mid_point_name = await get_location_name(mid_point[0], mid_point[1])
 
-                check_points = {
-                    "baslangic": {"coords": decoded_coords[0], "ad": "Başlangıç"},
-                    "orta_nokta": {"coords": mid_point, "ad": mid_point_name},
-                    "bitis": {"coords": decoded_coords[-1], "ad": "Bitiş"}
-                }
-
                 return {
+                    "source": "HERE_Maps_API",
                     "mesafe_km": round(summary["length"] / 1000, 2),
                     "sure_dk": round(summary["duration"] / 60, 0),
-                    "analiz_noktalari": check_points,
-                    "polyline_encoded": "LATEST" 
+                    "analiz_noktalari": {
+                        "baslangic": {"coords": decoded_coords[0], "ad": origin},
+                        "orta_nokta": {"coords": mid_point, "ad": mid_point_name},
+                        "bitis": {"coords": decoded_coords[-1], "ad": destination}
+                    },
+                    "polyline_encoded": encoded_polyline, 
                 }
             
-            return {"error": "Rota bulunamadı"}
+            return {"error": "Rota bulunamadı (HERE API)"}
 
     except Exception as e:
-        log.error(f"Rota Hatası: {e}")
-        return {"error": str(e)}
+        log.error(f"Genel Rota Hatası: {e}")
+        return {"error": f"Sistem Hatası: {str(e)}"}

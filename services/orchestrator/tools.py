@@ -55,20 +55,20 @@ MANUAL_TOOLS = [
             "required": ["lat", "lon"]
         }
     },
-   {
-    "name": "analyze_route_weather",
-    "description": "WEATHER SHIELD: Rota üzerindeki hava durumunu topluca tarar ve riskleri raporlar. Rota planlandıktan sonra hava durumu analizi gerekiyorsa bunu kullan.",
-    "inputSchema": {
-        "type": "object",
-        "properties": {
-            "polyline": {
-                "type": "string", 
-                "description": "Analiz edilecek rotanın polyline verisi. Eğer ajan hafızasında varsa gönderir, yoksa sistem otomatik tamamlar."
-            }
-        },
-        "required": ["polyline"]
-    }
-},
+    {
+        "name": "analyze_route_weather",
+        "description": "WEATHER SHIELD: Rota üzerindeki hava durumunu topluca tarar ve riskleri raporlar. Rota planlandıktan sonra hava durumu analizi gerekiyorsa bunu kullan.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "polyline": {
+                    "type": "string", 
+                    "description": "Analiz edilecek rotanın polyline verisi. Eğer ajan hafızasında varsa gönderir, yoksa sistem otomatik tamamlar."
+                }
+            },
+            "required": ["polyline"]
+        }
+    },
     {
         "name": "save_location",
         "description": "Kullanıcının beğendiği veya kaydetmek istediği bir konumu veritabanına işler.",

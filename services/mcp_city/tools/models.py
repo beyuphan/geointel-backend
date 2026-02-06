@@ -1,12 +1,12 @@
 # services/mcp_city/models.py
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional
+from typing import Optional, Literal
 
 # 1. OSM İsteği Validasyonu
 class OSMRequest(BaseModel):
     lat: float = Field(..., ge=-90, le=90, description="Geçerli bir enlem olmalı")
     lon: float = Field(..., ge=-180, le=180, description="Geçerli bir boylam olmalı")
-    category: str = Field(..., pattern="^(airport|park|square|mosque|hospital|school)$")
+    category: str = Field(..., description="Aranacak yerin İngilizce OSM etiketi (Örn: cafe, park, supermarket, commercial, clothing).")
     radius: int = Field(default=2000, ge=100, le=50000)
 
 # 2. Google Arama Validasyonu
