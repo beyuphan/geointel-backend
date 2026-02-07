@@ -1,7 +1,8 @@
 import os
 import httpx
 import json
-import polyline
+import flexpolyline
+import math  # <--- EKLENDİ: Sonsuzluk kontrolü için şart
 from loguru import logger
 from shapely.geometry import Point, LineString
 from shapely.ops import transform
@@ -12,11 +13,28 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 def get_distance_from_route(location, polyline_str):
     """
     Mekan ile rota arasındaki en kısa mesafeyi (metre cinsinden) döner.
+    Hata durumunda veya sonsuzluk durumunda 999999 döner.
     """
     try:
-        if not polyline_str or polyline_str == "LATEST": return 0 # Rota yoksa mesafe 0 varsay
+        # Basit validasyonlar
+        if not polyline_str or polyline_str == "LATEST": 
+            return 0
         
-        decoded = polyline.decode(polyline_str)
+        if len(polyline_str) < 5: # Çok kısa stringler decode hatası verebilir
+            return 999999
+
+        try:
+            decoded = flexpolyline.decode(polyline_str)
+        except Exception:
+            import polyline
+            try:
+                decoded = polyline.decode(polyline_str)
+            except:
+                return 999999
+
+        if not decoded:
+            return 999999
+
         line_coords = [(lon, lat) for lat, lon in decoded]
         route_line = LineString(line_coords)
         place_point = Point(location["lng"], location["lat"])
@@ -31,14 +49,19 @@ def get_distance_from_route(location, polyline_str):
         route_line_m = transform(project, route_line)
         place_point_m = transform(project, place_point)
 
-        return route_line_m.distance(place_point_m)
-    except Exception as e:
-        logger.error(f"⚠️ Mesafe ölçüm hatası: {e}")
-        return 999999 # Hata varsa çok uzak varsay
+        distance = route_line_m.distance(place_point_m)
 
+        # 🛡️ GÜVENLİK KONTROLÜ: Sonsuz veya Tanımsız değer kontrolü
+        if math.isinf(distance) or math.isnan(distance):
+            return 999999
+            
+        return distance
+
+    except Exception as e:
+        # Sadece beklenmedik kritik hataları logla
+        logger.warning(f"⚠️ Mesafe ölçümü yapılamadı: {e}")
+        return 999999 # Hata varsa çok uzak varsay
 async def search_places_google_handler(query: str, lat: float = None, lon: float = None, route_polyline: str = None) -> dict:
-    # ⚠️ DİKKAT: Dönüş tipini 'list' değil 'dict' yaptım!
-    
     if not GOOGLE_API_KEY:
         return {"error": "GOOGLE_MAPS_API_KEY eksik."}
 
@@ -56,7 +79,7 @@ async def search_places_google_handler(query: str, lat: float = None, lon: float
     
     if lat and lon:
         params["location"] = f"{lat},{lon}"
-        params["radius"] = "10000" # 10km çapında her şeyi getir, biz süzeceğiz
+        params["radius"] = "50000" # 50km (Rotayı kapsayacak kadar geniş tutalım)
 
     async with httpx.AsyncClient() as client:
         try:
@@ -69,16 +92,14 @@ async def search_places_google_handler(query: str, lat: float = None, lon: float
 
             raw_results = data["results"]
             
-            # --- 🚦 AYRIŞTIRMA MANTIĞI ---
-            on_route_list = [] # Tam yol üstü (Max 300m sapma)
-            detour_list = []   # Biraz sapmalı (Max 3km sapma)
+            on_route_list = []
+            detour_list = []
             
             for place in raw_results:
                 loc = place["geometry"]["location"]
                 rating = place.get("rating", 0)
                 user_ratings_total = place.get("user_ratings_total", 0)
                 
-                # Mekan Objesi
                 place_obj = {
                     "name": place.get("name"),
                     "address": place.get("formatted_address"),
@@ -90,25 +111,30 @@ async def search_places_google_handler(query: str, lat: float = None, lon: float
 
                 if should_calc_distance:
                     deviation = get_distance_from_route(loc, route_polyline)
-                    place_obj["deviation_meters"] = int(deviation)
                     
-                    if deviation <= 400: # 400 metreye kadar "Yol Üstü" sayalım
-                        on_route_list.append(place_obj)
-                    elif deviation <= 5000: # 5km'ye kadar "Uzatmalı" sayalım
-                        detour_list.append(place_obj)
+                    if isinstance(deviation, (int, float)) and deviation < 900000:
+                        place_obj["deviation_meters"] = int(deviation)
+                        
+                        # 400m rota üstü, 5km sapma
+                        if place_obj["deviation_meters"] <= 400:
+                            on_route_list.append(place_obj)
+                        elif place_obj["deviation_meters"] <= 5000:
+                            detour_list.append(place_obj)
+                    else:
+                         # Mesafe ölçülemediyse ama Google bulduysa, bunu "Uzak" listesine ekleyelim mi?
+                         # Şimdilik eklemeyelim, sadece rotadakileri istiyoruz.
+                         pass
                 else:
-                    # Rota yoksa hepsi yol üstü sayılır (Merkez araması)
                     on_route_list.append(place_obj)
 
-            # --- 📊 SIRALAMA (PUANA GÖRE) ---
-            # İkisini de puana göre tersten sırala (En yüksek puan en başa)
+            # Sıralama
             on_route_list.sort(key=lambda x: x['rating'], reverse=True)
             detour_list.sort(key=lambda x: x['rating'], reverse=True)
 
             return {
                 "route_status": "active" if should_calc_distance else "inactive",
-                "strict_route_places": on_route_list[:5], # En iyi 5
-                "relaxed_route_places": detour_list[:5]     # En iyi 5
+                "strict_route_places": on_route_list[:5],
+                "relaxed_route_places": detour_list[:5]
             }
 
         except Exception as e:

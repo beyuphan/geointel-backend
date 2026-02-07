@@ -19,3 +19,8 @@ infra/redis/data/
 # 4. IDE Dosyaları
 .vscode/
 .idea/
+
+# 5. Büyük Veri Dosyaları
+data/*.osm
+data/*.pbf
+*.log

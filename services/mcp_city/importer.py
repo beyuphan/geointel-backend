@@ -3,94 +3,101 @@ import asyncpg
 import xml.etree.ElementTree as ET
 import os
 
-# Veritabanı Bilgileri (.env ile aynı)
 DB_DSN = "postgresql://user:password@geo_db:5432/geodb"
-OSM_FILE = "/app/data/samsun.osm"
+OSM_FILE = "/app/data/istanbul_pilot.osm"
 
-async def run_import():
-    print(f"🔌 Veritabanına bağlanılıyor...")
+# OSM Standart Hızları
+SPEED_LIMITS = {
+    'motorway': 110, 'trunk': 90, 'primary': 70,
+    'secondary': 50, 'tertiary': 40, 'residential': 30,
+    'service': 20, 'living_street': 10
+}
+
+async def import_osm():
+    print("🔌 Veritabanına bağlanılıyor...")
     conn = await asyncpg.connect(DB_DSN)
-    
-    # 1. TEMİZLİK
+
+    # 1. TABLOLARI SIFIRLA
     print("🧹 Tablolar temizleniyor...")
     await conn.execute("DROP TABLE IF EXISTS ways CASCADE;")
     await conn.execute("DROP TABLE IF EXISTS ways_vertices_pgr CASCADE;")
     
-    # 2. TABLO OLUŞTURMA (Standart pgRouting yapısı)
-    print("🔨 'ways' tablosu oluşturuluyor...")
+    # ibb_match_id: İBB verisiyle eşleşirse buraya ID yazacağız
     await conn.execute("""
         CREATE TABLE ways (
             gid SERIAL PRIMARY KEY,
-            source INTEGER,
-            target INTEGER,
-            cost FLOAT,
-            reverse_cost FLOAT,
+            osm_id BIGINT,
+            source BIGINT, target BIGINT,
             length_m FLOAT,
+            cost_time FLOAT, reverse_cost_time FLOAT,
             name TEXT,
             maxspeed INTEGER,
+            current_speed INTEGER, -- Canlı hız buraya
+            ibb_match_id INTEGER,  -- EŞLEŞME ANAHTARI
+            highway TEXT,
             the_geom GEOMETRY(LineString, 4326)
         );
     """)
 
-    # 3. DOSYAYI OKU VE YÜKLE
-    print("📂 XML okunuyor...")
+    # 2. OSM PARSE ET
+    print("📂 OSM Dosyası okunuyor...")
+    if not os.path.exists(OSM_FILE):
+        print("❌ Dosya yok! Önce indir.")
+        return
+
     tree = ET.parse(OSM_FILE)
     root = tree.getroot()
     
-    nodes = {n.get('id'): (n.get('lon'), n.get('lat')) for n in root.findall('node')}
-    ways_to_insert = []
+    node_coords = {}
+    for node in root.findall('node'):
+        node_coords[int(node.get('id'))] = (float(node.get('lon')), float(node.get('lat')))
+
+    print("🛣️ Yollar yükleniyor...")
+    ways_data = []
     
-    print("🛣️ Yollar işleniyor...")
     for way in root.findall('way'):
-        # Sadece araç yollarını al
         tags = {t.get('k'): t.get('v') for t in way.findall('tag')}
         if 'highway' not in tags: continue
-        if tags['highway'] in ['footway', 'pedestrian', 'steps', 'corridor']: continue
-
-        way_nodes = way.findall('nd')
-        if len(way_nodes) < 2: continue
         
-        # Koordinatları birleştirip Çizgi (LineString) yap
-        coords = []
-        for nd in way_nodes:
-            ref = nd.get('ref')
-            if ref in nodes:
-                coords.append(f"{nodes[ref][0]} {nodes[ref][1]}")
+        highway = tags['highway']
+        speed = SPEED_LIMITS.get(highway, 30)
+        name = tags.get('name', 'Bilinmiyor')
         
-        if len(coords) > 1:
-            wkt = f"LINESTRING({', '.join(coords)})"
-            speed = int(tags.get('maxspeed', '50').split()[0]) if 'maxspeed' in tags else 50
-            name = tags.get('name', 'Unknown')
-            ways_to_insert.append((name, speed, wkt))
+        nd_refs = [int(nd.get('ref')) for nd in way.findall('nd')]
+        if len(nd_refs) < 2: continue
 
-    print(f"💾 {len(ways_to_insert)} adet yol veritabanına basılıyor...")
+        for i in range(len(nd_refs) - 1):
+            s_id, t_id = nd_refs[i], nd_refs[i+1]
+            if s_id in node_coords and t_id in node_coords:
+                s_lon, s_lat = node_coords[s_id]
+                t_lon, t_lat = node_coords[t_id]
+                wkt = f"LINESTRING({s_lon} {s_lat}, {t_lon} {t_lat})"
+                
+                # Başlangıçta ibb_match_id NULL, current_speed = maxspeed
+                ways_data.append((name, speed, speed, highway, wkt))
+
+    print(f"💾 {len(ways_data)} parça OSM yolu yükleniyor...")
+    await conn.executemany("""
+        INSERT INTO ways (name, maxspeed, current_speed, highway, cost_time, the_geom)
+        VALUES ($1, $2, $3, $4, 0, ST_GeomFromText($5, 4326))
+    """, ways_data)
+
+    # 3. TOPOLOJİ VE MALİYET
+    print("🧮 Geometrik hesaplamalar...")
+    await conn.execute("UPDATE ways SET length_m = ST_Length(the_geom::geography);")
     
-    # Veriyi Hızlıca Bas
-    for name, speed, wkt in ways_to_insert:
-        await conn.execute("""
-            INSERT INTO ways (name, maxspeed, the_geom, source, target, cost, reverse_cost) 
-            VALUES ($1, $2, ST_GeomFromText($3, 4326), 0, 0, 0, 0)
-        """, name, speed, wkt)
-
-    # 4. TOPOLOJİ (İŞİN BEYNİ BURASI)
-    print("🧠 PostGIS Topoloji Motoru Çalıştırılıyor (pgr_createTopology)...")
-    # Bu fonksiyon veritabanının kendi özelliğidir. Yolları analiz edip kavşakları bağlar.
-    try:
-        await conn.execute("SELECT pgr_createTopology('ways', 0.00001, 'the_geom', 'gid');")
-        print("✅ Topoloji başarıyla kuruldu!")
-    except Exception as e:
-        print(f"⚠️ Topoloji uyarısı (önemsiz olabilir): {e}")
-
-    # 5. ANALİZ VE MALİYET
-    print("🧮 Uzunluklar hesaplanıyor...")
+    # Süre Hesabı: Mesafe / Hız
     await conn.execute("""
-        UPDATE ways SET length_m = ST_Length(the_geom::geography);
-        UPDATE ways SET cost = length_m; 
-        UPDATE ways SET reverse_cost = length_m;
+        UPDATE ways SET 
+        cost_time = length_m / (current_speed / 3.6),
+        reverse_cost_time = length_m / (current_speed / 3.6);
     """)
-    
-    print("🚀 İŞLEM TAMAM! Samsun veritabanına gömüldü.")
+
+    print("🔗 Topoloji oluşturuluyor (pgr_createTopology)...")
+    await conn.execute("SELECT pgr_createTopology('ways', 0.0001, 'the_geom', 'gid');")
+
+    print("✅ OSM KURULUMU TAMAM!")
     await conn.close()
 
 if __name__ == "__main__":
-    asyncio.run(run_import())
+    asyncio.run(import_osm())

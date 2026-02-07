@@ -1,5 +1,6 @@
 # services/mcp_city/tools/geometry.py
 import flexpolyline
+import math
 from shapely.geometry import Point, LineString
 from logger import log
 from shapely.ops import transform
@@ -23,22 +24,33 @@ def sample_route_points(encoded_polyline: str, interval_km: int = 40) -> list:
     Rotayı analiz eder ve her 'interval_km' mesafede bir koordinat örnekler.
     Örn: 400km yol için ~10 nokta döndürür.
     """
-    if not encoded_polyline or encoded_polyline == "LATEST":
+    if not encoded_polyline or len(encoded_polyline) < 5 or encoded_polyline == "LATEST":
         return []
 
     try:
         # 1. Polyline çöz (Decode)
-        coords = flexpolyline.decode(encoded_polyline) # [(lat, lon), ...]
+        try:
+            coords = flexpolyline.decode(encoded_polyline) # [(lat, lon), ...]
+        except Exception:
+            # Decode hatası olursa sessizce boş dön
+            return []
+
         # Shapely (lon, lat) ister, flexpolyline (lat, lon) verir. Ters çevir:
         line_coords = [(lon, lat) for lat, lon in coords]
         
-        if not line_coords: return []
+        if not line_coords or len(line_coords) < 2: 
+            return []
         
         # 2. Geometriyi oluştur ve Metreye çevir
         route_line = LineString(line_coords)
         route_line_m = transform(project_to_meters, route_line)
         
         total_length_m = route_line_m.length
+        
+        # Eğer uzunluk çok kısaysa veya hesaplanamadıysa
+        if total_length_m <= 0 or math.isnan(total_length_m):
+            return []
+
         interval_m = interval_km * 1000
         
         # 3. Örnekleme (Sampling)
@@ -62,7 +74,7 @@ def sample_route_points(encoded_polyline: str, interval_km: int = 40) -> list:
         return sampled_points
 
     except Exception as e:
-        log.error(f"❌ Geometri Hatası: {e}")
+        log.error(f"❌ Geometri Hatası (sample_route_points): {e}")
         return []
 
 def filter_places_by_polyline(places: list, encoded_polyline: str) -> list:
@@ -73,12 +85,20 @@ def filter_places_by_polyline(places: list, encoded_polyline: str) -> list:
     - 500m-3000m: "Ufak Sapma" (Değebilir)
     - >3000m: Elenir.
     """
-    if not encoded_polyline:
+    if not encoded_polyline or len(encoded_polyline) < 5:
         return places
 
     try:
-        coords = flexpolyline.decode(encoded_polyline)
+        try:
+            coords = flexpolyline.decode(encoded_polyline)
+        except Exception:
+            return places # Decode edemezsek filtrelemeden dönelim
+
         line_coords = [(lon, lat) for lat, lon in coords]
+        
+        if len(line_coords) < 2:
+            return places
+
         route_line = LineString(line_coords)
         
         processed_places = []
@@ -92,30 +112,38 @@ def filter_places_by_polyline(places: list, encoded_polyline: str) -> list:
             p_lat, p_lon = place.get("lat"), place.get("lon")
             if not p_lat or not p_lon: continue
                 
-            point = Point(p_lon, p_lat)
-            distance_deg = route_line.distance(point)
-            distance_meters = int(distance_deg * 111000)
-            
-            # --- ETIKETLEME MANTIĞI ---
-            if distance_deg <= FLEXIBLE_LIMIT:
-                # Durumu belirle
-                if distance_deg <= STRICT_LIMIT:
-                    place["konum_durumu"] = "✅ YOL ÜSTÜ"
-                    place["sapma_mesafesi"] = f"{distance_meters} metre"
-                else:
-                    place["konum_durumu"] = "⚠️ SAPMA GEREKTİRİR"
-                    place["sapma_mesafesi"] = f"{round(distance_meters/1000, 1)} km"
+            try:
+                point = Point(p_lon, p_lat)
+                distance_deg = route_line.distance(point)
                 
-                # Matematiksel veriyi de ekleyelim ki LLM kıyaslasın
-                place["mesafe_raw"] = distance_meters
-                processed_places.append(place)
+                # Matematiksel koruma
+                if math.isinf(distance_deg) or math.isnan(distance_deg):
+                    continue
+
+                distance_meters = int(distance_deg * 111000)
+                
+                # --- ETIKETLEME MANTIĞI ---
+                if distance_deg <= FLEXIBLE_LIMIT:
+                    # Durumu belirle
+                    if distance_deg <= STRICT_LIMIT:
+                        place["konum_durumu"] = "✅ YOL ÜSTÜ"
+                        place["sapma_mesafesi"] = f"{distance_meters} metre"
+                    else:
+                        place["konum_durumu"] = "⚠️ SAPMA GEREKTİRİR"
+                        place["sapma_mesafesi"] = f"{round(distance_meters/1000, 1)} km"
+                    
+                    # Matematiksel veriyi de ekleyelim ki LLM kıyaslasın
+                    place["mesafe_raw"] = distance_meters
+                    processed_places.append(place)
+            except Exception:
+                continue # Tekil mekan hatalarında döngüyü kırma
 
         # En yakından en uzağa sırala
-        processed_places.sort(key=lambda x: x["mesafe_raw"])
+        processed_places.sort(key=lambda x: x.get("mesafe_raw", 999999))
         
         log.success(f"✅ Akıllı Filtre: {len(processed_places)} mekan analiz edildi.")
         return processed_places
 
     except Exception as e:
-        log.error(f"Geometri Hatası: {e}")
+        log.error(f"Geometri Hatası (filter_places_by_polyline): {e}")
         return places
