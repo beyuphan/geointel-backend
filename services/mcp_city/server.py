@@ -19,8 +19,15 @@ mcp = FastMCP(name="City Agent")
 @mcp.tool()
 async def search_infrastructure_osm(lat: float, lon: float, category: str) -> str:
     """
-    Kamusal alanları (Hastane, Okul, Park, Eczane vb.) OSM üzerinden bulur.
-    Kategori örnekleri: 'hastane', 'okul', 'park', 'eczane', 'polis'.
+    OSM ALTYAPI ARAMA: Belirtilen konumun çevresindeki kamusal alanları bulur.
+    
+    Ticari olmayan; Hastane, Okul, Park, Stadyum, Havalimanı gibi yerler için bunu kullan.
+    Restoran veya kafe aramak için BUNU KULLANMA.
+    
+    Args:
+        lat (float): Merkez enlem.
+        lon (float): Merkez boylam.
+        category (str): 'hospital', 'park', 'stadium', 'airport', 'parking'.
     """
     try:
         logger.info(f"🛠️ [Tool: OSM] İstek: {category} @ {lat},{lon}")
@@ -54,8 +61,15 @@ async def search_infrastructure_osm(lat: float, lon: float, category: str) -> st
 @mcp.tool()
 async def search_places_google(query: str, lat: float = None, lon: float = None, route_polyline: str = None) -> str:
     """
-    Ticari mekanları (Restoran, Benzinlik, Tamirci) Google Maps'te arar.
-    Eğer 'route_polyline' verilirse, sadece rota üzerindeki veya yakınındaki yerleri filtreler.
+    GOOGLE MEKAN ARAMA: Restoran, Benzinlik, Tamirci, Kafe gibi ticari yerleri arar.
+    
+    Eğer kullanıcı bir rota üzerindeyse 'route_polyline' parametresi mutlaka dolu gelmelidir.
+    
+    Args:
+        query (str): Aranan yer (Örn: 'En yakın köfteci', 'Lastikçi').
+        lat (float): Aramanın yapılacağı merkez enlem.
+        lon (float): Aramanın yapılacağı merkez boylam.
+        route_polyline (str, optional): Eğer bir rota varsa, rota çizgisi (encoded polyline).
     """
     try:
         logger.info(f"🛠️ [Tool: Google] İstek: '{query}' (Rota Modu: {'Aktif' if route_polyline else 'Pasif'})")
@@ -110,9 +124,14 @@ async def search_places_google(query: str, lat: float = None, lon: float = None,
 @mcp.tool()
 async def get_route_data(origin: str, destination: str) -> str:
     """
-    Akıllı Rota Hesaplayıcı.
-    İstanbul içindeyse: Canlı Trafik verisiyle Yerel DB kullanır.
-    Şehirlerarasıysa: HERE Maps verisini kullanır.
+    AKILLI ROTA MOTORU: İki nokta arasındaki trafik durumunu, süreyi ve mesafeyi hesaplar.
+    
+    Bu araç, hem şehir içi (İstanbul İBB verisi) hem de şehirler arası (HERE Maps) 
+    rota hesaplamaları için TEK YETKİLİ araçtır.
+    
+    Args:
+        origin (str): Başlangıç noktası (Örn: 'Rize', 'Kadikoy evlendirme dairesi').
+        destination (str): Varış noktası (Örn: 'Trabzon', 'Taksim meydani').
     """
     try:
         logger.info(f"🛠️ [Tool: Rota] Hesapla: {origin} -> {destination}")
@@ -151,7 +170,13 @@ async def get_route_data(origin: str, destination: str) -> str:
 # --- 4. HAVA DURUMU ---
 @mcp.tool()
 async def get_weather(lat: float, lon: float) -> str:
-    """Belirtilen koordinatın hava durumunu getirir."""
+    """
+    Belirtilen koordinat için anlık hava durumunu verir.
+    
+    Args:
+        lat (float): Enlem.
+        lon (float): Boylam.
+    """
     try:
         logger.info(f"🛠️ [Tool: Hava] Sorgu: {lat},{lon}")
         raw_data = await get_weather_handler(lat, lon)
@@ -179,8 +204,12 @@ async def get_weather(lat: float, lon: float) -> str:
 @mcp.tool()
 async def analyze_route_weather(polyline: str) -> str:
     """
-    Bir rota boyunca (Polyline String) hava durumunu analiz eder.
-    Farklı noktalardaki hava değişimlerini raporlar.
+    WEATHER SHIELD: Uzun yolculuklarda rota üzerindeki hava durumu risklerini analiz eder.
+    
+    Kullanıcı 'yolculukta yağmur var mı?', 'yolda hava nasıl?' diye sorarsa bunu kullan.
+    
+    Args:
+        polyline (str): Rota verisi (Encoded Polyline string).
     """
     try:
         logger.info("🛠️ [Tool: Rota Hava] Analiz başlatılıyor...")
@@ -197,7 +226,16 @@ async def analyze_route_weather(polyline: str) -> str:
 # --- 6. KONUM KAYDETME (DB) ---
 @mcp.tool()
 async def save_location(name: str, lat: float, lon: float, category: str = "Genel", note: str = "") -> str:
-    """Kullanıcının istediği bir konumu veritabanına kaydeder."""
+    """
+    Kullanıcının bir konumu veritabanına kaydetmesini sağlar.
+    
+    Args:
+        name (str): Konumun adı (Örn: 'Mehmetin evi').
+        lat (float): Enlem.
+        lon (float): Boylam.
+        category (str): Kategori (ev, is, favori).
+        note (str): Kullanıcı notu.
+    """
     try:
         logger.info(f"💾 [Tool: DB] Kayıt: {name}")
         result = await save_location_handler(name, lat, lon, category, note)
@@ -209,7 +247,12 @@ async def save_location(name: str, lat: float, lon: float, category: str = "Gene
 # --- 7. OTOYOL ÜCRETLERİ ---
 @mcp.tool()
 async def get_toll_prices(filter_region: str = None) -> str:
-    """Otoyol ve köprü ücretlerini listeler."""
+    """
+    Köprü, tünel ve otoyol geçiş ücretlerini listeler.
+    
+    Args:
+        filter_region (str): Filtrelemek için şehir adı (Örn: 'İstanbul'). Hepsi için boş bırak.
+    """
     try:
         logger.info("🛠️ [Tool: Otoyol] Fiyatlar çekiliyor...")
         text_result = await get_toll_prices_handler(filter_region)

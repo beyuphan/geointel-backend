@@ -65,7 +65,15 @@ def create_response(data_list, model_class) -> str:
 
 @mcp.tool()
 async def get_pharmacies(city: str, district: str = "") -> str:
-    """Nöbetçi eczaneleri bulur. JSON String döner."""
+    """
+    Belirtilen şehir ve ilçedeki nöbetçi eczaneleri bulur.
+    
+    Args:
+        city (str): Şehir adı (Örn: 'Samsun', 'Istanbul').
+        district (str): İlçe adı (Örn: 'Atakum', 'Kadikoy').
+    Returns:
+        JSON string formatında eczane listesi.
+    """
     logger.info(f"💊 [REQ] Eczane: {city}/{district}")
     
     # 1. DB Kontrol
@@ -110,7 +118,14 @@ async def get_pharmacies(city: str, district: str = "") -> str:
 
 @mcp.tool()
 async def get_fuel_prices(city: str, district: str) -> str:
-    """Akaryakıt fiyatlarını getirir. JSON String döner."""
+    """
+    Güncel akaryakıt (Benzin, Motorin, LPG) fiyatlarını getirir.
+    En ucuz istasyonları bulmak için kullanılır.
+    
+    Args:
+        city (str): Şehir adı.
+        district (str): İlçe adı.
+    """
     logger.info(f"⛽ [REQ] Yakıt: {city}/{district}")
     
     # 1. DB
@@ -149,7 +164,12 @@ async def get_fuel_prices(city: str, district: str) -> str:
 
 @mcp.tool()
 async def get_city_events(city: str) -> str:
-    """Şehir etkinlikleri. JSON String döner."""
+    """
+    Şehirdeki yaklaşan konser, tiyatro ve sanat etkinliklerini listeler.
+    
+    Args:
+        city (str): Etkinliklerin aranacağı şehir.
+    """
     logger.info(f"🎭 [REQ] Etkinlik: {city}")
     
     # DB
@@ -166,7 +186,10 @@ async def get_city_events(city: str) -> str:
 
 @mcp.tool()
 async def get_sports_events() -> str:
-    """Maç fikstürü. JSON String döner."""
+    """
+    Yaklaşan futbol maçlarını, stadyum ve saat bilgilerini getirir.
+    Trafik yoğunluğunu tahmin etmek veya maç programını öğrenmek için kullanılır.
+    """
     logger.info(f"⚽ [REQ] Maç Fikstürü")
     
     # DB
