@@ -1,29 +1,34 @@
 import json
+import uvicorn
 from fastmcp import FastMCP
-from loguru import logger  # <--- Loglama eklendi
+from loguru import logger
 from tools.models import StandardPlace, RouteResponse, WeatherResponse
+
+# --- HANDLER IMPORTS (Hepsi Bağlı) ---
 from tools.osm import search_infrastructure_osm_handler
 from tools.google import search_places_google_handler
-from tools.here import get_route_data_handler
+from tools.here import get_route_data_handler # <-- HİBRİT ROUTING BURADA
 from tools.weather import get_weather_handler, analyze_route_weather_handler
 from tools.db import save_location_handler
 from tools.toll import get_toll_prices_handler 
 
-# --- MCP KURULUMU ---
+# --- MCP SUNUCU KURULUMU ---
 mcp = FastMCP(name="City Agent")
 
-# --- TOOL TANIMLARI ---
-
+# --- 1. OSM ALTYAPI ARAMA ---
 @mcp.tool()
 async def search_infrastructure_osm(lat: float, lon: float, category: str) -> str:
-    """Kamusal alanları bulur. JSON String döner."""
+    """
+    Kamusal alanları (Hastane, Okul, Park, Eczane vb.) OSM üzerinden bulur.
+    Kategori örnekleri: 'hastane', 'okul', 'park', 'eczane', 'polis'.
+    """
     try:
         logger.info(f"🛠️ [Tool: OSM] İstek: {category} @ {lat},{lon}")
         raw_data = await search_infrastructure_osm_handler(lat, lon, category)
         
-        # Hata kontrolü
+        # Handler hata dönerse (List içinde dict olarak)
         if raw_data and isinstance(raw_data, list) and len(raw_data) > 0 and "error" in raw_data[0]:
-            logger.warning(f"⚠️ [Tool: OSM] Hata döndü: {raw_data[0]['error']}")
+            logger.warning(f"⚠️ [Tool: OSM] Hata: {raw_data[0]['error']}")
             return json.dumps({"status": "error", "message": raw_data[0]["error"]})
 
         # Veriyi StandardPlace modeline döküyoruz
@@ -45,11 +50,15 @@ async def search_infrastructure_osm(lat: float, lon: float, category: str) -> st
         logger.error(f"🔥 [Tool: OSM] Kritik Hata: {e}")
         return json.dumps({"status": "error", "message": str(e)})
 
+# --- 2. GOOGLE TİCARİ ARAMA (ROTA FİLTRELİ) ---
 @mcp.tool()
 async def search_places_google(query: str, lat: float = None, lon: float = None, route_polyline: str = None) -> str:
-    """Ticari mekanları bulur. JSON String döner."""
+    """
+    Ticari mekanları (Restoran, Benzinlik, Tamirci) Google Maps'te arar.
+    Eğer 'route_polyline' verilirse, sadece rota üzerindeki veya yakınındaki yerleri filtreler.
+    """
     try:
-        logger.info(f"🛠️ [Tool: Google] İstek: '{query}' (Rota Var mı: {'Evet' if route_polyline else 'Hayır'})")
+        logger.info(f"🛠️ [Tool: Google] İstek: '{query}' (Rota Modu: {'Aktif' if route_polyline else 'Pasif'})")
         
         raw_data = await search_places_google_handler(query, lat, lon, route_polyline)
 
@@ -57,15 +66,14 @@ async def search_places_google(query: str, lat: float = None, lon: float = None,
             logger.warning(f"⚠️ [Tool: Google] Servis hatası: {raw_data['error']}")
             return json.dumps({"status": "error", "message": raw_data["error"]})
 
-        # Google'dan gelen 'strict' ve 'relaxed' listelerini birleştirip standartlaştıralım
+        # Strict (Yol üstü) ve Relaxed (Sapma) listelerini birleştir
         strict_places = raw_data.get("strict_route_places", [])
         relaxed_places = raw_data.get("relaxed_route_places", [])
-        
         all_places = strict_places + relaxed_places
         
         standard_list = []
         for item in all_places:
-            # Koordinatları "41.02,40.52" stringinden ayırıyoruz
+            # Koordinatları güvenli parse et
             try:
                 if "coords" in item and "," in item["coords"]:
                     lat_str, lon_str = item["coords"].split(",")
@@ -82,48 +90,68 @@ async def search_places_google(query: str, lat: float = None, lon: float = None,
                 lon=p_lon,
                 rating=item.get("rating"),
                 is_open=str(item.get("open_now")), 
-                source="google"
+                source="google",
+                # Ekstra metadata (LLM için faydalı)
+                metadata={
+                    "durum": item.get("konum_durumu", "Bilinmiyor"),
+                    "sapma": item.get("sapma_mesafesi", "0m")
+                }
             )
-            # Rota bilgisi varsa mesafeyi de ekleyebiliriz (Model destekliyorsa)
-            # Şu anlık StandardPlace modeline sadık kalıyoruz.
             standard_list.append(place.model_dump())
 
-        logger.success(f"✅ [Tool: Google] Toplam {len(standard_list)} mekan işlendi. (Yol Üstü: {len(strict_places)}, Sapma: {len(relaxed_places)})")
+        logger.success(f"✅ [Tool: Google] {len(standard_list)} mekan işlendi.")
         return json.dumps(standard_list, ensure_ascii=False)
 
     except Exception as e:
         logger.error(f"🔥 [Tool: Google] Kritik Hata: {e}")
         return json.dumps({"status": "error", "message": str(e)})
 
+# --- 3. AKILLI ROTA HESAPLAMA (HİBRİT) ---
 @mcp.tool()
 async def get_route_data(origin: str, destination: str) -> str:
-    """Rota verisi. JSON String döner."""
+    """
+    Akıllı Rota Hesaplayıcı.
+    İstanbul içindeyse: Canlı Trafik verisiyle Yerel DB kullanır.
+    Şehirlerarasıysa: HERE Maps verisini kullanır.
+    """
     try:
         logger.info(f"🛠️ [Tool: Rota] Hesapla: {origin} -> {destination}")
+        
+        # Hibrit Handler'ı çağır
         raw_data = await get_route_data_handler(origin, destination)
 
         if "error" in raw_data:
             logger.error(f"❌ [Tool: Rota] Başarısız: {raw_data['error']}")
             return json.dumps({"status": "error", "message": raw_data["error"]})
 
+        # Pydantic Response Modelini doldur
+        # DÜZELTME BURADA YAPILDI 👇
+        poly_data = raw_data.get("polyline_encoded")
+        final_polyline = poly_data if poly_data else "LOCAL_ROUTE"
+
         response = RouteResponse(
             distance_km=raw_data.get("mesafe_km", 0),
             duration_min=raw_data.get("sure_dk", 0),
-            polyline=raw_data.get("polyline_encoded", ""),
-            summary=f"{raw_data.get('mesafe_km')} km, {raw_data.get('sure_dk')} dakika",
-            checkpoints=raw_data.get("analiz_noktalari", {})
+            polyline=final_polyline, 
+            summary=f"{raw_data.get('mesafe_km')} km, {raw_data.get('sure_dk')} dakika ({raw_data.get('source', 'Bilinmiyor')})",
+            checkpoints=raw_data.get("analiz_noktalari", {}),
+            extras={
+                "geometry": raw_data.get("geometry"),
+                "source_system": raw_data.get("source")
+            }
         )
         
-        logger.success(f"✅ [Tool: Rota] Rota oluşturuldu: {response.summary}")
+        logger.success(f"✅ [Tool: Rota] Rota Hazır: {response.summary}")
         return response.model_dump_json()
 
     except Exception as e:
         logger.error(f"🔥 [Tool: Rota] Kritik Hata: {e}")
         return json.dumps({"status": "error", "message": str(e)})
 
+# --- 4. HAVA DURUMU ---
 @mcp.tool()
 async def get_weather(lat: float, lon: float) -> str:
-    """Hava durumu. JSON String döner."""
+    """Belirtilen koordinatın hava durumunu getirir."""
     try:
         logger.info(f"🛠️ [Tool: Hava] Sorgu: {lat},{lon}")
         raw_data = await get_weather_handler(lat, lon)
@@ -147,19 +175,29 @@ async def get_weather(lat: float, lon: float) -> str:
         logger.error(f"🔥 [Tool: Hava] Hata: {e}")
         return json.dumps({"status": "error", "message": str(e)})
 
+# --- 5. ROTA HAVA DURUMU ANALİZİ ---
 @mcp.tool()
 async def analyze_route_weather(polyline: str) -> str:
+    """
+    Bir rota boyunca (Polyline String) hava durumunu analiz eder.
+    Farklı noktalardaki hava değişimlerini raporlar.
+    """
     try:
         logger.info("🛠️ [Tool: Rota Hava] Analiz başlatılıyor...")
+        # Not: Yerel rotalarda polyline yerine GeoJSON kullanılması gerekebilir.
+        # Handler içinde bu dönüşüm yapılacak.
         result = await analyze_route_weather_handler(polyline)
+        
         logger.success("✅ [Tool: Rota Hava] Analiz tamamlandı.")
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         logger.error(f"🔥 [Tool: Rota Hava] Hata: {e}")
         return json.dumps({"status": "error", "message": str(e)})
 
+# --- 6. KONUM KAYDETME (DB) ---
 @mcp.tool()
 async def save_location(name: str, lat: float, lon: float, category: str = "Genel", note: str = "") -> str:
+    """Kullanıcının istediği bir konumu veritabanına kaydeder."""
     try:
         logger.info(f"💾 [Tool: DB] Kayıt: {name}")
         result = await save_location_handler(name, lat, lon, category, note)
@@ -168,8 +206,10 @@ async def save_location(name: str, lat: float, lon: float, category: str = "Gene
         logger.error(f"🔥 [Tool: DB] Hata: {e}")
         return json.dumps({"status": "error", "message": str(e)})
 
+# --- 7. OTOYOL ÜCRETLERİ ---
 @mcp.tool()
 async def get_toll_prices(filter_region: str = None) -> str:
+    """Otoyol ve köprü ücretlerini listeler."""
     try:
         logger.info("🛠️ [Tool: Otoyol] Fiyatlar çekiliyor...")
         text_result = await get_toll_prices_handler(filter_region)
@@ -179,5 +219,6 @@ async def get_toll_prices(filter_region: str = None) -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 if __name__ == "__main__":
-    logger.info("🚀 City Agent (MCP) Başlatılıyor...")
+    logger.info("🚀 City Agent (MCP) Başlatılıyor... [Port: 8000]")
+    # Docker içinde host 0.0.0.0 olmalı ki dışarıdan erişilebilsin
     mcp.run(transport="sse", host="0.0.0.0", port=8000)

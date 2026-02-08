@@ -6,8 +6,7 @@ MANUAL_TOOLS = [
     # ==========================================
     {
         "name": "get_route_data",
-        "description": "İki nokta arasındaki en uygun rotayı, mesafeyi ve süreyi hesaplar. Rota çizildikten sonra çıkan 'polyline' verisi diğer araçlarda (mekan arama vb.) kullanılır.",
-        "inputSchema": {
+        "description": "AKILLI ROTA MOTORU: İstanbul içinde İBB Canlı Trafik verisini ve yerel veritabanını kullanır. Şehirlerarasında ise Global (HERE Maps) veriyi kullanır. Trafik durumu, süre ve mesafe için tek yetkili araçtır.",        "inputSchema": {
             "type": "object",
             "properties": {
                 "origin": {"type": "string", "description": "Başlangıç noktası (Örn: Rize)"},

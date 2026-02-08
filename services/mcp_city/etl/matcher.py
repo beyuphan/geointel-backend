@@ -4,7 +4,7 @@ import json
 import time
 
 DB_DSN = "postgresql://user:password@geo_db:5432/geodb"
-IBB_JSON = "istanbul_complete_static.json"
+IBB_JSON = "/app/data/istanbul_complete_static.json"
 
 async def match_layers_fast():
     print("🔌 Veritabanına bağlanılıyor...")

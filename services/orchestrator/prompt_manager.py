@@ -66,8 +66,9 @@ def get_dynamic_system_prompt(user_context_str: str, intent_dict: Union[Dict[str
         intent_instructions = """
 👉 [GÖREV: ROTA PLANLAMA]
 - Mesafeyi ve tahmini süreyi açıkça belirt.
+- Eğer araç çıktısında kaynak olarak 'Istanbul_Local_DB' veya 'GeoIntel' görünüyorsa, kullanıcıya "İBB Canlı Trafik verilerine göre..." diye bilgi ver.
 - Rota üzerindeki hava durumu risklerini (Weather Shield) mutlaka kontrol et.
-- Eğer yolda kar/fırtına varsa proaktif olarak uyar.
+- Yol tarifi verirken samimi ol (Örn: "Şu an köprü açık, bas git" gibi).
 """
     else:
         intent_instructions = "Yardımsever bir asistan olarak genel soruları yanıtla ve gerekirse araçları kullan."

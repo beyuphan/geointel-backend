@@ -1,97 +1,80 @@
 import asyncpg
+import json
+import os
 from .config import settings
 from logger import log
 
-# Samsun Pilot Region Bounding Box (Atakum/Ilkadim Area)
-SAMSUN_BBOX = {
-    "min_lat": 41.20, "max_lat": 41.45,
-    "min_lon": 36.15, "max_lon": 36.45
+# İstanbul Bounding Box
+ISTANBUL_BBOX = {
+    "min_lat": 40.80, "max_lat": 41.30,
+    "min_lon": 28.50, "max_lon": 29.50
 }
 
-def is_in_samsun(lat: float, lon: float) -> bool:
-    """Check if the given coordinates are within the Samsun pilot region."""
-    return (SAMSUN_BBOX["min_lat"] <= lat <= SAMSUN_BBOX["max_lat"] and
-            SAMSUN_BBOX["min_lon"] <= lon <= SAMSUN_BBOX["max_lon"])
+def is_in_service_area(lat: float, lon: float) -> bool:
+    return (ISTANBUL_BBOX["min_lat"] <= lat <= ISTANBUL_BBOX["max_lat"] and
+            ISTANBUL_BBOX["min_lon"] <= lon <= ISTANBUL_BBOX["max_lon"])
 
-async def get_local_route(origin_lat, origin_lon, dest_lat, dest_lon):
+async def get_local_route(origin_lat, origin_lon, dest_lat, dest_lon, preference="fastest"):
     """
-    Calculates a route using pgRouting (Dijkstra algorithm) with DIRECTED=FALSE
-    to ensure maximum connectivity even in imperfect data.
+    pgRouting (Dijkstra) kullanarak yerel rota hesaplar.
     """
-    conn = await asyncpg.connect(settings.DATABASE_URL)
+    db_url = getattr(settings, "DATABASE_URL", "postgresql://user:password@geo_db:5432/geodb")
+    conn = await asyncpg.connect(db_url)
     
     try:
-        # --- 1. HEALTH CHECK ---
-        ways_count = await conn.fetchval("SELECT count(*) FROM ways")
-        vertices_count = await conn.fetchval("SELECT count(*) FROM ways_vertices_pgr")
-        
-        log.info(f"🔍 [DB STATS] Ways: {ways_count} | Vertices: {vertices_count}")
-
-        if not vertices_count:
-            log.warning("⚠️ [LOCAL ROUTING] Vertices BOŞ! Topoloji onarılıyor...")
-            try:
-                await conn.execute("SELECT pgr_createTopology('ways', 0.00001, 'the_geom', 'gid');")
-                log.success("✅ [REPAIR] Topoloji oluşturuldu!")
-            except Exception as e:
-                log.error(f"🔥 [REPAIR FAIL] {e}")
-                return None
-
-        # --- 2. SRID DETECTION ---
-        db_srid = await conn.fetchval("SELECT ST_SRID(the_geom) FROM ways LIMIT 1")
-        if not db_srid: db_srid = 4326
-
-        # --- 3. NODE FINDING ---
-        if db_srid == 3857:
-            pt_sql = "ST_Transform(ST_SetSRID(ST_MakePoint($1, $2), 4326), 3857)"
-        else:
-            pt_sql = "ST_SetSRID(ST_MakePoint($1, $2), 4326)"
-
-        # Vertex tablosundan en yakın düğümü bul
-        node_sql = f"""
+        # 1. En Yakın Noktaları Bul (Smart Snap)
+        node_sql = """
         SELECT id FROM ways_vertices_pgr 
-        ORDER BY the_geom <-> {pt_sql} 
+        ORDER BY the_geom <-> ST_SetSRID(ST_MakePoint($1, $2), 4326) 
         LIMIT 1;
         """
-        
         source_node = await conn.fetchval(node_sql, origin_lon, origin_lat)
         target_node = await conn.fetchval(node_sql, dest_lon, dest_lat)
 
-        # Yedek: Ways tablosundan bul
-        if not source_node:
-            fallback_sql = f"SELECT source FROM ways ORDER BY the_geom <-> {pt_sql} LIMIT 1;"
-            source_node = await conn.fetchval(fallback_sql, origin_lon, origin_lat)
-        if not target_node:
-            fallback_sql = f"SELECT target FROM ways ORDER BY the_geom <-> {pt_sql} LIMIT 1;"
-            target_node = await conn.fetchval(fallback_sql, dest_lon, dest_lat)
-
         if not source_node or not target_node:
-            log.error(f"❌ [LOCAL ROUTING] Düğüm bulunamadı. (S:{source_node} T:{target_node})")
+            log.error(f"❌ [LOCAL ROUTING] Noktalar harita dışında (S:{source_node} T:{target_node})")
             return None
 
-        log.info(f"🛣️ [LOCAL ROUTING] Rota Aranıyor: {source_node} -> {target_node}")
+        # 2. Maliyet Ayarı
+        if preference == "shortest":
+            sql_cost = "length_m"
+            sql_reverse = "length_m" # Mesafe her iki yönde aynıdır
+        else:
+            # En Hızlı: Trafik verisi (süre) kullanılır.
+            # cost_time: Gidiş süresi
+            # reverse_cost_time: Dönüş süresi (Tek yön ise burada -1 veya çok yüksek sayı vardır)
+            sql_cost = "cost_time"
+            sql_reverse = "reverse_cost_time"
 
-        # --- 4. RUN DIJKSTRA (DIRECTED = FALSE) ---
-        # directed := false yaparak "Kopuk Ağ" sorunlarını bypass ediyoruz.
-        route_sql = """
-        SELECT b.the_geom
+        # 3. 🔥 SİHİRLİ SORGUSU (BURASI DEĞİŞTİ) 🔥
+        # ST_MakeLine ve ORDER BY a.seq sayesinde rota "ip gibi" düzgün çıkar.
+        route_sql = f"""
+        SELECT sum(b.length_m) as total_meters, 
+               sum(b.cost_time) as total_seconds, 
+               ST_AsGeoJSON(ST_MakeLine(b.the_geom ORDER BY a.seq)) as geometry
         FROM pgr_dijkstra(
-            'SELECT gid as id, source, target, cost, reverse_cost FROM ways',
+            'SELECT gid as id, source, target, {sql_cost} as cost, {sql_reverse} as reverse_cost FROM ways',
             $1::bigint, $2::bigint, directed := false
         ) a
         JOIN ways b ON (a.edge = b.gid);
         """
-        rows = await conn.fetch(route_sql, source_node, target_node)
         
-        if not rows:
-            log.warning("⚠️ [LOCAL ROUTING] Dijkstra yol bulamadı (Ciddi Kopukluk Var).")
-            # Son çare: Belki maliyetler NULL'dur?
-            check_cost = await conn.fetchval("SELECT count(*) FROM ways WHERE cost IS NULL")
-            if check_cost > 0:
-                log.error(f"❌ HATA: {check_cost} adet yolun maliyeti (cost) NULL!")
+        row = await conn.fetchrow(route_sql, source_node, target_node)
+        
+        if not row or not row['geometry']:
+            log.warning("⚠️ [LOCAL ROUTING] Rota bulunamadı.")
             return None
         
-        log.success(f"✅ [LOCAL ROUTING] Başarılı! {len(rows)} segment.")
-        return rows
+        # Sonucu Formatla
+        result = {
+            "mode": preference,
+            "distance_km": round(row['total_meters'] / 1000.0, 2) if row['total_meters'] else 0,
+            "duration_min": round(row['total_seconds'] / 60.0, 1) if row['total_seconds'] else 0,
+            "geometry": json.loads(row['geometry'])
+        }
+
+        log.success(f"✅ [LOCAL ROUTING] {result['distance_km']} km, {result['duration_min']} dk.")
+        return result
 
     except Exception as e:
         log.error(f"🔥 [LOCAL ROUTING] Kritik Hata: {e}")
