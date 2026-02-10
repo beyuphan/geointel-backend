@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     # Default değerler
     MCP_CITY_URL: str = "http://mcp_city:8000"
     MCP_INTEL_URL: str = "http://mcp_intel:8001"
+    MCP_SATELLITE_URL: str = "http://mcp_satellite:8002"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -25,3 +26,6 @@ if settings.MCP_CITY_URL and not settings.MCP_CITY_URL.startswith("http"):
 
 if settings.MCP_INTEL_URL and not settings.MCP_INTEL_URL.startswith("http"):
     settings.MCP_INTEL_URL = f"http://{settings.MCP_INTEL_URL}"
+
+if settings.MCP_SATELLITE_URL and not settings.MCP_SATELLITE_URL.startswith("http"):
+    settings.MCP_SATELLITE_URL = f"http://{settings.MCP_SATELLITE_URL}"

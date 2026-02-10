@@ -75,11 +75,19 @@ services:
 
   # 5. UYDU AJANI (MCP SATELLITE - İleride kodlayacağız)
   mcp_satellite:
-    image: python:3.11-slim # Şimdilik boş image, sonra dolduracağız
+    build: 
+      context: ./services/mcp_satellite
+      dockerfile: Dockerfile
     container_name: geo_mcp_satellite
-    command: tail -f /dev/null # Ayakta kalsın diye
+    ports:
+      - "8002:8002" # Dışarıdan erişim (Debug için)
+    environment:
+      # Microsoft Planetary Computer için (Gerekirse)
+      - PC_SDK_SUBSCRIPTION_KEY=${PC_SDK_SUBSCRIPTION_KEY} 
     networks:
       - geo_net
+    volumes:
+      - ./services/mcp_satellite:/app
 
   # 6. İSTİHBARAT AJANI (MCP INTEL)
   mcp_intel:

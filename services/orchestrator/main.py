@@ -276,6 +276,7 @@ async def lifespan(app: FastAPI):
         RUNTIME_TOOLS.append(await create_proxy_tool("orchestrator", t_def))
     asyncio.create_task(sse_listener_loop("city", f"{settings.MCP_CITY_URL}/sse"))
     asyncio.create_task(sse_listener_loop("intel", f"{settings.MCP_INTEL_URL}/sse"))
+    asyncio.create_task(sse_listener_loop("satellite", f"{settings.MCP_SATELLITE_URL}/sse"))
     yield
     RUNTIME_TOOLS.clear()
 
