@@ -1,63 +1,54 @@
-# services/mcp_city/models.py
-from pydantic import BaseModel, Field, field_validator
-from typing import Optional, Literal
+from pydantic import BaseModel, Field, field_validator, ConfigDict
+from typing import Optional, List, Dict, Any, Union, Literal
 
-# 1. OSM İsteği Validasyonu
+# --- TEMEL MODELLER ---
+
+class Coordinate(BaseModel):
+    """Enlem ve Boylam için katı validasyon."""
+    lat: float = Field(..., ge=-90, le=90, description="Enlem -90 ile 90 arasında olmalı")
+    lon: float = Field(..., ge=-180, le=180, description="Boylam -180 ile 180 arasında olmalı")
+
+# --- GİRİŞ MODELLERİ (INPUT) ---
+
 class OSMRequest(BaseModel):
-    lat: float = Field(..., ge=-90, le=90, description="Geçerli bir enlem olmalı")
-    lon: float = Field(..., ge=-180, le=180, description="Geçerli bir boylam olmalı")
-    category: str = Field(..., description="Aranacak yerin İngilizce OSM etiketi (Örn: cafe, park, supermarket, commercial, clothing).")
+    lat: float = Field(..., ge=-90, le=90)
+    lon: float = Field(..., ge=-180, le=180)
+    category: str = Field(..., min_length=2, description="OSM etiketi (Örn: hospital, park)")
     radius: int = Field(default=2000, ge=100, le=50000)
 
-# 2. Google Arama Validasyonu
 class GoogleSearchRequest(BaseModel):
-    query: str = Field(..., min_length=2, description="Arama metni çok kısa olamaz")
+    query: str = Field(..., min_length=2)
     lat: Optional[float] = Field(None, ge=-90, le=90)
     lon: Optional[float] = Field(None, ge=-180, le=180)
-    route_polyline: Optional[str] = Field(None, description="HERE Maps'ten gelen encoded polyline string")
-# 3. Rota İsteği Validasyonu
+    route_polyline: Optional[str] = Field(None, description="Rota üzerinde arama için polyline")
+
 class RouteRequest(BaseModel):
-    origin: str
-    destination: str
+    origin: str = Field(..., min_length=1, description="Başlangıç noktası veya koordinatı")
+    destination: str = Field(..., min_length=1, description="Varış noktası veya koordinatı")
 
-    @field_validator('origin', 'destination')
-    def validate_coordinates(cls, v):
-        # Boşlukları temizle
-        v = v.replace(" ", "")
-        # Format kontrolü: "lat,lon" (virgül şart)
-        if "," not in v:
-            raise ValueError(f"Koordinat formatı hatalı: '{v}'. Beklenen: 'lat,lon'")
-        
-        try:
-            parts = v.split(",")
-            lat, lon = float(parts[0]), float(parts[1])
-            if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
-                raise ValueError("Koordinatlar dünya sınırları dışında.")
-        except ValueError:
-            raise ValueError(f"Sayısal koordinat girilmeli: '{v}'")
-            
-        return v
-    
-
-# --- ÇIKIŞ MODELLERİ (OUTPUT MODELS) ---
+# --- ÇIKIŞ MODELLERİ (OUTPUT) ---
 
 class StandardPlace(BaseModel):
-    """Google ve OSM sonuçlarını bu formatta eşitleyeceğiz."""
-    name: str
-    address: Optional[str] = "Adres yok"
-    lat: float
-    lon: float
+    """Google ve OSM sonuçlarını eşitleyen ana model."""
+    model_config = ConfigDict(extra='allow') # Ekstra metadata gelirse reddetme
+    
+    name: str = Field(..., min_length=1)
+    address: Optional[str] = "Adres bilgisi yok"
+    lat: float = Field(..., ge=-90, le=90)
+    lon: float = Field(..., ge=-180, le=180)
     category: str = "general"
-    rating: Optional[float] = None
-    is_open: Optional[str] = None
-    source: str = "unknown" # 'google', 'osm'
+    rating: Optional[float] = 0.0
+    review_count: int = 0
+    is_open: str = "Bilinmiyor"
+    source: Literal["google", "osm"] = "google"
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 class WeatherResponse(BaseModel):
     location: str
     current_temp: str
     feels_like: str
     condition: str
-    forecast_hourly: list[dict]
+    forecast_hourly: List[Dict[str, Any]]
     warning: Optional[str] = None
 
 class RouteResponse(BaseModel):
@@ -65,4 +56,11 @@ class RouteResponse(BaseModel):
     duration_min: float
     polyline: str
     summary: str
-    checkpoints: dict
+    checkpoints: Dict[str, Any]
+    source_system: str
+
+class ErrorResponse(BaseModel):
+    """Standart hata formatı."""
+    status: str = "error"
+    message: str
+    code: int = 500

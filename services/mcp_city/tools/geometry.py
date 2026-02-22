@@ -3,6 +3,7 @@ import math
 from shapely.geometry import Point, LineString
 from shapely.ops import transform
 import pyproj
+import math
 from loguru import logger as log
 
 # --- PROJEKSİYON AYARLARI ---
@@ -188,3 +189,17 @@ def filter_places_by_polyline(places: list, encoded_polyline: str = None, geojso
     except Exception as e:
         log.error(f"Geometri Hatası (filter_places_by_polyline): {e}")
         return places # Hata durumunda filtreleme yapmadan ham listeyi dön
+    
+
+
+def calculate_distance_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """İki GPS koordinatı arasındaki mesafeyi Haversine formülü ile metre cinsinden hesaplar."""
+    R = 6371000  # Dünya yarıçapı (metre)
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    
+    return R * c

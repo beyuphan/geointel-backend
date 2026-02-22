@@ -1,57 +1,65 @@
-Pilot Şehir Uygulama Dokümantasyonu: Samsun Operasyonu
+Faz 1: Zeka ve Veri Füzyonu (Hızlı Kazanımlar ve Temel Doğruluk)
 
-Bu doküman, Samsun'u projenin ilk "Analitik Pilot Bölgesi" yapmak için gereken uçtan uca adımları kapsar. Hedefimiz, sadece bir API çağrısı yapmak değil; Samsun'un sokaklarını veritabanına gömüp üzerlerinde kendi algoritmalarımızı (Cedge​) koşturmaktır.
-1. Aşama: Veri Edinimi ve Hazırlık
+Bu faz, sistemin karar verme yeteneğini ve veri kalitesini artırarak hemen etki yaratacak geliştirmeleri içerir.
 
-Samsun'un dijital ikizini oluşturmak için OpenStreetMap (OSM) verilerine ihtiyacımız var.
+    1.1. LLM Dinamik Yönlendirme (Router Node) Geliştirmesi
 
-    Ham Veri: Geofabrik veya benzeri servislerden Samsun'a ait .osm.pbf dosyasını indir.
+        Öncelik: Çok Yüksek (Maliyet optimizasyonu ve hız için kritik)
 
-    Filtreleme: Sadece ulaşım ağını (highway tagleri) ayıklayarak veri setini hafiflet.
+        Büyüklük: S (Small / Düşük Efor)
 
-    Araç: Bu veriyi PostGIS'e aktarmak için osm2pgrouting aracını kullan. Bu araç, yolları sadece çizgi olarak değil, birbirine bağlı düğümler (topoloji) olarak içeri aktarır.
+        Aksiyon: main.py içerisindeki LangGraph akışında yer alan classifier düğümünün çıktısına (intent) göre model seçimi yapılması. Basit "Nerede?" soruları için Gemini 1.5 Flash'in bind_tools ile çağrılması, karmaşık analizler için mevcut Claude 3.5 Sonnet'in kullanılması.
 
-2. Aşama: Veritabanı ve Topoloji Kurulumu
+    1.2. Mekansal Füzyon (OSM + Google Places Birleştirmesi)
 
-Samsun sokaklarının "zeka" kazanması için PostgreSQL tarafında uzamsal motoru hazırlaman gerekiyor.
+        Öncelik: Yüksek (Halüsinasyonu önlemek ve zengin veri sunmak için)
 
-    Uzantılar: Veritabanında postgis ve pgrouting eklentilerinin aktif olduğundan emin ol.
+        Büyüklük: M (Medium / Orta Efor)
 
-    Topoloji Oluşturma: pgr_createTopology fonksiyonu ile yolların kesişim noktalarını (node) ve yönlerini (source/target) belirle.
+        Aksiyon: mcp_city içinde yeni bir birleştirici araç (veya orkestratör katmanında bir fonksiyon) yazılması. Google'dan dönen verilerin koordinatları ile OSM'den dönen fiziksel altyapı koordinatlarının Haversine veya PostGIS ST_DWithin formülü ile karşılaştırılıp 20 metrelik sapma payı (<20m) içinde kalanların tek bir zenginleştirilmiş JSON nesnesi (Füzyon) olarak LLM'e sunulması.
 
-    İndeksleme: Uzamsal sorguların milisaniyeler içinde bitmesi için GIST indekslerini mutlaka tanımla.
+Faz 2: Çevresel Analitik ve Yerel Veri (Projenin Çekirdeği)
 
-3. Aşama: Çevresel Maliyet Modellemesi (Cedge​)
+Bu faz, projeyi sıradan bir API toplayıcısından çıkarıp gerçek bir "Mekansal Yapay Zeka" (Spatial AI) seviyesine taşıyacak ağır mimari geliştirmeleri kapsar.
 
-Samsun'un yollarına "dinamik ağırlık" verme zamanı. Raporda belirttiğimiz formülü SQL seviyesinde uygulayacağız:
-Cedge​=Vlimit​×(1−(Wfactor​×Sslope​))Ledge​​
+    2.1. pgRouting ile Çevresel Faktörlü Dinamik Rota Motoru
 
-    Bileşenler:
+        Öncelik: En Yüksek (Projenin ana akademik vaadi)
 
-        Ledge​: Yolun gerçek uzunluğu.
+        Büyüklük: XL (Extra Large / Çok Yüksek Efor)
 
-        Vlimit​: Hız sınırı (OSM'den gelir).
+        Aksiyon: 1. OSM verisinin (samsun.osm veya istanbul_pilot.osm) osm2pgrouting aracı ile PostGIS veritabanına bir graf ağı olarak aktarılması.
+        2. PostgreSQL içinde, yolların eğimi ve anlık hava durumunu hesaba katan maliyet formülünü (Cedge​) hesaplayan bir PL/pgSQL fonksiyonu yazılması.
+        3. get_route_data aracının, pilot bölgelerde doğrudan bu veritabanı fonksiyonunu tetikleyecek şekilde güncellenmesi.
 
-        Wfactor​: Hava durumu katsayısı (Yağış anında maliyeti artırır).
+    2.2. WFS Entegrasyonu ve ITRF96 -> WGS84 Koordinat Dönüşümü
 
-        Sslope​: Eğim katsayısı (Özellikle Samsun'un yokuşlu bölgeleri için kritik).
+        Öncelik: Orta
 
-4. Aşama: Analitik Rotalama Motoru
+        Büyüklük: M (Medium / Orta Efor)
 
-Samsun sınırları içindeki bir sorgu geldiğinde devreye girecek motorun mantığı:
+        Aksiyon: Yerel yönetimlerin sağladığı WFS (GML/XML) bağlantılarından dinamik veri çekecek bir Python modülü yazılması. pyproj kütüphanesi veya PostGIS ST_Transform komutu kullanılarak yerel ITRF96 (EPSG:5254) koordinatlarının küresel WGS84 (EPSG:4326) formatına dönüştürülmesi.
 
-    Algoritma: En kısa ve en güvenli yolu bulmak için pgr_dijkstra veya pgr_astar algoritmalarını kullan.
+Faz 3: Gelişmiş Uydu Görüntüsü İşleme (Cloud-Native Analitik)
 
-    Dinamik Güncelleme: Hava durumu servisinden gelen veriye göre ways tablosundaki cost sütununu anlık olarak update eden bir trigger veya fonksiyon kurgula.
+Sistemin çevresel farkındalığını bölgesel ölçekte artıracak uydu entegrasyonu.
 
-5. Aşama: Ajan Entegrasyonu
+    3.1. Bulut Yerel NDVI (Bitki Sağlığı) Analizi
 
-City Agent sunucusundaki get_route_data fonksiyonunu şu mantıkla güncelle:
+        Öncelik: Orta (Çevresel durum tespiti için önemli)
 
-    Sınır Kontrolü (Geofencing): Gelen başlangıç ve bitiş koordinatları Samsun sınırları (Bounding Box) içinde mi?
+        Büyüklük: L (Large / Yüksek Efor)
 
-    Karar: * İçerideyse: pgRouting motorunu çalıştır (Analitik Rotalama).
+        Aksiyon: mcp_satellite sunucusundaki yeteneklerin salt arama (metadata) seviyesinden işleme seviyesine çıkarılması. rasterio veya xarray kütüphaneleri kullanılarak, Microsoft Planetary Computer üzerinden COG formatındaki görüntülerin tamamı indirilmeden (HTTP Range Requests) sadece Kırmızı ve Yakın Kızılötesi (NIR) bantlarının çekilmesi. LLM'e doğrudan NDVI=(NIR−Red)/(NIR+Red) hesaplama sonucunun ve piksel istatistiklerinin döndürülmesi.
 
-        Dışarıdaysa: HERE Maps API'sine fallback yap (Küresel Rotalama).
+Faz 4: Altyapı ve İletişim Optimizasyonu
 
-    Çıktı: Her iki durumda da ajana aynı formatta (GeoJSON/Polyline) veri dön ki akış bozulmasın.
+Sistem kararlılığını ve hızını maksimize edecek, kullanıcının görmediği ama sistemin omurgasını oluşturan geliştirmeler.
+
+    4.1. Stdio (Standart G/Ç) Taşıma Mekanizmasının Kurulumu
+
+        Öncelik: Düşük (Sistem SSE ile şu an çalışıyor, son rötüş olarak yapılmalı)
+
+        Büyüklük: L (Large / Yüksek Efor)
+
+        Aksiyon: Gerçek zamanlı ve sıfır gecikme gerektiren mcp_city (Çekirdek GIS) sunucusunun iletişim protokolünün HTTP üzerinden işleyen SSE yerine, yerel işletim sistemi boruları (stdio) üzerinden çalışacak şekilde yapılandırılması. main.py içindeki RPC çağrı mekanizmasının subprocess (alt süreç) yönetecek şekilde refactor edilmesi.
