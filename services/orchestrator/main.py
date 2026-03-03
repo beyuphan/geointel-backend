@@ -71,7 +71,7 @@ class GeoIntelOrchestrator:
             api_key=settings.ANTHROPIC_API_KEY
         )
         self.llm_gemini = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
+            model="gemini-2.5-pro",
             temperature=0,
             google_api_key=settings.GOOGLE_API_KEY
         )
@@ -140,12 +140,17 @@ class GeoIntelOrchestrator:
 
     def json_schema_to_pydantic(self, name: str, schema: dict) -> Any:
         fields = {}
+        required_fields = schema.get("required", [])
+
         if "properties" in schema:
             for field_name, field_info in schema["properties"].items():
                 t_map = {"string": str, "number": float, "integer": int, "boolean": bool}
                 field_type = t_map.get(field_info.get("type"), str)
                 description = field_info.get("description", "")
-                fields[field_name] = (field_type, Field(description=description))
+                if field_name in required_fields:
+                    fields[field_name] = (field_type, Field(description=description))
+                else:
+                    fields[field_name] = (Optional[field_type], Field(default=None, description=description))
                 
         fields["session_id"] = (str, "default_session")
         return create_model(f"{name}Input", **fields)
@@ -282,10 +287,16 @@ async def agent_node(state: AgentState):
     
     if complexity == "low":
         active_llm = orchestrator.llm_gemini
-        log.info(f"🧠 [LLM Router] Session: {state['session_id']} | Model: Gemini 1.5 Flash (Düşük Karmaşıklık)")
+        log.info(f"🧠 [LLM Router] Session: {state['session_id']} | Model: Gemini 2.5 Pro (Düşük Karmaşıklık)")
+
+        prompt += """
+        \n\nKESİN KURALLAR (BUNLARI İHLAL ETMEK YASAKTIR):
+        1- MEKAN ARAMALARI: Kullanıcı kafe, restoran, hastane vb. bir yer aradığında ASLA detaylandırma veya netleştirme sorusu sorma! "Hangi mahalle?", "Tam olarak neresi?" gibi sorular KESİNLİKLE YASAKTIR.
+        2- DERHAL AKSİYON: İnisiyatif alma, kullanıcının girdiği metni olduğu gibi alıp, DOĞRUDAN `search_places_google` aracının `query` parametresine gönder ve aracı DERHAL ÇALIŞTIR.
+        """
     else:
         active_llm = orchestrator.llm_claude
-        log.info(f"🧠 [LLM Router] Session: {state['session_id']} | Model: Claude 3.5 Sonnet (Yüksek Karmaşıklık)")
+        log.info(f"🧠 [LLM Router] Session: {state['session_id']} | Model: Claude 4.5 Sonnet (Yüksek Karmaşıklık)")
 
     # --- 2. REDİS'TEN GEÇMİŞİ ÇEKME ---
     history = []
@@ -336,10 +347,23 @@ async def custom_tool_node(state: AgentState):
                         "is_open": p.get("is_open", "Bilinmiyor") # Kullanıcı deneyimi için ek bilgi
                     })
             elif isinstance(res, dict):
-                if "polyline" in res or "polyline_encoded" in res: visual_data["polyline"] = res.get("polyline") or res.get("polyline_encoded")
+                if "polyline" in res or "polyline_encoded" in res: 
+                    visual_data["polyline"] = res.get("polyline") or res.get("polyline_encoded")
+                    
+                    # LLM'in kafası devasa veriyle karışmasın diye polyline metnini gizliyoruz!
+                    if "polyline" in res: 
+                        res["polyline"] = "[HARİTAYA ÇİZİLDİ - OKUMANA GEREK YOK]"
+                    if "polyline_encoded" in res: 
+                        res["polyline_encoded"] = "[HARİTAYA ÇİZİLDİ - OKUMANA GEREK YOK]"
                 if "lat" in res and "lon" in res: visual_data["markers"].append({"name": "Hedef", "lat": res["lat"], "lon": res["lon"]})
-            
-            msgs.append(ToolMessage(content=json.dumps(res, ensure_ascii=False), tool_call_id=tc["id"]))
+
+            tool_output = res
+            if isinstance(res, list):
+                tool_output = {"results": res}
+            elif not isinstance(res, dict):
+                tool_output = {"result": str(res)}
+                
+            msgs.append(ToolMessage(content=json.dumps(tool_output, ensure_ascii=False), tool_call_id=tc["id"]))
     return {"messages": msgs, "visual_data": visual_data}
 
 # --- 4. FASTAPI UYGULAMASI VE LIFESPAN ---
@@ -389,7 +413,13 @@ async def chat_endpoint(request: ChatRequest):
         "intent": {}, "retry_count": 0, "session_id": request.session_id, "visual_data": {"markers": [], "polyline": None}
     })
     
-    response_text = final_state["messages"][-1].content
+    raw_content = final_state["messages"][-1].content
+    
+    # AI yanıtı liste (block) olarak dönerse, içindeki metinleri birleştirip tek bir string yapıyoruz:
+    if isinstance(raw_content, list):
+        response_text = "".join([block.get("text", "") for block in raw_content if isinstance(block, dict) and "text" in block])
+    else:
+        response_text = str(raw_content)
     
     # Yanıtı Redis'e kaydet
     if orchestrator.redis_client:

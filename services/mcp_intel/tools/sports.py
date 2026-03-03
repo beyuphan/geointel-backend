@@ -83,14 +83,14 @@ class SportsScraper:
                                 city_name = full_stadium_txt.split(" - ")[-1].strip()
                                 
                             item = {
-                                "mac": f"{match_data['home']} vs {match_data['away']}",
-                                "zaman": dt_str,
-                                "stadyum": full_stadium_txt,
-                                "sehir": city_name,
-                                "uyari": "Maç saatinde stadyum çevresinde trafik yoğun olabilir."
+                                "match": f"{match_data['home']} vs {match_data['away']}",
+                                "time": dt_str,
+                                "stadium": full_stadium_txt,
+                                "city": city_name,
+                                "warning": "Maç saatinde stadyum çevresinde trafik yoğun olabilir."
                             }
                             all_matches.append(item)
-                            log.info(f"✅ Maç Bulundu: {item['mac']}")
+                            log.info(f"✅ Maç Bulundu: {item['match']}")
 
                         except Exception as e:
                             log.warning(f"Maç Detay Hatası: {e}")

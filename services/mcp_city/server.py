@@ -1,6 +1,6 @@
 import json
 import asyncio
-from services.mcp_city.tools.geometry import calculate_distance_meters
+from tools.geometry import calculate_distance_meters
 import uvicorn
 from fastmcp import FastMCP
 from loguru import logger
