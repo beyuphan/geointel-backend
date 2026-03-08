@@ -171,6 +171,12 @@ async def get_route_data_handler(origin: str, destination: str) -> dict:
         async with httpx.AsyncClient() as client:
             resp = await client.get(settings.HERE_ROUTING_URL, params=params, timeout=15.0)
             data = resp.json()
+            if resp.status_code != 200:
+                log.error(f"❌ [HERE API ERROR] Durum Kodu: {resp.status_code}")
+                log.error(f"📄 [HERE API RESPONSE] Body: {resp.text}")
+                return {"error": f"HERE API Hatası (HTTP {resp.status_code}): {resp.text[:100]}"}
+
+            data = resp.json()
             
             if resp.status_code == 200 and data.get("routes"):
                 section = data["routes"][0]["sections"][0]

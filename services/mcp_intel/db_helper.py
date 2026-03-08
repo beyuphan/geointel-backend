@@ -14,7 +14,7 @@ class DBHelper:
     # 1. AKARYAKIT (UPSERT: Güncelle veya Ekle)
     # ---------------------------------------------------------
     @staticmethod
-    async def save_fuel_prices(data_list):
+    async def save_fuel_prices(data_list, city_name="bilinmiyor"):
         if not data_list: return
         conn = await DBHelper.get_connection()
         try:
@@ -30,8 +30,9 @@ class DBHelper:
                 updated_at = NOW();
             """
             for item in data_list:
+                target_city = item.get('city', city_name).lower()
                 await conn.execute(query, 
-                    item['city'].lower(), 
+                    target_city,
                     item['ilce'].lower(), 
                     item['firma'], 
                     item.get('benzin', 0.0), 
@@ -166,6 +167,7 @@ class DBHelper:
                 SELECT company as firma, gasoline as benzin, diesel as motorin, lpg 
                 FROM fuel_prices 
                 WHERE city = $1 AND district = $2
+                AND updated_at >= CURRENT_DATE
                 ORDER BY gasoline ASC
             """
             rows = await conn.fetch(query, city.lower(), district.lower())

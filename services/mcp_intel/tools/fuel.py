@@ -3,6 +3,7 @@ from playwright.async_api import async_playwright
 import re
 import unicodedata
 from loguru import logger as log
+from datetime import datetime # Tarih kontrolü için eklendi
 
 class FuelScraper:
     FIRMS = ["opet", "petrol-ofisi", "total"]
@@ -88,7 +89,8 @@ class FuelScraper:
                 return {
                     benzin: cells[1]?.innerText.trim(),
                     motorin: cells[2]?.innerText.trim(),
-                    lpg: cells[3]?.innerText.trim()
+                    lpg: cells[3]?.innerText.trim(),
+                    tarih: cells[4]?.innerText.trim()
                 };
             }""")
             
@@ -102,6 +104,7 @@ class FuelScraper:
 
     async def get_district_prices(self, city: str, district: str) -> list:
         results = []
+        bugun = datetime.now().strftime("%d.%m.%Y") # Örn: 08.03.2026
         log.info(f"🚀 [BASLAT] {city}/{district} Taraması Başlıyor...")
         
         async with async_playwright() as p:
@@ -116,6 +119,12 @@ class FuelScraper:
                 raw = await self._get_firm_price_surgical(page, city, district, firm)
                 
                 if raw:
+                    site_tarihi = raw.get('tarih', '')
+                    if bugun not in site_tarihi:
+                        log.warning(f"⚠️ [ESKI VERI] {firm} için tarih güncel değil ({site_tarihi}). Atlanıyor...")
+                        continue
+
+
                     benzin = self._parse_price(raw.get('benzin'))
                     motorin = self._parse_price(raw.get('motorin'))
                     lpg = self._parse_price(raw.get('lpg'))
@@ -126,7 +135,8 @@ class FuelScraper:
                             "benzin": benzin,
                             "motorin": motorin,
                             "lpg": lpg,
-                            "ilce": district.capitalize()
+                            "ilce": district.capitalize(),
+                            "city": city.capitalize()
                         })
             
             await browser.close()

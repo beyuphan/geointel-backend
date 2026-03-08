@@ -71,7 +71,7 @@ class GeoIntelOrchestrator:
             api_key=settings.ANTHROPIC_API_KEY
         )
         self.llm_gemini = ChatGoogleGenerativeAI(
-            model="gemini-2.5-pro",
+            model="gemini-2.0-flash",
             temperature=0,
             google_api_key=settings.GOOGLE_API_KEY
         )
@@ -279,20 +279,26 @@ async def agent_node(state: AgentState):
     # Kullanıcı bağlamı ve niyet analizini al
     user_context = await ProfileManager.get_user_context(state["session_id"])
     intent = state.get("intent", {})
+    category = intent.get("category", "general")
     prompt = get_dynamic_system_prompt(user_context, intent)
     
     # --- 1. YÖNLENDİRME (ROUTER) MANTIĞI ---
     # Intent içinden complexity değerini al, yoksa güvenli liman olarak 'high' (Claude) seç
     complexity = intent.get("complexity", "high")
     
-    if complexity == "low":
+    if category in ["event", "fuel", "pharmacy"]:
+        active_llm = orchestrator.llm_claude
+        log.info(f"🛡️ [Guardrail] Kategori {category.upper()} için Claude zorlanıyor.")
+
+    elif complexity == "low":
         active_llm = orchestrator.llm_gemini
-        log.info(f"🧠 [LLM Router] Session: {state['session_id']} | Model: Gemini 2.5 Pro (Düşük Karmaşıklık)")
+        log.info(f"🧠 [LLM Router] Session: {state['session_id']} | Model: Gemini 2.0 Flash (Düşük Karmaşıklık)")
 
         prompt += """
-        \n\nKESİN KURALLAR (BUNLARI İHLAL ETMEK YASAKTIR):
-        1- MEKAN ARAMALARI: Kullanıcı kafe, restoran, hastane vb. bir yer aradığında ASLA detaylandırma veya netleştirme sorusu sorma! "Hangi mahalle?", "Tam olarak neresi?" gibi sorular KESİNLİKLE YASAKTIR.
-        2- DERHAL AKSİYON: İnisiyatif alma, kullanıcının girdiği metni olduğu gibi alıp, DOĞRUDAN `search_places_google` aracının `query` parametresine gönder ve aracı DERHAL ÇALIŞTIR.
+        \n\nKESİN KURALLAR:
+        1- MEKAN VE DURUM SORGULARI: Kullanıcı hava durumu, kafe, hastane vb. bir şey sorduğunda ASLA soru sorma! 
+        2- ARAÇ KULLANIMI: Hava durumu için `get_weather`, mekanlar için `search_places_google` aracını DERHAL tetikle. 
+        Parametreleri kullanıcının metninden (örn: 'Beşiktaş') ayıkla ve beklemeden çalıştır.
         """
     else:
         active_llm = orchestrator.llm_claude
@@ -300,11 +306,25 @@ async def agent_node(state: AgentState):
 
     # --- 2. REDİS'TEN GEÇMİŞİ ÇEKME ---
     history = []
+    last_category = None 
     if orchestrator.redis_client:
+        # decode_responses=True olduğu için .decode() yapmana gerek yok, direkt string gelir.
+        last_category = orchestrator.redis_client.get(f"last_cat:{state['session_id']}") 
+
         stored = orchestrator.redis_client.lrange(f"chat:{state['session_id']}", 0, -1)
         for item in stored:
             m = json.loads(item)
             history.append(HumanMessage(content=m["content"]) if m["role"] == "user" else AIMessage(content=m["content"]))
+
+    # 🔥 BAĞLAM TEMİZLİĞİ (CONTEXT RESET) - BURASI AYNI KALIYOR
+    if history and last_category and category != last_category:
+        log.warning(f"🔄 [Context Reset] Kategori değişti: {last_category} -> {category}")
+        reset_msg = SystemMessage(content=f"ÖNEMLİ: Konu '{last_category}' kategorisinden '{category}' kategorisine değişti. Önceki konuya ait özel talimatları KESİNLİKLE UNUT ve yeni kategoriye odaklan.")
+        history.append(reset_msg)
+
+    # Güncel kategoriyi bir sonraki tur için Redis'e kaydet
+    if orchestrator.redis_client:
+        orchestrator.redis_client.set(f"last_cat:{state['session_id']}", category)
 
     # --- 3. SEÇİLEN MODELİ ÇALIŞTIRMA ---
     # Araçları sadece o an aktif olan modele bağlıyoruz

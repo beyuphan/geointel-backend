@@ -157,7 +157,7 @@ async def get_fuel_prices(city: str, district: str) -> str:
                 "district": d.get("ilce", district),
                 "city": city
             })
-        await DBHelper.save_fuel_prices(live_data)
+        await DBHelper.save_fuel_prices(live_data, city)
         return create_response(fixed_live, FuelPrice)
 
     return create_response(live_data, FuelPrice)
