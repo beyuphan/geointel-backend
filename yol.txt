@@ -1,9 +1,31 @@
-"Geçmiş Olsun" Anomalisi (Bağlam Kirlenmesi)
 
-Dikkat ettiysen hava durumu cevabının sonunda "Geçmiş olsun, sağlıklı günler!" demiş.
 
-    Nedenini buldum: prompt_manager.py dosyasında "pharmacy" kategorisi için özel talimatlarda "Kullanıcıya geçmiş olsun dileklerini iletmeyi unutma" kuralı var.
 
-    Sorun şu: Bir önceki "Eczane" sorgunla aynı session_id (ops_cb6060cf) üzerinden devam ettiğin için, main.py içindeki agent_node fonksiyonu Redis'ten eski geçmişi (history) çekip modelin önüne koydu. Claude da geçmişteki o "eczane" havasından çıkamamış.
+Optimistik" Varış Süresi (10.1 Dakika)
 
-    Ders: Karmaşık sistemlerde, kategori değiştiğinde LLM'in eski kategorinin "özel talimatlarını" unutmasını sağlamak için history yönetimini biraz daha sıkılaştırmak gerekebilir.
+Sistem Kadıköy-Beşiktaş arasını 13.63 km ve 10.1 dakika olarak hesaplamış.
+
+
+Sorun: Beşiktaş-Kadıköy arası (tünel veya köprü fark etmeksizin) 10 dakikada gitmek için trafiğin tamamen boş olması ve ortalama 80-90 km/s hızla gidilmesi gerekir.
+
+Tespit: Senin local_routing.py içindeki cost_time verisi muhtemelen yolların "ideal" hız sınırlarına göre hesaplanmış. Eğer İBB'den canlı trafik verisi çekip bu cost değerlerini dinamik güncellemiyorsan, asistan kullanıcıya "10 dakikada gidersin" diyerek yalan söylemiş olur. Bu da bir çeşit "teknik halüsinasyon"dur.
+
+
+aslında https://uym.ibb.gov.tr/yharita6/ sisteminden yol yoğunluklarını anlık olarak çekip kaydediyoruz ona göre hareket ediyoruz ama hata var. şu an minumum 30 dakika sürer o yol 10 dakika olması imkasnısz. onu dsaha sonra düzelteceğiz. 
+
+
+
+Backend'i kapatmadan önceki "büyük temizlik" için şu iki adım şart oldu:
+
+    DB Fix: mcp_intel içindeki o Yakıt Kaydı: 'city' hatasını çözmemiz lazım. db_helper.py dosyasını inceleyip oradaki tablo şemasını düzeltelim ki sistem cache (önbellek) yapabilsin.
+
+    Search Fusion: Logların sonunda gördüğüm search_places_google çağrısı, Claude'un bulduğu bu ucuz yakıt fiyatlarını gerçek koordinatlarla (haritadaki yerleriyle) eşleştirmeye çalıştığını gösteriyor. Bu kısım çok değerli, mobil tarafta kullanıcıya doğrudan "Şu istasyona git" dedirtecek olan yer burası.
+
+Kanka özetle: Sistem şu an "akıllı" davranıyor, uydurmuyor ve rotayı takip ediyor. Sadece veritabanı yazma kısmında küçük bir pürüz var. Orayı da hallettik mi bu iş tamamdır.
+
+
+
+****************** 
+YAKIT KISMINDA TARİHLERİ DE ÇEKMEMİZ GEREKİYOR. EĞER TARİH O GÜNKÜ TARİHLE UYUŞMUYORSA O VERİYİ HİÇ ALMAMALIYIZ
+*********************
+
