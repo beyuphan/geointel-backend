@@ -87,10 +87,10 @@ class FuelScraper:
                 if (!row) return null;
                 const cells = row.querySelectorAll('td');
                 return {
-                    benzin: cells[1]?.innerText.trim(),
-                    motorin: cells[2]?.innerText.trim(),
-                    lpg: cells[3]?.innerText.trim(),
-                    tarih: cells[4]?.innerText.trim()
+                    benzin: cells[1] ? cells[1].innerText.trim() : null,
+                    motorin: cells[2] ? cells[2].innerText.trim() : null,
+                    lpg: cells[3] ? cells[3].innerText.trim() : null,
+                    page_text: document.body.innerText
                 };
             }""")
             
@@ -119,11 +119,17 @@ class FuelScraper:
                 raw = await self._get_firm_price_surgical(page, city, district, firm)
                 
                 if raw:
-                    site_tarihi = raw.get('tarih', '')
-                    if bugun not in site_tarihi:
-                        log.warning(f"⚠️ [ESKI VERI] {firm} için tarih güncel değil ({site_tarihi}). Atlanıyor...")
+                    # Tarih Süzme İşlemi (Tüm sayfa içeriğinde bugünün tarihi var mı?)
+                    page_text = raw.get('page_text', '')
+                    # Aylar Türkçe formatlarda olabilir. Sayfada DD.MM.YYYY var mı diye de bakıyoruz.
+                    months_tr = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
+                    bugun_obj = datetime.now()
+                    bugun_str_1 = bugun_obj.strftime("%d.%m.%Y")
+                    bugun_str_2 = f"{bugun_obj.day} {months_tr[bugun_obj.month - 1]} {bugun_obj.year}"
+                    
+                    if bugun_str_1 not in page_text and bugun_str_2 not in page_text:
+                        log.warning(f"⚠️ [ESKI VERI] {firm} sayfasında güncel {bugun_str_1} tarihi bulunamadı. Atlanıyor...")
                         continue
-
 
                     benzin = self._parse_price(raw.get('benzin'))
                     motorin = self._parse_price(raw.get('motorin'))

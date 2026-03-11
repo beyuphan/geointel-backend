@@ -3,7 +3,6 @@ import math
 from shapely.geometry import Point, LineString
 from shapely.ops import transform
 import pyproj
-import math
 from loguru import logger as log
 
 # --- PROJEKSİYON AYARLARI ---
@@ -113,6 +112,44 @@ def sample_route_points(encoded_polyline: str = None, geojson_geometry: dict = N
     except Exception as e:
         log.error(f"❌ Geometri Hatası (sample_route_points): {e}")
         return []
+
+def get_distance_from_route(location: dict, polyline_str: str) -> float:
+    """
+    Mekan (Point) ile rota (Polyline) arasındaki en kısa dik mesafeyi (metre) hesaplar.
+    Hata durumunda 999999 döner.
+    """
+    try:
+        if not polyline_str or polyline_str == "LATEST" or len(polyline_str) < 5:
+            return 0
+
+        try:
+            decoded = flexpolyline.decode(polyline_str)
+        except Exception:
+            try:
+                import polyline  # optional dependency
+                decoded = polyline.decode(polyline_str)
+            except Exception:
+                return 999999
+
+        if not decoded or len(decoded) < 2:
+            return 999999
+
+        line_coords = [(lon, lat) for lat, lon in decoded]
+        route_line = LineString(line_coords)
+        place_point = Point(location["lng"], location["lat"])
+
+        route_line_m = transform(project_to_meters, route_line)
+        place_point_m = transform(project_to_meters, place_point)
+
+        distance = route_line_m.distance(place_point_m)
+
+        if math.isinf(distance) or math.isnan(distance):
+            return 999999
+
+        return float(distance)
+    except Exception as e:
+        log.warning(f"⚠️ Mesafe hesaplama hatası: {e}")
+        return 999999
 
 def filter_places_by_polyline(places: list, encoded_polyline: str = None, geojson_geometry: dict = None) -> list:
     """

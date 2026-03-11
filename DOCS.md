@@ -23,7 +23,22 @@ Bu proje, coğrafi sorguları hibrit bir mimari (OSM + Google + HERE) ile işley
 2. `docker-compose up -d --build` komutuyla başlatın.
 3. Orchestrator `http://localhost:8001/docs` adresinde çalışır.
 
+## 🗺️ WFS (İBB) Entegrasyonu
+
+- **Genel WFS tool**: City Agent içinde `fetch_wfs_layer`
+  - Parametreler: `base_url`, `type_name`, opsiyonel `bbox`, `src_epsg`
+- **İBB preset tool**: City Agent içinde `fetch_ibb_dataset`
+  - Önce `.env` içine `IBB_WFS_BASE_URL` ekleyin (örnek: `.env.example`)
+  - Sonra `dataset_id` ile çağırın (örn: `ibb_afet_toplanma`)
+- **Dataset listesi**: City Agent içinde `list_ibb_datasets` (hangi `dataset_id`’ler var görürsünüz)
+
 ## 🧪 Testler
 Testleri çalıştırmak için:
 ```bash
 pytest tests/
+```
+
+## 📌 OEK1 (Rapor) uyumluluk / eksik listesi
+
+Rapor hedefleri ile mevcut kod tabanının fark analizi:
+- `OEK1_GAP_ANALYSIS.md`

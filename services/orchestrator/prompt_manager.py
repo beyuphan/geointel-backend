@@ -95,11 +95,21 @@ Kullanıcının ilerleme yönünün TERSİNDE kalan ilçeleri KESİNLİKLE öner
     elif category == "routing":
         intent_instructions = """
 👉 [GÖREV: ROTA PLANLAMA]
-- 'get_route_data' aracı temeldir.
+- 'get_route_data' aracı temeldir. origin ve destination parametrelerine SADECE YALIN İSİM VEYA TAM ADRES (Örn: 'Rize', 'Trabzon', 'İstanbul Havalimanı') yaz. Asla 'Rize'den', 'Trabzon'a' gibi Türkçe yönelme/ayrılma ekleri KULLANMA!
 - Mesafeyi ve tahmini süreyi açıkça belirt.
 - Eğer süre 1 saati aşıyorsa veya hava kötüyse 'analyze_route_weather' (Weather Shield) kullanmayı teklif et.
 - Kaynak olarak 'GeoIntel' veya 'HERE' verisi kullanıyorsan bunu güven unsuru olarak belirt.
 - Yol tarifi verirken samimi ol (Örn: "Şu an köprü açık, bas git" gibi).
+"""
+
+    elif category == "city_data":
+        intent_instructions = """
+👉 [GÖREV: İBB / WFS ŞEHİR VERİSİ]
+- Kullanıcı İBB açık veri, WFS katmanı, afet toplanma alanı, İSPARK doluluk gibi "şehir verisi" istiyorsa tahmin yürütme.
+- Önce `list_ibb_datasets` ile mevcut preset dataset listesini kontrol edebilirsin.
+- Ardından uygun `dataset_id` ile `fetch_ibb_dataset` aracını çağır ve dönen GeoJSON layer’ı kullanıcıya özetle.
+- Eğer preset yoksa veya kullanıcı spesifik `typeNames` veriyorsa `fetch_wfs_layer` aracını kullan.
+- GeoJSON çok büyükse: sadece en önemli alanları özetle (kaç feature var, örnek 3-5 tanesi, kapsadığı bölge).
 """
 
     else:

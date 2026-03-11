@@ -51,14 +51,21 @@ async def _resolve_coordinates(location: str) -> str | None:
             params = {
                 "q": location,
                 "format": "json",
-                "limit": 1,
+                "limit": 5,
                 "countrycodes": "tr"
             }
             resp = await client.get(url, params=params, headers=headers, timeout=10.0)
             data = resp.json()
             if data:
-                lat, lon = data[0]["lat"], data[0]["lon"]
-                log.success(f"✅ [OSM] Bulundu: {location} -> {lat},{lon}")
+                # KRİTİK FİLTRE: "Rize" arandığında koskoca il sınırını (Hemşin merkezli) getirmek yerine Şehir/İlçe merkezine öncelik ver.
+                best_match = data[0]
+                for item in data:
+                    if item.get("class") == "place" and item.get("type") in ["city", "town", "village", "municipality"]:
+                        best_match = item
+                        break
+                        
+                lat, lon = best_match["lat"], best_match["lon"]
+                log.success(f"✅ [OSM] Bulundu: {best_match.get('name', location)} -> {lat},{lon}")
                 return f"{lat},{lon}"
     except Exception as e:
         log.error(f"OSM Geocoding Hatası: {e}")

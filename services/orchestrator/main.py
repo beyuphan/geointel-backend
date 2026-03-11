@@ -35,7 +35,7 @@ from logger import log
 # --- 1. MODELLER VE DURUM YÖNETİMİ ---
 
 class IntentAnalysis(BaseModel):
-    category: Literal["fuel", "pharmacy", "event", "routing", "general"] = Field(
+    category: Literal["fuel", "pharmacy", "event", "routing", "city_data", "general"] = Field(
         description="Kullanıcının isteğinin ana kategorisi"
     )
     urgency: bool = Field(description="İşlem acil mi?")
@@ -297,8 +297,9 @@ async def agent_node(state: AgentState):
         prompt += """
         \n\nKESİN KURALLAR:
         1- MEKAN VE DURUM SORGULARI: Kullanıcı hava durumu, kafe, hastane vb. bir şey sorduğunda ASLA soru sorma! 
-        2- ARAÇ KULLANIMI: Hava durumu için `get_weather`, mekanlar için `search_places_google` aracını DERHAL tetikle. 
-        Parametreleri kullanıcının metninden (örn: 'Beşiktaş') ayıkla ve beklemeden çalıştır.
+        2- ARAÇ KULLANIMI: Hava durumu için `get_weather`, mekanlar için `search_places_google` veya `search_hybrid_places` aracını DERHAL tetikle. 
+        Parametreleri kullanıcının metninden ÇOK KESİN YALIN İSİMLER OLARAK (Örn: 'Rize', 'Trabzon', 'Beşiktaş') ayıkla ve beklemeden çalıştır. 'Rize'den' veya 'Trabzon'a' gibi ekler ASLA geçme.
+        3- ROTA TALEPLERİ: Eğer kullanıcı iki nokta arası rota istiyorsa 'get_route_data' aracını DOĞRUDAN çağır.
         """
     else:
         active_llm = orchestrator.llm_claude
@@ -316,11 +317,10 @@ async def agent_node(state: AgentState):
             m = json.loads(item)
             history.append(HumanMessage(content=m["content"]) if m["role"] == "user" else AIMessage(content=m["content"]))
 
-    # 🔥 BAĞLAM TEMİZLİĞİ (CONTEXT RESET) - BURASI AYNI KALIYOR
+    # 🔥 BAĞLAM TEMİZLİĞİ (CONTEXT RESET) - CRASH FIX YÖNTEMİ
     if history and last_category and category != last_category:
         log.warning(f"🔄 [Context Reset] Kategori değişti: {last_category} -> {category}")
-        reset_msg = SystemMessage(content=f"ÖNEMLİ: Konu '{last_category}' kategorisinden '{category}' kategorisine değişti. Önceki konuya ait özel talimatları KESİNLİKLE UNUT ve yeni kategoriye odaklan.")
-        history.append(reset_msg)
+        prompt += f"\n\n🚨 DİKKAT: Kullanıcının odaklandığı konu '{last_category}' kategorisinden '{category}' kategorisine ÇEVRİLDİ. Önceki kısıtlamaları ve rolleri tamamen yoksay. SADECE YENİ GÖREV TALİMATLARINA ({category}) ODAKLAN!"
 
     # Güncel kategoriyi bir sonraki tur için Redis'e kaydet
     if orchestrator.redis_client:
@@ -337,7 +337,10 @@ async def agent_node(state: AgentState):
     return {"messages": [response], "retry_count": state.get("retry_count", 0) + 1}
 
 async def custom_tool_node(state: AgentState):
-    msgs = []; visual_data = state.get("visual_data", {"markers": [], "polyline": None})
+    msgs = []
+    visual_data = state.get("visual_data", {"markers": [], "polyline": None, "geojson_layers": []})
+    if "geojson_layers" not in visual_data:
+        visual_data["geojson_layers"] = []
     for tc in state["messages"][-1].tool_calls:
         log.info(f"🛠️ [Node: Tools] Çağrılıyor: {tc['name']}")
         tc["args"]["session_id"] = state["session_id"]
@@ -367,6 +370,24 @@ async def custom_tool_node(state: AgentState):
                         "is_open": p.get("is_open", "Bilinmiyor") # Kullanıcı deneyimi için ek bilgi
                     })
             elif isinstance(res, dict):
+                # GeoJSON layer extraction (WFS / dataset vb.)
+                if res.get("type") == "FeatureCollection" and isinstance(res.get("features"), list):
+                    visual_data["geojson_layers"].append(
+                        {
+                            "name": tc["name"],
+                            "geojson": res,
+                        }
+                    )
+
+                # Bazı tool'lar {"results": <FeatureCollection>} gibi dönebilir.
+                if isinstance(res.get("results"), dict) and res["results"].get("type") == "FeatureCollection":
+                    visual_data["geojson_layers"].append(
+                        {
+                            "name": tc["name"],
+                            "geojson": res["results"],
+                        }
+                    )
+
                 if "polyline" in res or "polyline_encoded" in res: 
                     visual_data["polyline"] = res.get("polyline") or res.get("polyline_encoded")
                     
@@ -430,7 +451,7 @@ async def chat_endpoint(request: ChatRequest):
     executor = workflow.compile()
     final_state = await executor.ainvoke({
         "messages": [HumanMessage(content=request.message)],
-        "intent": {}, "retry_count": 0, "session_id": request.session_id, "visual_data": {"markers": [], "polyline": None}
+        "intent": {}, "retry_count": 0, "session_id": request.session_id, "visual_data": {"markers": [], "polyline": None, "geojson_layers": []}
     })
     
     raw_content = final_state["messages"][-1].content

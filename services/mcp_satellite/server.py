@@ -43,6 +43,52 @@ def search_satellite_imagery(
     except Exception as e:
         return f"Uydu arama hatası: {str(e)}"
 
+@mcp.tool()
+def calculate_ndvi(
+    min_lon: float,
+    min_lat: float,
+    max_lon: float,
+    max_lat: float,
+    days_back: int = 30,
+    max_cloud_cover: int = 40,
+) -> str:
+    """
+    Belirtilen ROI (BBox) için en güncel Sentinel-2 görüntüsü üzerinden NDVI hesaplar.
+    Cloud-native yaklaşım: COG streaming ile yalnızca gerekli pikseller okunur.
+    """
+    bbox = [min_lon, min_lat, max_lon, max_lat]
+
+    try:
+        items = sat_client.search_sentinel2(
+            bbox,
+            days_back=days_back,
+            max_cloud_cover=max_cloud_cover,
+        )
+
+        if not items:
+            return json.dumps(
+                {"error": "Belirtilen kriterlerde Sentinel-2 görüntüsü bulunamadı."},
+                ensure_ascii=False,
+            )
+
+        item = items[0]
+        ndvi = sat_client.calculate_ndvi(item, bbox)
+
+        return json.dumps(
+            {
+                "ndvi_avg": ndvi,
+                "item": {
+                    "id": item.id,
+                    "date": item.datetime.isoformat() if getattr(item, "datetime", None) else None,
+                    "cloud_cover": item.properties.get("eo:cloud_cover", None),
+                    "platform": item.properties.get("platform", None),
+                },
+            },
+            ensure_ascii=False,
+        )
+    except Exception as e:
+        return json.dumps({"error": f"NDVI hesaplama hatası: {str(e)}"}, ensure_ascii=False)
+
 if __name__ == "__main__":
     print("🚀 Satellite Agent (MCP) Başlatılıyor... [Port: 8002]")
     # 0.1.0 Sürümü için ayarlar burada olmalı:

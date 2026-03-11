@@ -65,6 +65,7 @@ services:
       - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY}
       - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
       - HERE_API_KEY=${HERE_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     depends_on:
       postgres_postgis:
         condition: service_healthy

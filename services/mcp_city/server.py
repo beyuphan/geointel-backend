@@ -12,8 +12,9 @@ from tools.osm import search_infrastructure_osm_handler
 from tools.google import search_places_google_handler
 from tools.here import get_route_data_handler
 from tools.weather import get_weather_handler, analyze_route_weather_handler
-from tools.db import save_location_handler
+from tools.db import save_location_handler, search_spatial_rag, save_poi_with_embedding
 from tools.toll import get_toll_prices_handler
+from tools.wfs import fetch_wfs_as_geojson, fetch_ibb_dataset_geojson, list_wfs_datasets
 
 # --- MCP SUNUCU KURULUMU ---
 # v2.0: Veri bütünlüğü ve koordinat güvenliği odaklı mimari
@@ -70,7 +71,7 @@ async def search_infrastructure_osm(lat: float, lon: float, category: str, radiu
 
 # --- 2. GOOGLE TİCARİ ARAMA (ROTA FİLTRELİ) ---
 @mcp.tool()
-async def search_places_google(query: str, lat: float = None, lon: float = None, route_polyline: str = None) -> str:
+async def search_places_google(query: str, lat: Optional[float] = None, lon: Optional[float] = None, route_polyline: Optional[str] = None) -> str:
     """
     GOOGLE MEKAN ARAMA: Restoran, Benzinlik, Tamirci, Kafe gibi ticari yerleri arar.
     
@@ -221,24 +222,137 @@ async def get_toll_prices(filter_region: str = None) -> str:
     except Exception as e:
         return handle_critical_error(e, "get_toll_prices")
 
+# --- 8. SPATIAL RAG (Hibrit Arama) ---
+@mcp.tool()
+async def search_hybrid_poi(query: str, lat: float, lon: float, radius: float = 5000, limit: int = 5) -> str:
+    """
+    SPATIAL RAG ARAMA: Kullanıcının metin sorgusuna anlamsal (semantic) olarak en çok 
+    benzeyen yerleri (POI) bulur ve bunları belirtilen koordinata olan uzaklıklarına göre (spatial) daraltır.
+    """
+    try:
+        logger.info(f"🛠️ [Tool: SpatialRAG] Sorgu: '{query}' @ {lat},{lon}")
+        results = await search_spatial_rag(query, lat, lon, radius, limit)
+        return json.dumps(results, ensure_ascii=False)
+    except Exception as e:
+        return handle_critical_error(e, "search_hybrid_poi")
 
 @mcp.tool()
-async def search_hybrid_places(query: str, lat: float, lon: float, category: str = "commercial") -> str:
+async def save_poi_to_db(name: str, description: str, lat: float, lon: float, category: str = "Tavsiye") -> str:
     """
-    HİBRİT MEKAN ARAMA (Google + OSM Füzyonu): Kullanıcının aradığı mekanları bulur ve 
-    fiziksel doğruluğunu artırır. Restoran, kafe, mağaza gibi yerler için bunu kullan.
+    Kullanıcının önerdiği veya beğendiği bir konumu açıklamasıyla birlikte vektörel (embedding)
+    olarak veritabanına kaydeder. RAG aramalarında bu veriler listelenecektir.
     """
-    logger.info(f"🧬 [Tool: Hybrid Fusion] Başlatıldı: '{query}' @ {lat},{lon}")
+    try:
+        logger.info(f"💾 [Tool: SpatialRAG Kayıt] {name}")
+        result = await save_poi_with_embedding(name, description, lat, lon, category)
+        return json.dumps({"status": "success", "message": result}, ensure_ascii=False)
+    except Exception as e:
+        return handle_critical_error(e, "save_poi_to_db")
+
+@mcp.tool()
+async def fetch_wfs_layer(
+    base_url: str,
+    type_name: str,
+    bbox: Optional[str] = None,
+    src_epsg: Optional[int] = 5254,
+    max_features: Optional[int] = 200,
+) -> str:
+    """
+    WFS katmanı çeker ve GeoJSON FeatureCollection döndürür.
+
+    Args:
+        base_url: WFS endpoint (örn: 'https://.../ows' veya '?service=WFS' almayan kök URL)
+        type_name: Katman adı (WFS typeNames) (örn: 'ibb:afettoplanma')
+        bbox: 'minx,miny,maxx,maxy' formatında bbox. Varsayılan CRS: EPSG:5254.
+        src_epsg: Kaynak koordinat sistemi (rapordaki senaryo için genelde 5254).
+        max_features: Maksimum feature sayısı.
+    """
+    try:
+        bbox_tuple = None
+        if bbox:
+            parts = [p.strip() for p in bbox.split(",")]
+            if len(parts) >= 4:
+                bbox_tuple = (float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]))
+
+        data = await fetch_wfs_as_geojson(
+            base_url=base_url,
+            type_name=type_name,
+            bbox=bbox_tuple,
+            src_epsg=src_epsg,
+            dst_epsg=4326,
+            max_features=max_features,
+        )
+
+        return json.dumps(data, ensure_ascii=False)
+    except Exception as e:
+        return handle_critical_error(e, "fetch_wfs_layer")
+
+@mcp.tool()
+async def fetch_ibb_dataset(
+    dataset_id: str,
+    bbox: Optional[str] = None,
+    max_features: Optional[int] = 200,
+) -> str:
+    """
+    İBB WFS preset dataset'lerinden GeoJSON çeker ve standardize edilmiş FeatureCollection döndürür.
+
+    Not: Endpoint env ile yönetilir: IBB_WFS_BASE_URL
+    """
+    try:
+        bbox_tuple = None
+        if bbox:
+            parts = [p.strip() for p in bbox.split(",")]
+            if len(parts) >= 4:
+                bbox_tuple = (float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]))
+
+        data = await fetch_ibb_dataset_geojson(
+            dataset_id=dataset_id,
+            bbox=bbox_tuple,
+            max_features=max_features,
+        )
+        return json.dumps(data, ensure_ascii=False)
+    except Exception as e:
+        return handle_critical_error(e, "fetch_ibb_dataset")
+
+@mcp.tool()
+async def list_ibb_datasets() -> str:
+    """İBB WFS preset dataset listesini döndürür."""
+    try:
+        return json.dumps(list_wfs_datasets(), ensure_ascii=False)
+    except Exception as e:
+        return handle_critical_error(e, "list_ibb_datasets")
+
+
+from tools.here import get_route_data_handler, _resolve_coordinates
+@mcp.tool()
+async def search_hybrid_places(query: str, location_name: str = None, lat: float = None, lon: float = None, category: str = "commercial") -> str:
+    """
+    HİBRİT MEKAN ARAMA (Google + OSM Füzyonu): Kullanıcının aradığı mekanları bulur ve fiziksel doğruluğunu artırır.
+    Eğer elinde kesin 'lat' ve 'lon' yoksa, bunları BOŞ BIRAK ve sadece 'location_name' (Örn: 'Kadıköy', 'Rize') ile 'query' değerlerini ver. 
+    Lütfen koordinatları TAHMİN ETME!
+    """
+    logger.info(f"🧬 [Tool: Hybrid Fusion] Başlatıldı: '{query}' @ {location_name} | {lat},{lon}")
     
     try:
-        # 1. Google'dan Ticari Veriyi Çek
+        # 1. Koordinat Çözümleme (LLM halüsinasyonunu engeller)
+        if not lat or not lon:
+            if location_name:
+                resolved = await _resolve_coordinates(location_name)
+                if resolved:
+                    lat, lon = map(float, resolved.split(","))
+                else:
+                    return json.dumps({"status": "error", "message": f"{location_name} için koordinat bulunamadı."})
+            else:
+                 return json.dumps({"status": "error", "message": "Konum adı (location_name) veya koordinatlar (lat, lon) gerekli."})
+
+        # 2. Google'dan Ticari Veriyi Çek
         google_raw = await search_places_google_handler(query, lat, lon, None)
         if "error" in google_raw:
             return json.dumps({"status": "error", "message": google_raw["error"]})
             
         google_places = google_raw.get("strict_route_places", []) + google_raw.get("relaxed_route_places", [])
         
-        # 2. OSM'den Fiziksel (Bina/Altyapı) Verisini Çek
+        # 3. OSM'den Fiziksel (Bina/Altyapı) Verisini Çek
         osm_raw = await search_infrastructure_osm_handler(lat, lon, category)
         osm_places = osm_raw if isinstance(osm_raw, list) and len(osm_raw) > 0 and "error" not in osm_raw[0] else []
 

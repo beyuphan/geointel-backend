@@ -18,7 +18,7 @@ async def test_custom_tool_node_visual_extraction():
     state: AgentState = {
         "messages": [AIMessage(content="", tool_calls=[mock_tool_call])],
         "session_id": "test_sid",
-        "visual_data": {"markers": [], "polyline": None},
+        "visual_data": {"markers": [], "polyline": None, "geojson_layers": []},
         "intent": {},
         "retry_count": 0
     }

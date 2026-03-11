@@ -18,6 +18,12 @@ class DBHelper:
         if not data_list: return
         conn = await DBHelper.get_connection()
         try:
+            # Şema bozukluğu var ise tabloyu garanti altına al (Eğer UNIQUE uçurulmuşsa)
+            try:
+                await conn.execute("ALTER TABLE fuel_prices ADD CONSTRAINT unique_fuel_prices UNIQUE(city, district, company);")
+            except Exception:
+                pass # Eğer zaten varsa veya constraint uyuşmazlığı varsa devam et
+
             # Aynı istasyon varsa fiyatı güncelle, yoksa yeni kayıt aç
             query = """
             INSERT INTO fuel_prices (city, district, company, gasoline, diesel, lpg, updated_at)
@@ -30,14 +36,18 @@ class DBHelper:
                 updated_at = NOW();
             """
             for item in data_list:
-                target_city = item.get('city', city_name).lower()
+                # Hem Türkçe hem İngilizce (Live vs Fixed_Live) keyleri destekleyelim ki hata olmasın.
+                target_city = item.get('city', item.get('sehir', city_name)).lower()
+                target_district = item.get('district', item.get('ilce', 'bilinmiyor')).lower()
+                target_company = item.get('company', item.get('firma', 'bilinmiyor'))
+                
                 await conn.execute(query, 
                     target_city,
-                    item['ilce'].lower(), 
-                    item['firma'], 
-                    item.get('benzin', 0.0), 
-                    item.get('motorin', 0.0), 
-                    item.get('lpg', 0.0)
+                    target_district, 
+                    target_company, 
+                    float(item.get('gasoline', item.get('benzin', 0.0))), 
+                    float(item.get('diesel', item.get('motorin', 0.0))), 
+                    float(item.get('lpg', item.get('lpg', 0.0)))
                 )
             logger.success(f"💾 [DB] {len(data_list)} adet yakıt verisi işlendi.")
         except Exception as e:
@@ -91,7 +101,7 @@ class DBHelper:
             rows = []
             for m in data_list:
                 # Tarih formatını kontrol et (datetime objesi gelmeli)
-                m_date = m.get('zaman') # Scraper datetime objesi dönmeli
+                m_date = m.get('time', m.get('zaman')) # Scraper datetime objesi dönmeli
                 if isinstance(m_date, str):
                     try:
                         m_date = datetime.strptime(m_date, "%d.%m.%Y %H:%M")
@@ -100,15 +110,21 @@ class DBHelper:
 
                 # Basit bir trafik etki puanı (İleride algoritma ile gelişecek)
                 impact = 1
-                if any(x in (m['mac']).lower() for x in ['fenerbahçe', 'galatasaray', 'beşiktaş', 'trabzonspor']):
+                match_name = m.get('match', m.get('mac', 'Bilinmiyor vs Bilinmiyor'))
+                
+                if any(x in match_name.lower() for x in ['fenerbahçe', 'galatasaray', 'beşiktaş', 'trabzonspor']):
                     impact = 3 # Derbi veya büyük maç
                 
+                parts = match_name.split(' vs ')
+                home_team = parts[0].strip() if len(parts) > 0 else match_name
+                away_team = parts[1].strip() if len(parts) > 1 else 'Bilinmiyor'
+
                 rows.append((
-                    m['mac'].split(' vs ')[0], # Home
-                    m['mac'].split(' vs ')[1], # Away
+                    home_team, # Home
+                    away_team, # Away
                     m_date,
-                    m['stadyum'],
-                    m.get('sehir', 'Bilinmiyor'),
+                    m.get('stadium', m.get('stadyum', 'Bilinmiyor')),
+                    m.get('city', m.get('sehir', 'Bilinmiyor')),
                     impact
                 ))
 
@@ -167,7 +183,7 @@ class DBHelper:
                 SELECT company as firma, gasoline as benzin, diesel as motorin, lpg 
                 FROM fuel_prices 
                 WHERE city = $1 AND district = $2
-                AND updated_at >= CURRENT_DATE
+                AND updated_at >= NOW() - INTERVAL '24 hours'
                 ORDER BY gasoline ASC
             """
             rows = await conn.fetch(query, city.lower(), district.lower())

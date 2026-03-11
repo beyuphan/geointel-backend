@@ -1,67 +1,11 @@
 import os
 import httpx
 import json
-import flexpolyline
-import math
 from loguru import logger
-from shapely.geometry import Point, LineString
-from shapely.ops import transform
-import pyproj
+from .geometry import get_distance_from_route
 
 # Ortam değişkenlerinden API anahtarını al
 GOOGLE_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
-
-def get_distance_from_route(location, polyline_str):
-    """
-    Mekan (Point) ile rota (Polyline) arasındaki en kısa dik mesafeyi (metre) hesaplar.
-    Hata durumunda 999999 döner.
-    """
-    try:
-        # Validasyon: Polyline boşsa veya 'LATEST' ise mesafe hesaplanamaz
-        if not polyline_str or polyline_str == "LATEST" or len(polyline_str) < 5: 
-            return 0
-
-        # Polyline çözümleme (flexpolyline veya standart polyline)
-        try:
-            decoded = flexpolyline.decode(polyline_str)
-        except Exception:
-            try:
-                import polyline
-                decoded = polyline.decode(polyline_str)
-            except Exception:
-                return 999999
-
-        if not decoded or len(decoded) < 2:
-            return 999999
-
-        # Shapely objelerini oluştur (Lon, Lat sırasıyla)
-        line_coords = [(lon, lat) for lat, lon in decoded]
-        route_line = LineString(line_coords)
-        place_point = Point(location["lng"], location["lat"])
-
-        # Metrik hesaplama için EPSG:3857 (Web Mercator) projeksiyonu kullan
-        # WGS84 (Derece) -> Mercator (Metre)
-        project = pyproj.Transformer.from_proj(
-            pyproj.Proj('epsg:4326'), 
-            pyproj.Proj('epsg:3857'), 
-            always_xy=True
-        ).transform
-
-        route_line_m = transform(project, route_line)
-        place_point_m = transform(project, place_point)
-
-        # Mesafeyi metre olarak hesapla
-        distance = route_line_m.distance(place_point_m)
-
-        # Sayısal geçerlilik kontrolü
-        if math.isinf(distance) or math.isnan(distance):
-            return 999999
-            
-        return distance
-
-    except Exception as e:
-        logger.warning(f"⚠️ Mesafe hesaplama hatası: {e}")
-        return 999999
 
 async def search_places_google_handler(query: str, lat: float = None, lon: float = None, route_polyline: str = None) -> dict:
     """

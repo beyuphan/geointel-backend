@@ -1,6 +1,8 @@
 -- 1. PostGIS Eklentisini Aç (Mekansal Zeka)
 CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS pgrouting;
+-- 1b. Vektör benzerlik arama (Spatial RAG için altyapı)
+CREATE EXTENSION IF NOT EXISTS vector;
 -- 2. Mekanlar Tablosu
 CREATE TABLE IF NOT EXISTS saved_places (
     id SERIAL PRIMARY KEY,
@@ -14,6 +16,21 @@ CREATE TABLE IF NOT EXISTS saved_places (
 -- 3. Hız İndeksi
 CREATE INDEX IF NOT EXISTS idx_saved_places_geom ON saved_places USING GIST(geom);
 
+-- 4. POI Embedding (Spatial RAG için)
+CREATE TABLE IF NOT EXISTS poi_embeddings (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,       -- Anlamsal arama için kullanılacak metin
+    category TEXT DEFAULT 'Genel',
+    location VARCHAR(50),            -- "Lat,Lon"
+    geom GEOMETRY(Point, 4326),      -- PostGIS konumsal filtreleme için
+    embedding vector(768),           -- Gemini embedding modeli için 768 boyut
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 5. Embedding HNSW İndeksi (Kosinüs Benzerliği - Hizli Arama)
+CREATE INDEX IF NOT EXISTS idx_poi_embeddings_hnsw ON poi_embeddings USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_poi_embeddings_geom ON poi_embeddings USING GIST(geom);
 
 -- services/mcp_intel verileri için tablolar
 
