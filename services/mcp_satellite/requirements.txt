@@ -1,0 +1,17 @@
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+# Stabil çalışan sürüm
+fastmcp>=0.2.0
+httpx>=0.26.0
+python-dotenv>=1.0.0
+loguru>=0.7.0
+
+
+# Satellite Paketleri (Binary olarak kurulacaklar)
+pystac-client
+planetary-computer
+rasterio
+numpy
+pillow
+stackstac
+rioxarray

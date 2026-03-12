@@ -1,0 +1,124 @@
+services:
+  # 1. VERİTABANI (POSTGIS)
+  postgres_postgis:
+    image: pgrouting/pgrouting:15-3.5-3.7
+    container_name: geo_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - geo_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 2. ÖNBELLEK (REDIS)
+  redis_cache:
+    image: redis:alpine
+    container_name: geo_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - geo_net
+
+  # 3. BEYİN (ORCHESTRATOR - LANGGRAPH)
+  orchestrator:
+    build: 
+      context: ./services/orchestrator
+      dockerfile: Dockerfile
+    container_name: geo_brain
+    ports:
+      - "8000:8000" # Dış dünyaya açık tek kapı
+    environment:
+      - MCP_CITY_URL=http://mcp_city:8000
+      - MCP_INTEL_URL=http://mcp_intel:8001
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY} # Rota çizmek için gerekebilir
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_postgis:5432/${POSTGRES_DB}
+    depends_on:
+      postgres_postgis:
+        condition: service_healthy
+      mcp_city:
+        condition: service_started
+    networks:
+      - geo_net
+    volumes:
+      - ./services/orchestrator:/app
+
+  # 4. ŞEHİR AJANI (MCP CITY)
+  mcp_city:
+    build: 
+      context: ./services/mcp_city
+      dockerfile: Dockerfile
+    container_name: geo_mcp_city
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_postgis:5432/${POSTGRES_DB}
+      - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY}
+      - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
+      - HERE_API_KEY=${HERE_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+    depends_on:
+      postgres_postgis:
+        condition: service_healthy
+    networks:
+      - geo_net
+    volumes:
+      - ./services/mcp_city:/app
+
+  # 5. UYDU AJANI (MCP SATELLITE - İleride kodlayacağız)
+  mcp_satellite:
+    build: 
+      context: ./services/mcp_satellite
+      dockerfile: Dockerfile
+    container_name: geo_mcp_satellite
+    ports:
+      - "8002:8002" # Dışarıdan erişim (Debug için)
+    environment:
+      # Microsoft Planetary Computer için (Gerekirse)
+      - PC_SDK_SUBSCRIPTION_KEY=${PC_SDK_SUBSCRIPTION_KEY} 
+    networks:
+      - geo_net
+    volumes:
+      - ./services/mcp_satellite:/app
+
+  # 6. İSTİHBARAT AJANI (MCP INTEL)
+  mcp_intel:
+    build: 
+      context: ./services/mcp_intel
+      dockerfile: Dockerfile
+    container_name: geo_mcp_intel
+    ports:
+      - "8001:8001" # Dışarıdan test etmek istersen diye
+    networks:
+      - geo_net
+
+
+  # 6. arayüz AJANI
+  geo_dashboard:
+    build: ./services/dashboard
+    container_name: geo_dashboard
+    ports:
+      - "8501:8501"  # Tarayıcıdan erişmek için
+    environment:
+      - ORCHESTRATOR_URL=http://geo_brain:8000
+    volumes:
+      - ./services/dashboard:/app
+    networks:
+      - geo_net
+    depends_on:
+      - orchestrator
+networks:
+  geo_net:
+    driver: bridge
+
+volumes:
+  postgres_data:

@@ -1,0 +1,88 @@
+
+
+
+Optimistik" Varış Süresi (10.1 Dakika)
+
+Sistem Kadıköy-Beşiktaş arasını 13.63 km ve 10.1 dakika olarak hesaplamış.
+
+
+Sorun: Beşiktaş-Kadıköy arası (tünel veya köprü fark etmeksizin) 10 dakikada gitmek için trafiğin tamamen boş olması ve ortalama 80-90 km/s hızla gidilmesi gerekir.
+
+Tespit: Senin local_routing.py içindeki cost_time verisi muhtemelen yolların "ideal" hız sınırlarına göre hesaplanmış. Eğer İBB'den canlı trafik verisi çekip bu cost değerlerini dinamik güncellemiyorsan, asistan kullanıcıya "10 dakikada gidersin" diyerek yalan söylemiş olur. Bu da bir çeşit "teknik halüsinasyon"dur.
+
+
+aslında https://uym.ibb.gov.tr/yharita6/ sisteminden yol yoğunluklarını anlık olarak çekip kaydediyoruz ona göre hareket ediyoruz ama hata var. şu an minumum 30 dakika sürer o yol 10 dakika olması imkasnısz. onu dsaha sonra düzelteceğiz. 
+
+
+
+Backend'i kapatmadan önceki "büyük temizlik" için şu iki adım şart oldu:
+
+    DB Fix: mcp_intel içindeki o Yakıt Kaydı: 'city' hatasını çözmemiz lazım. db_helper.py dosyasını inceleyip oradaki tablo şemasını düzeltelim ki sistem cache (önbellek) yapabilsin.
+
+    Search Fusion: Logların sonunda gördüğüm search_places_google çağrısı, Claude'un bulduğu bu ucuz yakıt fiyatlarını gerçek koordinatlarla (haritadaki yerleriyle) eşleştirmeye çalıştığını gösteriyor. Bu kısım çok değerli, mobil tarafta kullanıcıya doğrudan "Şu istasyona git" dedirtecek olan yer burası.
+
+Kanka özetle: Sistem şu an "akıllı" davranıyor, uydurmuyor ve rotayı takip ediyor. Sadece veritabanı yazma kısmında küçük bir pürüz var. Orayı da hallettik mi bu iş tamamdır.
+
+
+
+
+
+*********************************************
+✅ YAKIT TARİH SORUNU ÇÖZÜLDÜ (NOTLAR)
+Yakıt fiyatı DB'den okunurken updated_at >= NOW() - INTERVAL '24 hours' filtresi zaten vardı.
+24 saatten eski veri → sistem otomatik live scrape yapıyor. Ek değişiklik gerekmedi.
+*********************************************
+
+
+*********************************************
+🗺️ YAPILACAK: route_history DB MİGRASYONU
+(Kendi bilgisayarında docker çalışınca bunu uygula)
+*********************************************
+
+NE İÇİN GEREKLİ?
+  Kullanıcının rota geçmişi artık PostgreSQL'e kaydediliyor.
+  Bunun için "route_history" adında yeni bir tablo gerekiyor.
+  Bu tablo olmadan kod çalışır ama geçmiş kaydedilemez (hata loglanır, sistem çökmez).
+
+NASIL UYGULANIR?
+
+ADIM 1 — Docker Desktop'ı aç ve projeyi başlat:
+  cd C:\Users\User\Desktop\geointel-backend-main
+  docker compose up -d
+
+ADIM 2 — Migration dosyasını container'a kopyala:
+  docker cp infra\postgres\migrations\003_route_history.sql geo_db:/tmp/migration.sql
+
+ADIM 3 — Tabloyu oluştur:
+  docker exec geo_db psql -U user -d geodb -f /tmp/migration.sql
+
+ADIM 4 — Doğrulama (tablo var mı kontrol et):
+  docker exec geo_db psql -U user -d geodb -c "\dt route_history"
+
+Eğer "route_history" çıktısını görüyorsan TAMAM! Sistem artık:
+  - Her rota hesabından sonra seyahati otomatik kaydeder
+  - LLM her turda son 3 rotayı prompt'a ekler
+  - "Daha önce Rize'ye gitmiştim, aynı yolu hesapla" gibi sorular çalışır
+
+NOT: Migration dosyası idempotent'tir — yanlışlıkla 2 kez çalıştırsan bile sorun olmaz.
+Migration dosyası: infra/postgres/migrations/003_route_history.sql
+
+*********************************************
+✅ YAPILACAK: ARAÇ PROFİLİ (Phase 4 - Özellik 4)
+*********************************************
+
+NE İÇİN GEREKLİ?
+  Araç markası, modeli ve detaylı yakıt tüketimi bilgilerini tutmak için.
+
+NASIL UYGULANIR?
+
+ADIM 1 — Migration dosyasını kopyala:
+  docker cp infra\postgres\migrations\004_vehicle_details.sql geo_db:/tmp/v_migration.sql
+
+ADIM 2 — Uygula:
+  docker exec geo_db psql -U user -d geodb -f /tmp/v_migration.sql
+
+ADIM 3 — Doğrula:
+  docker exec geo_db psql -U user -d geodb -c "\d user_vehicles"
+
+*********************************************
