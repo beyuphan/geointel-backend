@@ -171,8 +171,15 @@ class GeoIntelOrchestrator:
                  return await ProfileManager.update_memory(kwargs.get("category"), kwargs.get("value"))
 
             # Rota bazlı araçlar için Redis entegrasyonu
-            if name in ["analyze_route_weather", "search_places_google"] and self.redis_client:
-                poly_param = "polyline" if name == "analyze_route_weather" else "route_polyline"
+            polyline_tools = {
+                "analyze_route_weather": "polyline",
+                "search_places_google": "route_polyline",
+                "get_route_radars": "route_polyline",
+                "get_toll_for_route": "route_polyline",
+                "search_hybrid_places": "route_polyline",
+            }
+            if name in polyline_tools and self.redis_client:
+                poly_param = polyline_tools[name]
                 if not kwargs.get(poly_param) or kwargs.get(poly_param) == "LATEST":
                     latest = self.redis_client.get(route_key)
                     if latest: kwargs[poly_param] = latest
@@ -180,11 +187,24 @@ class GeoIntelOrchestrator:
             mcp_args = {k: v for k, v in kwargs.items() if k != "session_id"}
             result = await self.mcp_rpc_call(service_name, "tools/call", {"name": name, "arguments": mcp_args})
             
-            # Rota verisini cache'leme
-            if name == "get_route_data" and self.redis_client and isinstance(result, dict):
+            # Rota verisini cache'leme + otomatik geçmiş kaydı
+            if name == "get_route_data" and isinstance(result, dict) and "error" not in result:
                 poly = result.get("polyline") or result.get("polyline_encoded")
-                if poly:
+                if poly and self.redis_client:
                     self.redis_client.setex(route_key, 3600, poly)
+
+                # Rota geçmişini arka planda DB'ye kaydet (non-blocking)
+                try:
+                    import asyncio
+                    asyncio.create_task(ProfileManager.save_route_history(
+                        origin=mcp_args.get("origin", "Bilinmiyor"),
+                        destination=mcp_args.get("destination", "Bilinmiyor"),
+                        distance_km=float(result.get("mesafe_km", 0)),
+                        duration_min=float(result.get("sure_dk", 0)),
+                    ))
+                    log.info("📚 [RouteHistory] Rota geçmişe kaydediliyor (arka plan)...")
+                except Exception as e:
+                    log.warning(f"⚠️ [RouteHistory] Kayıt başlatılamadı: {e}")
                     
             return result
 
@@ -280,6 +300,15 @@ async def agent_node(state: AgentState):
     user_context = await ProfileManager.get_user_context(state["session_id"])
     intent = state.get("intent", {})
     category = intent.get("category", "general")
+
+    # Rota geçmişini intent_dict'e enjekte et (prompt_manager bunu kullanacak)
+    try:
+        route_history = await ProfileManager.get_route_history(username=state["session_id"], limit=3)
+        if isinstance(intent, dict):
+            intent["route_history"] = route_history
+    except Exception as e:
+        log.warning(f"⚠️ [RouteHistory] Geçmiş alınamadı: {e}")
+
     prompt = get_dynamic_system_prompt(user_context, intent)
     
     # --- 1. YÖNLENDİRME (ROUTER) MANTIĞI ---
@@ -433,10 +462,23 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 class ChatRequest(BaseModel):
     session_id: str = "default_session"
     message: str
+    current_lat: Optional[float] = None  # Anlık konum (frontend'den gelir)
+    current_lon: Optional[float] = None  # Anlık konum (frontend'den gelir)
+    fcm_token: Optional[str] = None      # Push bildirim token'i (Firebase)
 
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     log.info(f"📩 [Request] Session: {request.session_id} | Msg: {request.message[:30]}...")
+
+    # Anlık konumu Redis'e kaydet (her istek güncelleyebilir)
+    if orchestrator.redis_client and request.current_lat and request.current_lon:
+        loc_str = f"{request.current_lat},{request.current_lon}"
+        orchestrator.redis_client.set(f"loc:{request.session_id}", loc_str, ex=3600)  # 1 saat geçerli
+        log.info(f"📍 [CurrentLoc] Kaydedildi → {loc_str}")
+
+    # FCM token'i kaydet (varsa)
+    if orchestrator.redis_client and request.fcm_token:
+        orchestrator.redis_client.set(f"fcm:{request.session_id}", request.fcm_token, ex=86400 * 30)
     
     workflow = StateGraph(AgentState)
     workflow.add_node("classifier", intent_node)

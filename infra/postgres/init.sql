@@ -126,3 +126,22 @@ CREATE TABLE IF NOT EXISTS user_preferences (
 -- TEST KULLANICISI (Senin için bir tane oluşturalım)
 -- Bu sayede sistemi denerken "default_user" üzerinden test edebiliriz.
 INSERT INTO users (username) VALUES ('test_pilot') ON CONFLICT DO NOTHING;
+
+-- ==========================================
+-- 🗺️ ROTA GEÇMİŞİ (Phase 3 - Aşama 5)
+-- ==========================================
+
+-- 5. Rota Geçmişi (Kişiselleştirme + LLM hafızası için)
+CREATE TABLE IF NOT EXISTS route_history (
+    id            SERIAL PRIMARY KEY,
+    user_id       UUID REFERENCES users(id) ON DELETE CASCADE,
+    origin        VARCHAR(200) NOT NULL,       -- Başlangıç noktası adı (Örn: "Rize")
+    destination   VARCHAR(200) NOT NULL,       -- Bitiş noktası adı (Örn: "Trabzon")
+    distance_km   NUMERIC(8,2) DEFAULT 0,      -- Rota uzunluğu km
+    duration_min  NUMERIC(8,1) DEFAULT 0,      -- Tahmini süre dakika
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Kullanıcı başına hızlı sıralı sorgu için indeks
+CREATE INDEX IF NOT EXISTS idx_route_history_user_date
+    ON route_history (user_id, created_at DESC);

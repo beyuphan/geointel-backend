@@ -34,5 +34,16 @@ class RedisCache:
             return self.client.get("latest_route")
         return None
 
+    def set(self, key: str, value: str, ex: int = 3600):
+        """Genel amaçlı cache yazma metodu."""
+        if self.client:
+            self.client.set(key, value, ex=ex)
+
+    def get(self, key: str):
+        """Genel amaçlı cache okuma metodu."""
+        if self.client:
+            return self.client.get(key)
+        return None
+
 # Singleton instance
 redis_store = RedisCache()

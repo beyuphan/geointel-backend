@@ -58,6 +58,7 @@ class RouteResponse(BaseModel):
     summary: str
     checkpoints: Dict[str, Any]
     source_system: str
+    alternatives: List[Dict[str, Any]] = Field(default_factory=list, description="Alternatif rota seçenekleri (isim, mesafe_km, sure_dk, polyline_encoded)")
 
 class ErrorResponse(BaseModel):
     """Standart hata formatı."""

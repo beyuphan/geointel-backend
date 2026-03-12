@@ -13,8 +13,13 @@ from tools.google import search_places_google_handler
 from tools.here import get_route_data_handler
 from tools.weather import get_weather_handler, analyze_route_weather_handler
 from tools.db import save_location_handler, search_spatial_rag, save_poi_with_embedding
-from tools.toll import get_toll_prices_handler
+from tools.toll import get_toll_prices_handler, get_toll_for_route_handler
 from tools.wfs import fetch_wfs_as_geojson, fetch_ibb_dataset_geojson, list_wfs_datasets
+from tools.radar import get_radars_on_route_handler
+from tools.cache import redis_store
+from tools.route_summary import build_route_summary_handler
+from tools.ev_charging import get_ev_charging_handler
+from tools.traffic import get_route_traffic_handler
 
 # --- MCP SUNUCU KURULUMU ---
 # v2.0: Veri bütünlüğü ve koordinat güvenliği odaklı mimari
@@ -141,16 +146,20 @@ async def get_route_data(origin: str, destination: str) -> str:
         poly_data = raw_data.get("polyline_encoded")
         final_polyline = poly_data if poly_data else "LOCAL_ROUTE"
 
+        # Alternatif rota verilerini aktar (HERE API alternatifler döndürürse)
+        alternatives = raw_data.get("alternatif_rotalar", [])
+
         response = RouteResponse(
             distance_km=raw_data.get("mesafe_km", 0),
             duration_min=raw_data.get("sure_dk", 0),
             polyline=final_polyline, 
             summary=f"{raw_data.get('mesafe_km')} km, {raw_data.get('sure_dk')} dakika",
             checkpoints=raw_data.get("analiz_noktalari", {}),
-            source_system=raw_data.get("source", "Bilinmiyor")
+            source_system=raw_data.get("source", "Bilinmiyor"),
+            alternatives=alternatives
         )
         
-        logger.success(f"✅ [Tool: Rota] {response.source_system} üzerinden rota hazır.")
+        logger.success(f"✅ [Tool: Rota] {response.source_system} üzerinden rota hazır. {len(alternatives)} alternatif.")
         return response.model_dump_json()
 
     except Exception as e:
@@ -324,14 +333,54 @@ async def list_ibb_datasets() -> str:
 
 
 from tools.here import get_route_data_handler, _resolve_coordinates
+
+
+# --- 11. ROTA RADARLARI (GERÇEK ZAMANLI - HERE MAPS) ---
 @mcp.tool()
-async def search_hybrid_places(query: str, location_name: str = None, lat: float = None, lon: float = None, category: str = "commercial") -> str:
+async def get_route_radars(route_polyline: str) -> str:
+    """
+    GERÇEK ZAMANLI RADAR TARAMA (HERE Maps Traffic API): Rota boyunca aktif hız kameraları,
+    radar noktaları ve trafik tehlikelerini HERE Maps'ten canlı olarak çeker.
+    Rota hesaplandıktan sonra her zaman çağır. route_polyline için 'LATEST' kullanabilirsin.
+    """
+    try:
+        logger.info("🚨 [Tool: Radar] Rota üzerinde kamera taraması yapılıyor...")
+        result = await get_radars_on_route_handler(route_polyline)
+        if "error" in result:
+            return ErrorResponse(message=result["error"]).model_dump_json()
+        logger.success(f"✅ [Tool: Radar] {result['total_count']} kamera bulundu.")
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as e:
+        return handle_critical_error(e, "get_route_radars")
+
+
+# --- 12. ROTA GEÇİŞ ÜCRETLERİ (GERÇEK ZAMANLI - HERE MAPS) ---
+@mcp.tool()
+async def get_toll_for_route(route_polyline: str) -> str:
+    """
+    GERÇEK ZAMANLI GEÇİŞ ÜCRETİ (HERE Maps Routing API): Rota üzerindeki köprü, tünel ve
+    ücretli otoyolların HGS/OGS maliyetini HERE Maps'ten canlı olarak hesaplar.
+    Rota hesaplandıktan sonra her zaman çağır. route_polyline için 'LATEST' kullanabilirsin.
+    """
+    try:
+        logger.info("💰 [Tool: Toll] Rota ücreti hesaplanıyor...")
+        result = await get_toll_for_route_handler(route_polyline)
+        if "error" in result:
+            return ErrorResponse(message=result["error"]).model_dump_json()
+        logger.success(f"✅ [Tool: Toll] {result['toll_count']} geçiş tespit edildi. Toplam: {result['total_toll_cost_tl']} TL")
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as e:
+        return handle_critical_error(e, "get_toll_for_route")
+
+@mcp.tool()
+async def search_hybrid_places(query: str, location_name: str = None, lat: float = None, lon: float = None, category: str = "commercial", route_polyline: Optional[str] = None) -> str:
     """
     HİBRİT MEKAN ARAMA (Google + OSM Füzyonu): Kullanıcının aradığı mekanları bulur ve fiziksel doğruluğunu artırır.
     Eğer elinde kesin 'lat' ve 'lon' yoksa, bunları BOŞ BIRAK ve sadece 'location_name' (Örn: 'Kadıköy', 'Rize') ile 'query' değerlerini ver. 
     Lütfen koordinatları TAHMİN ETME!
+    Eğer kullanıcı bir rota üzerindeyse route_polyline parametresini geç veya LATEST kullan; bu sayede ETA bazlı mekan filtreleme aktif olur.
     """
-    logger.info(f"🧬 [Tool: Hybrid Fusion] Başlatıldı: '{query}' @ {location_name} | {lat},{lon}")
+    logger.info(f"🧬 [Tool: Hybrid Fusion] Başlatıldı: '{query}' @ {location_name} | {lat},{lon} | Rota: {'Aktif' if route_polyline else 'Pasif'}")
     
     try:
         # 1. Koordinat Çözümleme (LLM halüsinasyonunu engeller)
@@ -345,8 +394,8 @@ async def search_hybrid_places(query: str, location_name: str = None, lat: float
             else:
                  return json.dumps({"status": "error", "message": "Konum adı (location_name) veya koordinatlar (lat, lon) gerekli."})
 
-        # 2. Google'dan Ticari Veriyi Çek
-        google_raw = await search_places_google_handler(query, lat, lon, None)
+        # 2. Google'dan Ticari Veriyi Çek (route_polyline geçiliyorsa ETA hesabı da aktif)
+        google_raw = await search_places_google_handler(query, lat, lon, route_polyline)
         if "error" in google_raw:
             return json.dumps({"status": "error", "message": google_raw["error"]})
             
@@ -397,6 +446,129 @@ async def search_hybrid_places(query: str, location_name: str = None, lat: float
     except Exception as e:
         logger.error(f"🔥 [Tool: Hybrid Fusion] Kritik Hata: {e}")
         return json.dumps({"status": "error", "message": str(e)})
+
+
+# --- 13. POI GERİ BİLDİRİM (KARA LİSTE) ---
+@mcp.tool()
+async def report_poi_feedback(place_name: str, reason: str, session_id: str = "default") -> str:
+    """
+    KULLANICI GERİ BİLDİRİMİ: Kullanıcı bir mekanı “kapalıydı” veya “beğenmedim” dediğinde çağır.
+    Bu mekanı oturum kara listesine ekler, bir daha önerilmez.
+    Kullanıcı herhangi bir mekan veya öneri hakkında olumsuz geıbildirim verdiğinde kullan.
+    """
+    try:
+        blacklist_key = f"poi_blacklist:{session_id}"
+        entry = json.dumps({"name": place_name, "reason": reason}, ensure_ascii=False)
+        redis_store.client.rpush(blacklist_key, entry)
+        redis_store.client.expire(blacklist_key, 86400 * 7)  # 7 gün
+        logger.info(f"🚫 [Feedback] '{place_name}' kara listeye eklendi. Neden: {reason}")
+        return json.dumps({
+            "status": "ok",
+            "message": f"'​{place_name}' kara listeye eklendi. Bir daha önerilmeyecek.",
+            "session_id": session_id
+        }, ensure_ascii=False)
+    except Exception as e:
+        return handle_critical_error(e, "report_poi_feedback")
+
+
+@mcp.tool()
+async def get_poi_blacklist(session_id: str = "default") -> str:
+    """
+    Oturuma ait POI kara listesini getirir. Mekan önerisi yapmadan önce bu listeyi kontrol et.
+    Kara listedeki mekanlar hiçbir koşulda tekrar önerilmemeli.
+    """
+    try:
+        blacklist_key = f"poi_blacklist:{session_id}"
+        items = redis_store.client.lrange(blacklist_key, 0, -1)
+        blacklist = [json.loads(item) for item in items] if items else []
+        return json.dumps({
+            "blacklisted_places": blacklist,
+            "count": len(blacklist)
+        }, ensure_ascii=False)
+    except Exception as e:
+        return handle_critical_error(e, "get_poi_blacklist")
+
+
+# --- 14. ROTA ÖZET KARTI ---
+@mcp.tool()
+async def build_route_summary(
+    route_data: str,
+    radar_data: str = "",
+    toll_data: str = "",
+    weather_data: str = ""
+) -> str:
+    """
+    ROTA ÖZET KARTI: Rota hesaplandıktan sonra mesafe, süre, radar sayısı,
+    geçiş ücreti ve hava durumu bilgilerini birleştirip Markdown özet kart oluşturur.
+    Rota araçları tamamlandıktan sonra mutlaka bu aracı çağır.
+    """
+    try:
+        import json as _json
+        rd = _json.loads(route_data) if route_data else {}
+        rr = _json.loads(radar_data) if radar_data else None
+        td = _json.loads(toll_data) if toll_data else None
+        wd = _json.loads(weather_data) if weather_data else None
+        result = build_route_summary_handler(rd, rr, td, wd)
+        return _json.dumps(result, ensure_ascii=False)
+    except Exception as e:
+        return handle_critical_error(e, "build_route_summary")
+
+
+# --- 15. EV ŞARJ İSTASYONLARI ---
+@mcp.tool()
+async def get_ev_charging_stations(route_polyline: str) -> str:
+    """
+    EV ŞARJ İSTASYONLARI: Rota boyunca elektrikli araç şarj noktalarını bulur (OSM).
+    Kullanıcının aracı elektrikli ise veya şarj noktası soran kullanıcıya uygulanmalıdır.
+    'LATEST' kullanılabilir.
+    """
+    try:
+        result = await get_ev_charging_handler(route_polyline)
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as e:
+        return handle_critical_error(e, "get_ev_charging_stations")
+
+
+# --- 16. CANLI TRAFİK DURUMU ---
+@mcp.tool()
+async def get_route_traffic(route_polyline: str) -> str:
+    """
+    CANLI TRAFİK: HERE Traffic Flow API'dan rota üzerindeki gerçek zamanlı trafik
+    yoğunluğunu çeker. Sıkışıklık seviyesi, hız ve gecikme bilgisi döner.
+    Rota hesaplandıktan sonra 'LATEST' ile otomatik çağrılabilir.
+    """
+    try:
+        result = await get_route_traffic_handler(route_polyline)
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as e:
+        return handle_critical_error(e, "get_route_traffic")
+
+
+# --- 17. ARAÇ PROFİLİ GÜNCELLEME ---
+@mcp.tool()
+async def update_vehicle_profile(
+    brand: str,
+    model: str,
+    year: int,
+    city_consumption: float,
+    highway_consumption: float,
+    fuel_type: str = "gasoline",
+    username: str = "test_pilot"
+) -> str:
+    """
+    ARAÇ PROFİLİ GÜNCELLEME: Kullanıcının araç bilgilerini (marka, model, yıl, tüketim) veritabanında günceller.
+    Kullanıcı 'Aracımı şu marka yap' veya 'Tüketimi güncelle' dediğinde bunu kullan.
+    """
+    try:
+        from orchestrator.profile_manager import ProfileManager
+        result = await ProfileManager.update_vehicle_profile(
+            brand, model, year, city_consumption, highway_consumption, fuel_type, username
+        )
+        return json.dumps({"status": "success", "message": result}, ensure_ascii=False)
+    except Exception as e:
+        return handle_critical_error(e, "update_vehicle_profile")
+
+
 if __name__ == "__main__":
     logger.info("🚀 City Agent v2.0 (MCP) Port 8000 üzerinde başlatılıyor...")
     mcp.run(transport="sse", host="0.0.0.0", port=8000)

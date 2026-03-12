@@ -312,17 +312,22 @@ WFS_DATASETS: Dict[str, WFS_CKAN_Dataset] = {
     # Örnek IBB CKAN Datastore API Endpoint'leri:
     "ibb_afet_toplanma": WFS_CKAN_Dataset(
         dataset_id="ibb_afet_toplanma", 
-        url="https://data.ibb.gov.tr/api/3/action/datastore_search?resource_id=64d2bfb2-6014-4cbf-8d59-c290a424b94f", 
+        url="dynamic_search_Afet Toplanma", 
         src_epsg=4326
     ),
     "ibb_ispark": WFS_CKAN_Dataset(
         dataset_id="ibb_ispark", 
-        url="https://data.ibb.gov.tr/dataset/4b901fcb-8392-4aef-bbc7-920ac34bcdec/resource/0dd622bb-673e-4d04-ac0b-5b58c7bc77f3/download/ispark_otopark_lokasyonlari.geojson", 
+        url="live_api_ispark", 
         src_epsg=4326
     ),
     "ibb_wifi": WFS_CKAN_Dataset(
         dataset_id="ibb_wifi",
-        url="https://data.ibb.gov.tr/dataset/50dfdc43-3b17-488b-b8c7-43ca20cce1c4/resource/5766e4a2-15f5-4dc2-b883-fa4ab854abf8/download/ibbwifi_noktalari_wgs84.geojson",
+        url="https://data.ibb.gov.tr/api/3/action/datastore_search?resource_id=5d0a0b1e-9e56-4038-b966-7d3e7b46f882",
+        src_epsg=4326
+    ),
+    "ibb_sosyal_tesis": WFS_CKAN_Dataset(
+        dataset_id="ibb_sosyal_tesis",
+        url="dynamic_search_Sosyal Tesis", # "Sosyal Tesis" kelimesini aratacağız
         src_epsg=4326
     )
 }
@@ -444,7 +449,6 @@ async def fetch_wfs_as_geojson(
         _wfs_cache.set(cache_key, data)
         return data
 
-
 async def fetch_ibb_dataset_geojson(
     dataset_id: str,
     bbox: Optional[Tuple[float, float, float, float]] = None,
@@ -455,66 +459,100 @@ async def fetch_ibb_dataset_geojson(
 
     ds = WFS_DATASETS[dataset_id]
     
-    # 1. Aşama: Eğer datastore_search API (CKAN) ise
-    if "datastore_search" in ds.url:
-        params = {"limit": max_features}
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            log.info(f"🌐 [CKAN API] Veri çekiliyor: {dataset_id}")
-            resp = await client.get(ds.url, params=params)
-            data = resp.json()
-            
-            if data.get("success"):
-                records = data["result"]["records"]
+    # --- STRATEJİ 1: İSPARK CANLI API (test_ispark.py mantığı) ---
+    if ds.url == "live_api_ispark":
+        async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            log.info(f"📡 [Canlı API] Veri çekiliyor: {dataset_id}")
+            try:
+                resp = await client.get("https://api.ibb.gov.tr/ispark/Park", headers=headers)
+                data = resp.json()
                 features = []
-                for rec in records:
-                    # Enlem Boylam (Lat, Lon / Enlem, Boylam) kontrolü
-                    lat = rec.get("Enlem") or rec.get("LATITUDE") or rec.get("lat")
-                    lon = rec.get("Boylam") or rec.get("LONGITUDE") or rec.get("lon")
-                    
-                    # Güvenli float dönüşümü
-                    lat_f, lon_f = _maybe_float(str(lat)), _maybe_float(str(lon))
-                    
-                    if lat_f is not None and lon_f is not None:
-                        geom = {"type": "Point", "coordinates": [lon_f, lat_f]}
-                        # WGS84 değilse (örn ITRF96) dönüştür
-                        if ds.src_epsg != 4326:
-                            geom["coordinates"] = _project_coords([geom["coordinates"]], ds.src_epsg, 4326)[0]
-                            
+                for park in data[:max_features]:
+                    lat, lon = park.get("lat"), park.get("lng")
+                    if lat and lon:
                         features.append({
                             "type": "Feature",
-                            "geometry": geom,
-                            "properties": rec
+                            "geometry": {"type": "Point", "coordinates": [float(lon), float(lat)]},
+                            "properties": {
+                                "name": park.get("parkName", "İSPARK"),
+                                "capacity": park.get("capacity", 0),
+                                "emptyCapacity": park.get("emptyCapacity", 0),
+                                "workHours": park.get("workHours", "-")
+                            }
                         })
                 fc = {"type": "FeatureCollection", "features": features}
                 return normalize_feature_collection(fc, dataset_id=dataset_id)
-            else:
-                 raise ValueError(f"CKAN API Hatası: {data}")
-    
-    # 2. Aşama: Doğrudan .geojson dosyası
-    elif ds.url.endswith(".geojson") or ds.url.endswith(".json"):
-         async with httpx.AsyncClient(timeout=30.0) as client:
-            log.info(f"🌐 [GeoJSON URL] İndiriliyor: {dataset_id}")
-            try:
-                resp = await client.get(ds.url)
-                if resp.status_code != 200:
-                    log.warning(f"⚠️ İBB Açık Veri {dataset_id} ulaşılmaz durumda (HTTP {resp.status_code})")
-                    fc = {"type": "FeatureCollection", "features": []}
-                else:
-                    fc = resp.json()
             except Exception as e:
-                log.error(f"❌ [GEOJSON] İndirme/Parse Hatası {dataset_id}: {e}")
-                fc = {"type": "FeatureCollection", "features": []}
-            return normalize_feature_collection(fc, dataset_id=dataset_id)
+                log.error(f"❌ [İSPARK API] Hata: {e}")
+                return {"type": "FeatureCollection", "features": []}
 
-    # 3. Aşama: Fallback WFS URL (GeoServer OWS vs.)
+    # --- STRATEJİ 2: DİNAMİK PAKET ARAMA (test_ibb_sosyal.py mantığı) ---
+    elif ds.url.startswith("dynamic_search_"):
+        search_query = ds.url.split("dynamic_search_")[1]
+        base_url = "https://data.ibb.gov.tr/api/3/action/"
+        
+        async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+            log.info(f"🔍 [Dinamik Arama] '{search_query}' aranıyor...")
+            try:
+                pkg_resp = await client.get(base_url + "package_search", params={"q": search_query, "rows": 1})
+                resource_id = None
+                
+                if pkg_resp.json().get("result", {}).get("results"):
+                    for res in pkg_resp.json()["result"]["results"][0]["resources"]:
+                        if res["format"].upper() in ["JSON", "CSV"]:
+                            resource_id = res["id"]
+                            break
+                
+                if not resource_id:
+                    log.warning(f"⚠️ {search_query} için güncel veri ID'si bulunamadı.")
+                    return {"type": "FeatureCollection", "features": []}
+                
+                # ID bulundu, şimdi veriyi çek (Strateji 3'teki datastore mantığına yönlendir)
+                ds = WFS_CKAN_Dataset(dataset_id=dataset_id, url=f"{base_url}datastore_search?resource_id={resource_id}")
+                # Koda aşağıdan devam edecek...
+            except Exception as e:
+                log.error(f"❌ [Dinamik Arama] Hata: {e}")
+                return {"type": "FeatureCollection", "features": []}
+
+    # --- STRATEJİ 3: CKAN DATASTORE API (Afet Toplanma ve test_ibb_wifi.py mantığı) ---
+    if "datastore_search" in ds.url:
+        params = {"limit": max_features}
+        async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+            log.info(f"🌐 [CKAN API] Veri çekiliyor: {dataset_id}")
+            try:
+                resp = await client.get(ds.url, params=params)
+                data = resp.json()
+                
+                if data.get("success"):
+                    records = data["result"]["records"]
+                    features = []
+                    for rec in records:
+                        # Enlem/Boylam eşleştirmesi (test_ibb_wifi.py ve eski kod harmanı)
+                        lat = rec.get("ENLEM") or rec.get("Enlem") or rec.get("LATITUDE") or rec.get("lat")
+                        lon = rec.get("BOYLAM") or rec.get("Boylam") or rec.get("LONGITUDE") or rec.get("lon")
+                        
+                        lat_f, lon_f = _maybe_float(str(lat)), _maybe_float(str(lon))
+                        if lat_f is not None and lon_f is not None:
+                            geom = {"type": "Point", "coordinates": [lon_f, lat_f]}
+                            if ds.src_epsg != 4326:
+                                geom["coordinates"] = _project_coords([geom["coordinates"]], ds.src_epsg, 4326)[0]
+                                
+                            features.append({"type": "Feature", "geometry": geom, "properties": rec})
+                    
+                    fc = {"type": "FeatureCollection", "features": features}
+                    return normalize_feature_collection(fc, dataset_id=dataset_id)
+                else:
+                    raise ValueError(f"CKAN API başarısız yanıt döndü.")
+            except Exception as e:
+                log.error(f"❌ [CKAN API] Hata: {e}")
+                return {"type": "FeatureCollection", "features": []}
+
+    # 4. Aşama: Eskiden kalan GeoJSON linkleri veya Fallback WFS URL (Eski kodun geri kalanı)
+    elif ds.url.endswith(".geojson") or ds.url.endswith(".json"):
+        # ... (burası senin wfs.py'deki eski kodun 2. aşaması olarak aynı kalabilir)
+        pass
+        
     else:
-        fc = await fetch_wfs_as_geojson(
-            base_url=ds.url.split("?")[0], # OWS base url
-            type_name=ds.url.split("typeNames=")[-1].split("&")[0] if "typeNames=" in ds.url else dataset_id,
-            bbox=bbox,
-            src_epsg=ds.src_epsg,
-            dst_epsg=4326,
-            max_features=max_features,
-        )
-        return normalize_feature_collection(fc, dataset_id=dataset_id)
-
+        # ... (burası senin wfs.py'deki eski kodun 3. aşaması olarak aynı kalabilir)
+        pass

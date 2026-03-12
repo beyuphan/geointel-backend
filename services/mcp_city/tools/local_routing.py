@@ -46,14 +46,18 @@ async def get_local_route(origin_lat, origin_lon, dest_lat, dest_lon, preference
             sql_cost = "cost_time"
             sql_reverse = "reverse_cost_time"
 
-        # 3. 🔥 SİHİRLİ SORGUSU (BURASI DEĞİŞTİ) 🔥
-        # ST_MakeLine ve ORDER BY a.seq sayesinde rota "ip gibi" düzgün çıkar.
+        # 3. 🔥 SİHİRLİ SORGUSU (GELİŞTİRİLDİ) 🔥
+        # Trafik verisi (current_speed) varsa onu, yoksa şehir içi varsayılan (25 km/s) hızı kullan.
+        # Bu, İBB'nin izlemediği ara sokaklarda rotanın "uçmasını" engeller.
+        dynamic_cost = "CASE WHEN current_speed IS NOT NULL AND current_speed > 0 THEN (length_m / (current_speed / 3.6)) ELSE (length_m / (25 / 3.6)) END"
+        
         route_sql = f"""
         SELECT sum(b.length_m) as total_meters, 
-               sum(b.cost_time) as total_seconds, 
+               sum({dynamic_cost}) as total_seconds,
+               avg(COALESCE(b.current_speed, 25)) as avg_speed,
                ST_AsGeoJSON(ST_MakeLine(b.the_geom ORDER BY a.seq)) as geometry
         FROM pgr_dijkstra(
-            'SELECT gid as id, source, target, {sql_cost} as cost, {sql_reverse} as reverse_cost FROM ways',
+            'SELECT gid as id, source, target, {dynamic_cost} as cost, {dynamic_cost} as reverse_cost FROM ways',
             $1::bigint, $2::bigint, directed := false
         ) a
         JOIN ways b ON (a.edge = b.gid);
@@ -65,15 +69,44 @@ async def get_local_route(origin_lat, origin_lon, dest_lat, dest_lon, preference
             log.warning("⚠️ [LOCAL ROUTING] Rota bulunamadı.")
             return None
         
+        # 4. TRAFİK YOĞUNLUK ANALİZİ
+        avg_speed = row['avg_speed'] or 40.0
+        total_seconds = row['total_seconds'] or 0
+        total_meters = row['total_meters'] or 0
+        
+        # İdeal Süre (Baseline: 60 km/h)
+        # 60 km/h = 16.6 m/s
+        ideal_seconds = total_meters / 16.6
+        delay_seconds = max(0, total_seconds - ideal_seconds)
+        
+        # Trafik Durumu Belirle
+        if avg_speed < 10:
+            traffic_status = "⛔ DURMUŞ"
+            traffic_color = "red"
+        elif avg_speed < 25:
+            traffic_status = "🔴 YOĞUN"
+            traffic_color = "orange"
+        elif avg_speed < 45:
+            traffic_status = "🟡 AKICI-YOĞUN"
+            traffic_color = "yellow"
+        else:
+            traffic_status = "🟢 AKICI"
+            traffic_color = "green"
+
         # Sonucu Formatla
         result = {
             "mode": preference,
-            "distance_km": round(row['total_meters'] / 1000.0, 2) if row['total_meters'] else 0,
-            "duration_min": round(row['total_seconds'] / 60.0, 1) if row['total_seconds'] else 0,
-            "geometry": json.loads(row['geometry'])
+            "distance_km": round(total_meters / 1000.0, 2),
+            "duration_min": round(total_seconds / 60.0, 1),
+            "avg_speed_kmh": round(avg_speed, 1),
+            "traffic_status": traffic_status,
+            "traffic_color": traffic_color,
+            "delay_min": round(delay_seconds / 60.0, 1),
+            "geometry": json.loads(row['geometry']),
+            "data_source": "GeoIntel Yerel Rotalama (İBB Canlı Veri Destekli)"
         }
 
-        log.success(f"✅ [LOCAL ROUTING] {result['distance_km']} km, {result['duration_min']} dk.")
+        log.success(f"✅ [LOCAL ROUTING] {result['distance_km']} km, {result['duration_min']} dk | Durum: {traffic_status}")
         return result
 
     except Exception as e:

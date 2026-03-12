@@ -28,7 +28,17 @@ class ProfileManager:
             # 2. Araç Bilgisi
             vehicle = await conn.fetchrow("SELECT * FROM user_vehicles WHERE user_id = $1 AND is_primary = TRUE", user_id)
             if vehicle:
-                context.append(f"🚗 ARAÇ BİLGİSİ: {vehicle['vehicle_name']} | Tip: {vehicle['fuel_type']} | Tüketim: {vehicle['avg_consumption']}L/100km")
+                details = []
+                if vehicle.get('brand'): details.append(vehicle['brand'])
+                if vehicle.get('model'): details.append(vehicle['model'])
+                if vehicle.get('year'): details.append(str(vehicle['year']))
+                name_str = " ".join(details) if details else vehicle['vehicle_name']
+                
+                cons_str = f"{vehicle['avg_consumption']}L/100km"
+                if vehicle.get('city_consumption') and vehicle.get('highway_consumption'):
+                    cons_str = f"Şehir: {vehicle['city_consumption']}L | Uzun Yol: {vehicle['highway_consumption']}L"
+                
+                context.append(f"🚗 ARAÇ: {name_str} | Tip: {vehicle['fuel_type']} | Tüketim: {cons_str}")
             else:
                 context.append("🚗 ARAÇ BİLGİSİ: Bilinmiyor (Varsayılan: Benzinli kabul et)")
 
@@ -51,6 +61,76 @@ class ProfileManager:
             await conn.close()
         
         return "\n".join(context)
+
+    @staticmethod
+    async def get_saved_locations(username: str = "test_pilot") -> dict:
+        """
+        Kullanıcının kayıtlı konumlarını döner.
+        Örn: {"ev": "41.02,40.52", "iş": "41.05,39.73", "ayşe teyzem": "41.10,39.90"}
+        Koordinat çözücüde 'Ev', 'İş' gibi kısayolları desteklemek için kullanılır.
+        """
+        conn = await ProfileManager.get_connection()
+        try:
+            user = await conn.fetchrow("SELECT id FROM users WHERE username = $1", username)
+            if not user:
+                return {}
+            user_id = user["id"]
+
+            rows = await conn.fetch(
+                "SELECT name, coordinates FROM saved_locations WHERE user_id = $1 AND coordinates IS NOT NULL",
+                user_id
+            )
+            return {row["name"].lower().strip(): row["coordinates"] for row in rows}
+
+        except Exception as e:
+            logger.warning(f"⚠️ [SavedLocations] Kayıtlı konumlar alınamadı: {e}")
+            return {}
+        finally:
+            await conn.close()
+
+
+    @staticmethod
+    async def update_vehicle_profile(
+        brand: str,
+        model: str,
+        year: int,
+        city_consumption: float,
+        highway_consumption: float,
+        fuel_type: str = "gasoline",
+        username: str = "test_pilot"
+    ):
+        """
+        Kullanıcının ana araç profilini detaylı olarak günceller.
+        """
+        conn = await ProfileManager.get_connection()
+        try:
+            user = await conn.fetchrow("SELECT id FROM users WHERE username = $1", username)
+            if not user: return "Kullanıcı bulunamadı."
+            user_id = user['id']
+
+            # Mevcut primary aracı bul veya yeni oluştur
+            await conn.execute("""
+                INSERT INTO user_vehicles 
+                (user_id, vehicle_name, brand, model, year, city_consumption, highway_consumption, avg_consumption, fuel_type, is_primary)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)
+                ON CONFLICT (id) DO UPDATE SET
+                    brand = EXCLUDED.brand,
+                    model = EXCLUDED.model,
+                    year = EXCLUDED.year,
+                    city_consumption = EXCLUDED.city_consumption,
+                    highway_consumption = EXCLUDED.highway_consumption,
+                    avg_consumption = (EXCLUDED.city_consumption + EXCLUDED.highway_consumption) / 2,
+                    fuel_type = EXCLUDED.fuel_type
+            """, user_id, f"{brand} {model}", brand, model, year, city_consumption, highway_consumption, 
+               (city_consumption + highway_consumption) / 2, fuel_type)
+            
+            return f"✅ Araç profili güncellendi: {brand} {model} ({year})"
+
+        except Exception as e:
+            logger.error(f"Araç profil güncelleme hatası: {e}")
+            return f"❌ Hata: {e}"
+        finally:
+            await conn.close()
 
     @staticmethod
     async def update_memory(category: str, value: str, username: str = "test_pilot"):
@@ -95,5 +175,88 @@ class ProfileManager:
         except Exception as e:
             logger.error(f"Hafıza kayıt hatası: {e}")
             return f"Hata oluştu: {e}"
+        finally:
+            await conn.close()
+
+    @staticmethod
+    async def save_route_history(
+        origin: str,
+        destination: str,
+        distance_km: float,
+        duration_min: float,
+        username: str = "test_pilot"
+    ):
+        """
+        Başarıyla hesaplanan rotayı kullanıcı geçmişine kaydeder.
+        Aynı rota 24 saat içinde zaten kaydedilmişse atlar (duplicate önleme).
+        """
+        conn = await ProfileManager.get_connection()
+        try:
+            user = await conn.fetchrow("SELECT id FROM users WHERE username = $1", username)
+            if not user:
+                return
+            user_id = user['id']
+
+            # Duplicate kontrolü: Aynı origin+dest son 24 saatte var mı?
+            existing = await conn.fetchrow("""
+                SELECT id FROM route_history
+                WHERE user_id = $1 AND origin = $2 AND destination = $3
+                  AND created_at >= NOW() - INTERVAL '24 hours'
+                LIMIT 1
+            """, user_id, origin, destination)
+
+            if existing:
+                logger.info(f"⏭️ [RouteHistory] Aynı rota 24 saat içinde zaten kayıtlı, atlandı.")
+                return
+
+            await conn.execute("""
+                INSERT INTO route_history (user_id, origin, destination, distance_km, duration_min, created_at)
+                VALUES ($1, $2, $3, $4, $5, NOW())
+            """, user_id, origin, destination, distance_km, duration_min)
+
+            logger.success(f"✅ [RouteHistory] Rota kaydedildi: {origin} -> {destination} ({distance_km}km, {duration_min}dk)")
+
+        except Exception as e:
+            # route_history tablosu yoksa sessizce geç (migration bekleniyor olabilir)
+            logger.warning(f"⚠️ [RouteHistory] Kayıt başarısız (tablo yok mu?): {e}")
+        finally:
+            await conn.close()
+
+    @staticmethod
+    async def get_route_history(username: str = "test_pilot", limit: int = 5) -> list:
+        """
+        Kullanıcının son rota geçmişini döndürür.
+        LLM'e kişiselleştirilmiş öneri yapabilmek için kullanılır.
+        """
+        conn = await ProfileManager.get_connection()
+        try:
+            user = await conn.fetchrow("SELECT id FROM users WHERE username = $1", username)
+            if not user:
+                return []
+            user_id = user['id']
+
+            rows = await conn.fetch("""
+                SELECT origin, destination, distance_km, duration_min,
+                       TO_CHAR(created_at, 'DD.MM.YYYY HH24:MI') AS date_str
+                FROM route_history
+                WHERE user_id = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+            """, user_id, limit)
+
+            return [
+                {
+                    "origin": r["origin"],
+                    "destination": r["destination"],
+                    "distance_km": r["distance_km"],
+                    "duration_min": r["duration_min"],
+                    "date": r["date_str"]
+                }
+                for r in rows
+            ]
+
+        except Exception as e:
+            logger.warning(f"⚠️ [RouteHistory] Geçmiş okunamadı: {e}")
+            return []
         finally:
             await conn.close()
