@@ -1,5 +1,6 @@
 import httpx
 import flexpolyline
+
 from datetime import datetime, timezone
 from loguru import logger as log
 from .config import settings
@@ -7,17 +8,16 @@ from .models import RouteRequest
 from .cache import redis_store
 from .local_routing import is_in_service_area, get_local_route
 
+
+
+
 # Favori lokasyon çözücü (DB'den lazy import - döngüsel import önlemi)
 async def _resolve_from_db(location: str, session_id: str = "test_pilot") -> str | None:
     """Kayıtlı konumları (Ev, İş vb.) DB'den koordinata çevirir."""
     try:
-        import sys
-        import os
-        # orchestrator modülünü path'e ekle
-        orch_path = os.path.join(os.path.dirname(__file__), "..", "..", "..", "orchestrator")
-        if orch_path not in sys.path:
-            sys.path.insert(0, orch_path)
-        from profile_manager import ProfileManager
+        # Artık doğrudan orchestrator klasöründen çekebiliriz!
+        from orchestrator.profile_manager import ProfileManager
+        
         saved = await ProfileManager.get_saved_locations(username=session_id)
         key = location.lower().strip()
         if key in saved:

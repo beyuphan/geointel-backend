@@ -425,6 +425,13 @@ async def custom_tool_node(state: AgentState):
                         res["polyline"] = "[HARİTAYA ÇİZİLDİ - OKUMANA GEREK YOK]"
                     if "polyline_encoded" in res: 
                         res["polyline_encoded"] = "[HARİTAYA ÇİZİLDİ - OKUMANA GEREK YOK]"
+                    
+                    if "alternatives" in res and isinstance(res["alternatives"], list):
+                        for alt in res["alternatives"]:
+                            if "polyline_encoded" in alt:
+                                alt["polyline_encoded"] = "[GİZLENDİ]"
+                            if "polyline" in alt:
+                                alt["polyline"] = "[GİZLENDİ]"
                 if "lat" in res and "lon" in res: visual_data["markers"].append({"name": "Hedef", "lat": res["lat"], "lon": res["lon"]})
 
             tool_output = res

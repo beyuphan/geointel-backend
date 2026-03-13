@@ -73,6 +73,7 @@ services:
       - geo_net
     volumes:
       - ./services/mcp_city:/app
+      - ./services/orchestrator:/app/orchestrator  # Orchestrator koduna erişim için
 
   # 5. UYDU AJANI (MCP SATELLITE - İleride kodlayacağız)
   mcp_satellite:
