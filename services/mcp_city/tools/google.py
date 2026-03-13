@@ -134,10 +134,17 @@ async def search_places_google_handler(query: str, lat: float = None, lon: float
                             # (Google API detaylı saat vermediği için basit heuristik: Gece 23:00 - 06:00 arası filtrele)
                             if place_obj["open_now"] is True: # Şu an açık
                                 if eta_time.hour >= 23 or eta_time.hour < 6:
-                                    # Gece varılacak mekanlar muhtemelen kapalıdır, listeye alma.
-                                    # Not: 24 saat açık olan istasyonlar detay sorgusunda anlaşılır ancak textsearch bunu dönmez.
-                                    logger.info(f"Mekan ETA nedeniyle elendi (Gece varış): {place_obj['name']} | ETA: {place_obj['eta']}")
-                                    continue
+                                    # 24 Saat açık olması muhtemel mekanlar (Benzinlik, Otel, Hastane) için istisna
+                                    query_lower = query.lower()
+                                    name_lower = place_obj['name'].lower()
+                                    exempt_keywords = ["benzin", "petrol", "akaryakıt", "istasyon", "opet", "shell", "bp", "hastane", "otel", "hotel", "havalimanı"]
+                                    
+                                    is_exempt = any(k in query_lower or k in name_lower for k in exempt_keywords)
+                                    
+                                    if not is_exempt:
+                                        # Gece varılacak mekanlar muhtemelen kapalıdır, listeye alma.
+                                        logger.info(f"Mekan ETA nedeniyle elendi (Gece varış): {place_obj['name']} | ETA: {place_obj['eta']}")
+                                        continue
                         
                         # KRİTERLER: 400m (Yol üstü), 5000m (Kısa sapma)
                         if place_obj["deviation_meters"] <= 400:

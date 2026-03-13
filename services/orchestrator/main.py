@@ -180,9 +180,25 @@ class GeoIntelOrchestrator:
             }
             if name in polyline_tools and self.redis_client:
                 poly_param = polyline_tools[name]
-                if not kwargs.get(poly_param) or kwargs.get(poly_param) == "LATEST":
+                poly_val = kwargs.get(poly_param, "")
+                poly_val_str = str(poly_val) if poly_val else ""
+                
+                # Broad safety net: check for missing strings, known proxy keywords, or implausibly short polylines
+                is_proxy = (
+                    not poly_val_str or 
+                    "LATEST" in poly_val_str.upper() or 
+                    "GİZLENDİ" in poly_val_str.upper() or 
+                    "HARİTA" in poly_val_str.upper() or 
+                    len(poly_val_str) < 100
+                )
+                
+                if is_proxy:
                     latest = self.redis_client.get(route_key)
-                    if latest: kwargs[poly_param] = latest
+                    if latest: 
+                        kwargs[poly_param] = latest
+                        log.info(f"🔄 [Proxy] Sahte polyline algılandı ('{poly_val_str[:20]}...'), Redis'teki gerçek koordinatlarla değiştirildi.")
+                    else:
+                        log.warning(f"⚠️ [Proxy] Redis'te '{route_key}' boş ama sahte bir polyline gönderildi!")
 
             mcp_args = {k: v for k, v in kwargs.items() if k != "session_id"}
             result = await self.mcp_rpc_call(service_name, "tools/call", {"name": name, "arguments": mcp_args})
@@ -292,6 +308,9 @@ async def intent_node(state: AgentState):
         return {"intent": {"category": "general", "focus_points": [], "urgency": False, "complexity": "high"}}
 
 def should_continue(state: AgentState):
+    if state.get("retry_count", 0) > 3:
+        log.warning("⚠️ Max tool retry limit reached! Killing execution loop.")
+        return END
     if state["messages"][-1].tool_calls: return "tools"
     return END
 
@@ -418,9 +437,23 @@ async def custom_tool_node(state: AgentState):
                     )
 
                 if "polyline" in res or "polyline_encoded" in res: 
-                    visual_data["polyline"] = res.get("polyline") or res.get("polyline_encoded")
+                    # 1. Ham polyline verisini al (String olmasını bekliyoruz)
+                    poly_str = res.get("polyline") or res.get("polyline_encoded")
                     
-                    # LLM'in kafası devasa veriyle karışmasın diye polyline metnini gizliyoruz!
+                    # 2. Eğer LLM'e giden token gizleme etiketi varsa, Redis'ten asıl polyline'ı çek!
+                    if poly_str and "LATEST" in poly_str and orchestrator.redis_client:
+                        route_key = f"route:{state['session_id']}"
+                        real_poly = orchestrator.redis_client.get(route_key)
+                        if real_poly:
+                            visual_data["polyline"] = real_poly
+                            log.info(f"🗺️ [Visualizer] Gizli (LATEST) polyline algılandı, Redis '{route_key}' den gerçek koordinatlar çekildi.")
+                        else:
+                            visual_data["polyline"] = poly_str
+                            log.warning(f"⚠️ [Visualizer] LATEST algılandı ama Redis '{route_key}' boş!")
+                    else:
+                        visual_data["polyline"] = poly_str
+                    
+                    # LLM'in kafası devasa veriyle karışmasın diye polyline metnini tamamen gizliyoruz!
                     if "polyline" in res: 
                         res["polyline"] = "[HARİTAYA ÇİZİLDİ - OKUMANA GEREK YOK]"
                     if "polyline_encoded" in res: 

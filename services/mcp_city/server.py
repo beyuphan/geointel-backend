@@ -205,7 +205,15 @@ async def analyze_route_weather(polyline: str) -> str:
             return ErrorResponse(message=result["error"]).model_dump_json()
 
         logger.success("✅ [Tool: Weather Shield] Analiz tamamlandı.")
-        return json.dumps(result, ensure_ascii=False)
+        
+        # TOKEN OPTIMIZATION: LLM'e sadece özeti gönder, tüm koordinat dizisi gereksiz bağlam yaratır.
+        summary_result = {
+            "tarama_noktasi_sayisi": result.get("tarama_noktasi_sayisi", 0),
+            "risk_durumu": result.get("risk_durumu", "BİLİNMİYOR"),
+            "riskli_bolgeler": result.get("riskli_bolgeler", []),
+            "tavsiye": result.get("tavsiye", "")
+        }
+        return json.dumps(summary_result, ensure_ascii=False)
     except Exception as e:
         return handle_critical_error(e, "analyze_route_weather")
 
@@ -349,7 +357,15 @@ async def get_route_radars(route_polyline: str) -> str:
         if "error" in result:
             return ErrorResponse(message=result["error"]).model_dump_json()
         logger.success(f"✅ [Tool: Radar] {result['total_count']} kamera bulundu.")
-        return json.dumps(result, ensure_ascii=False)
+        
+        # TOKEN OPTIMIZATION: LLM'e tüm radar koordinatlarını dönme. 
+        # Sadece sayı durumu ve tehlike bilgisini gönder. 
+        summary_result = {
+            "total_count": result.get("total_count", 0),
+            "summary": result.get("summary", ""),
+            "warning": result.get("warning")
+        }
+        return json.dumps(summary_result, ensure_ascii=False)
     except Exception as e:
         return handle_critical_error(e, "get_route_radars")
 
@@ -373,7 +389,7 @@ async def get_toll_for_route(route_polyline: str) -> str:
         return handle_critical_error(e, "get_toll_for_route")
 
 @mcp.tool()
-async def search_hybrid_places(query: str, location_name: str = None, lat: float = None, lon: float = None, category: str = "commercial", route_polyline: Optional[str] = None) -> str:
+async def search_hybrid_places(query: str, location_name: Optional[str] = None, lat: Optional[float] = None, lon: Optional[float] = None, category: Optional[str] = "commercial", route_polyline: Optional[str] = None) -> str:
     """
     HİBRİT MEKAN ARAMA (Google + OSM Füzyonu): Kullanıcının aradığı mekanları bulur ve fiziksel doğruluğunu artırır.
     Eğer elinde kesin 'lat' ve 'lon' yoksa, bunları BOŞ BIRAK ve sadece 'location_name' (Örn: 'Kadıköy', 'Rize') ile 'query' değerlerini ver. 
@@ -391,23 +407,50 @@ async def search_hybrid_places(query: str, location_name: str = None, lat: float
                     lat, lon = map(float, resolved.split(","))
                 else:
                     return json.dumps({"status": "error", "message": f"{location_name} için koordinat bulunamadı."})
-            else:
-                 return json.dumps({"status": "error", "message": "Konum adı (location_name) veya koordinatlar (lat, lon) gerekli."})
+            elif not route_polyline:
+                 return json.dumps({"status": "error", "message": "Konum adı (location_name), koordinatlar (lat, lon) veya route_polyline parametrelerinden en az biri gerekli."})
 
         # 2. Google'dan Ticari Veriyi Çek (route_polyline geçiliyorsa ETA hesabı da aktif)
-        google_raw = await search_places_google_handler(query, lat, lon, route_polyline)
+        # lat ve lon None olsa bile route_polyline varsa Google Places yine de sonuç bulabilir.
+        google_raw = await search_places_google_handler(query, lat or 0.0, lon or 0.0, route_polyline)
         if "error" in google_raw:
             return json.dumps({"status": "error", "message": google_raw["error"]})
             
         google_places = google_raw.get("strict_route_places", []) + google_raw.get("relaxed_route_places", [])
         
+        # Eğer kesin koordinat yoksa OSM fusion yapılamaz (Bounding box merkezsiz çizilemez), doğrudan dön!
+        if not lat or not lon:
+            logger.info("ℹ️ Kesin koordinat olmadığı için OSM füzyonu atlanıyor, Google Rota araması sonuçları dönülecek.")
+            fused_results = []
+            for g_place in google_places:
+                try:
+                    g_lat, g_lon = map(float, g_place.get("coords", "0,0").split(","))
+                except:
+                    continue
+                fused_results.append({
+                    "name": g_place.get("name"),
+                    "address": g_place.get("address"),
+                    "rating": g_place.get("rating"),
+                    "is_open": str(g_place.get("open_now")),
+                    "lat": g_lat,
+                    "lon": g_lon,
+                    "fusion_status": "Google Route-Only Match"
+                })
+            
+            return json.dumps({
+                "places": fused_results,
+                "count": len(fused_results),
+                "data_source": "Google Places API (Route Match)"
+            }, ensure_ascii=False)
+
+        # Kesin koordinat varsa normal OSM füzyonu devam eder...
         # 3. OSM'den Fiziksel (Bina/Altyapı) Verisini Çek
         osm_raw = await search_infrastructure_osm_handler(lat, lon, category)
         osm_places = osm_raw if isinstance(osm_raw, list) and len(osm_raw) > 0 and "error" not in osm_raw[0] else []
 
         fused_results = []
         
-        # 3. Çakıştırma (Füzyon) Algoritması
+        # 4. Çakıştırma (Füzyon) Algoritması
         for g_place in google_places:
             try:
                 g_lat, g_lon = map(float, g_place.get("coords", "0,0").split(","))

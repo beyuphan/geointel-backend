@@ -171,6 +171,8 @@ async def get_toll_for_route_handler(route_polyline: str) -> dict:
 
 def _parse_here_toll(toll: dict) -> dict | None:
     """HERE API'den gelen tek bir toll nesnesini parse eder."""
+    if not isinstance(toll, dict):
+        return None
     try:
         name = toll.get("tollSystem", {}).get("name", "Ücretli Geçiş")
         

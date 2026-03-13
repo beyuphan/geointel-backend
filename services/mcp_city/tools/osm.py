@@ -2,14 +2,18 @@ import httpx
 from logger import log
 from .config import settings
 from .models import OSMRequest
+from typing import Optional
 
-async def search_infrastructure_osm_handler(lat: float, lon: float, category: str, radius: int = 2000) -> list:
+async def search_infrastructure_osm_handler(lat: float, lon: float, category: Optional[str] = None, radius: int = 2000) -> list:
     """
     OpenStreetMap üzerinde optimize edilmiş dinamik arama.
     """
     try:
+        # Guarantee category is a string before it hits Pydantic's strict checks
+        actual_category = category if category else "commercial"
+        
         # Pydantic validasyonu
-        req = OSMRequest(lat=lat, lon=lon, category=category, radius=radius)
+        req = OSMRequest(lat=lat, lon=lon, category=actual_category, radius=radius)
         
         tag = req.category.strip().lower()
         search_radius = 50000 if "airport" in tag else req.radius

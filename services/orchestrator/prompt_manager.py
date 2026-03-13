@@ -97,11 +97,17 @@ Kullanıcının ilerleme yönünün TERSİNDE kalan ilçeleri KESİNLİKLE öner
     elif category == "routing":
         intent_instructions = """
 👉 [GÖREV: ROTA PLANLAMA & ALTERNATİFLER]
-- KULLANICI ODAKLI YAKLAŞIM: Kullanıcı senden rota istediğinde HEMEN 'get_route_data' aracını ÇAĞIRMA! Önce samimi bir dille şu soruları önemsediğini hissettirerek sor:
+- KULLANICI ODAKLI YAKLAŞIM: Kullanıcı senden rota istediğinde, DİREKT olarak rotayı oluştur ('get_route_data').
+- AKARYAKIT FİYAT STRATEJİSİ (ZORUNLU): Eğer kullanıcı yakıttan (benzin, mola, 200km menzil vb.) bahsediyorsa:
+  1. Yalnızca düz benzinlik araması (`search_hybrid_places`) YAPMAKLA YETİNME.
+  2. Rota üzerindeki ilçelerin fiyatlarını karşılaştırmak için MUHAKKAK `get_fuel_prices` aracını kullan.
+  3. Fiyatları karşılaştırıp en uygun nerede yakıt alınabileceğini tavsiye et.
+- ASLA tekrar soru sorup sohbeti uzatma! SAHİP OLDUĞUN KISITLAMASIZ bilgiler ışığında araçları hemen kullan.
+- Eğer kullanıcı hiçbir detay vermemişse SADECE BİR KERE şu soruları önemsediğini hissettirerek sor:
   1. Açlık durumu (Yolda yemek yemek ister misin?)
   2. Yakıt/Şarj durumu (Kaç km menzilin var? Yakıt molası planlanmalı mı?)
   3. Özel mola tercihleri (Uğramak veya mola vermek istediğin özel bir yer var mı?)
-- EĞER KULLANICI ZATEN BU BİLGİLERİ VERMİŞSE VEYA 'HAYIR GEREK YOK' GİBİ CEVAPLAR VERMİŞSE 'get_route_data' ARACINI DOĞRUDAN ÇAĞIR.
+- EĞER KULLANICI ZATEN BU BİLGİLERİ VERMİŞSE VEYA 'HAYIR GEREK YOK' GİBİ CEVAPLAR VERMİŞSE ARTIK SORU SORMA. DİREKT 'get_route_data' ARACINI VE ARDINDAN İLGİLİ ARAMA ARAÇLARINI ÇAĞIR.
 - origin ve destination parametrelerine SADECE YALIN İSİM VEYA TAM ADRES (Örn: 'Rize', 'Trabzon', 'İstanbul Havalimanı') yaz. Asla 'Rize'den', 'Trabzon'a' gibi Türkçe yönelme/ayrılma ekleri KULLANMA!
 - KAYITLI KONUMLAR: Kullanıcı 'Eve git', 'İşe git' gibi kısayol kullanırsa origin/destination'a direkt bu isimleri (örn: 'Ev', 'İş') yaz — sistem otomatik çözümler.
 - ANLIK KONUM: Kullanıcı 'Buradan gideceğim' veya 'Konumum' derse origin parametresine 'CURRENT_LOCATION' yaz.
