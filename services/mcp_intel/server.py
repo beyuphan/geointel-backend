@@ -14,6 +14,8 @@ from tools.pharmacy import get_pharmacies_handler
 from tools.events import get_events_handler
 from tools.sports import get_matches_handler
 
+from safe_tools import safe_tool
+
 # Yeni Modellerimiz
 from tools.models import IntelResponse, FuelPrice, Pharmacy, Event, Match
 
@@ -64,6 +66,7 @@ def create_response(data_list, model_class) -> str:
 # --- TOOL TANIMLARI (HİBRİT MOD + JSON ÇIKIŞ) ---
 
 @mcp.tool()
+@safe_tool(fallback_message="Nöbetçi eczane bilgisi şu an çekilemiyor.")
 async def get_pharmacies(city: str, district: str = "") -> str:
     """
     Belirtilen şehir ve ilçedeki nöbetçi eczaneleri bulur.
@@ -117,6 +120,7 @@ async def get_pharmacies(city: str, district: str = "") -> str:
     return create_response(live_data, Pharmacy) # Hata mesajını basar
 
 @mcp.tool()
+@safe_tool(fallback_message="Yakıt bilgisi şu an çekilemiyor.")
 async def get_fuel_prices(city: str, district: str) -> str:
     """
     Güncel akaryakıt (Benzin, Motorin, LPG) fiyatlarını getirir.

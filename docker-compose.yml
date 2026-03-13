@@ -1,7 +1,9 @@
 services:
-  # 1. VERİTABANI (POSTGIS)
+  # 1. VERİTABANI (POSTGIS + PGROUTING + PGVECTOR)
   postgres_postgis:
-    image: pgrouting/pgrouting:15-3.5-3.7
+    build:
+      context: ./infra/postgres
+      dockerfile: Dockerfile
     container_name: geo_db
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
@@ -66,6 +68,7 @@ services:
       - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
       - HERE_API_KEY=${HERE_API_KEY}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - PYTHONPATH=/app/orchestrator
     depends_on:
       postgres_postgis:
         condition: service_healthy
@@ -99,8 +102,13 @@ services:
     container_name: geo_mcp_intel
     ports:
       - "8001:8001" # Dışarıdan test etmek istersen diye
+    environment:
+      - PYTHONPATH=/app/orchestrator
     networks:
       - geo_net
+    volumes:
+      - ./services/mcp_intel:/app
+      - ./services/orchestrator:/app/orchestrator
 
 
   # 6. arayüz AJANI

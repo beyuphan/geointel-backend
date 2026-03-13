@@ -3,7 +3,7 @@ import flexpolyline
 
 from datetime import datetime, timezone
 from loguru import logger as log
-from .config import settings
+from .config import settings, http_client
 from .models import RouteRequest
 from .cache import redis_store
 from .local_routing import is_in_service_area, get_local_route
@@ -58,50 +58,48 @@ async def _resolve_coordinates(location: str, session_id: str = "test_pilot") ->
     if settings.GOOGLE_MAPS_API_KEY:
         log.info(f"🌍 [Google] Geocoding yapılıyor: {location}")
         try:
-            async with httpx.AsyncClient() as client:
-                url = "https://maps.googleapis.com/maps/api/geocode/json"
-                params = {
-                    "address": location,
-                    "key": settings.GOOGLE_MAPS_API_KEY,
-                    "language": "tr",
-                    "region": "tr"
-                }
-                resp = await client.get(url, params=params, timeout=10.0)
-                data = resp.json()
-                
-                if data.get("status") == "OK" and data.get("results"):
-                    loc = data["results"][0]["geometry"]["location"]
-                    lat, lon = loc["lat"], loc["lng"]
-                    log.success(f"✅ [Google] Bulundu: {location} -> {lat},{lon}")
-                    return f"{lat},{lon}"
+            url = "https://maps.googleapis.com/maps/api/geocode/json"
+            params = {
+                "address": location,
+                "key": settings.GOOGLE_MAPS_API_KEY,
+                "language": "tr",
+                "region": "tr"
+            }
+            resp = await http_client.get(url, params=params, timeout=10.0)
+            data = resp.json()
+            
+            if data.get("status") == "OK" and data.get("results"):
+                loc = data["results"][0]["geometry"]["location"]
+                lat, lon = loc["lat"], loc["lng"]
+                log.success(f"✅ [Google] Bulundu: {location} -> {lat},{lon}")
+                return f"{lat},{lon}"
         except Exception as e:
             log.error(f"Google Geocoding Hatası: {e}")
 
     # 3. B PLANI: OSM NOMINATIM
     log.info(f"🌍 [OSM] Geocoding deneniyor (Yedek): {location}")
     try:
-        async with httpx.AsyncClient() as client:
-            url = "https://nominatim.openstreetmap.org/search"
-            headers = {"User-Agent": "GeoIntel_City/1.0"}
-            params = {
-                "q": location,
-                "format": "json",
-                "limit": 5,
-                "countrycodes": "tr"
-            }
-            resp = await client.get(url, params=params, headers=headers, timeout=10.0)
-            data = resp.json()
-            if data:
-                # KRİTİK FİLTRE: "Rize" arandığında koskoca il sınırını (Hemşin merkezli) getirmek yerine Şehir/İlçe merkezine öncelik ver.
-                best_match = data[0]
-                for item in data:
-                    if item.get("class") == "place" and item.get("type") in ["city", "town", "village", "municipality"]:
-                        best_match = item
-                        break
-                        
-                lat, lon = best_match["lat"], best_match["lon"]
-                log.success(f"✅ [OSM] Bulundu: {best_match.get('name', location)} -> {lat},{lon}")
-                return f"{lat},{lon}"
+        url = "https://nominatim.openstreetmap.org/search"
+        headers = {"User-Agent": "GeoIntel_City/3.0"}
+        params = {
+            "q": location,
+            "format": "json",
+            "limit": 5,
+            "countrycodes": "tr"
+        }
+        resp = await http_client.get(url, params=params, headers=headers, timeout=10.0)
+        data = resp.json()
+        if data:
+            # KRİTİK FİLTRE: "Rize" arandığında koskoca il sınırını (Hemşin merkezli) getirmek yerine Şehir/İlçe merkezine öncelik ver.
+            best_match = data[0]
+            for item in data:
+                if item.get("class") == "place" and item.get("type") in ["city", "town", "village", "municipality"]:
+                    best_match = item
+                    break
+                    
+            lat, lon = best_match["lat"], best_match["lon"]
+            log.success(f"✅ [OSM] Bulundu: {best_match.get('name', location)} -> {lat},{lon}")
+            return f"{lat},{lon}"
     except Exception as e:
         log.error(f"OSM Geocoding Hatası: {e}")
     
@@ -115,14 +113,13 @@ async def get_location_name(lat, lon):
     try:
         url = "https://maps.googleapis.com/maps/api/geocode/json"
         params = {"latlng": f"{lat},{lon}", "key": settings.GOOGLE_MAPS_API_KEY, "language": "tr"}
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url, params=params, timeout=5.0)
-            data = resp.json()
-            if data.get("results"):
-                for comp in data["results"][0]["address_components"]:
-                    if "administrative_area_level_2" in comp["types"]: 
-                        return comp["long_name"]
-                return data["results"][0]["formatted_address"]
+        resp = await http_client.get(url, params=params, timeout=5.0)
+        data = resp.json()
+        if data.get("results"):
+            for comp in data["results"][0]["address_components"]:
+                if "administrative_area_level_2" in comp["types"]: 
+                    return comp["long_name"]
+            return data["results"][0]["formatted_address"]
     except:
         pass
     return "Bilinmeyen Konum"
@@ -239,62 +236,61 @@ async def get_route_data_handler(origin: str, destination: str, waypoints: list[
         for i, via in enumerate(via_coords):
             params[f"via[{i}]"] = via
 
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(settings.HERE_ROUTING_URL, params=params, timeout=15.0)
-            if resp.status_code != 200:
-                log.error(f"❌ [HERE API ERROR] Durum Kodu: {resp.status_code}")
-                log.error(f"📄 [HERE API RESPONSE] Body: {resp.text}")
-                return {"error": f"HERE API Hatası (HTTP {resp.status_code}): {resp.text[:100]}"}
+        resp = await http_client.get(settings.HERE_ROUTING_URL, params=params, timeout=15.0)
+        if resp.status_code != 200:
+            log.error(f"❌ [HERE API ERROR] Durum Kodu: {resp.status_code}")
+            log.error(f"📄 [HERE API RESPONSE] Body: {resp.text}")
+            return {"error": f"HERE API Hatası (HTTP {resp.status_code}): {resp.text[:100]}"}
 
-            data = resp.json()
+        data = resp.json()
+        
+        if data.get("routes"):
+            all_routes = []
+            primary_encoded_polyline = None
             
-            if data.get("routes"):
-                all_routes = []
-                primary_encoded_polyline = None
+            for idx, route_data in enumerate(data["routes"]):
+                if not route_data.get("sections"):
+                     continue
                 
-                for idx, route_data in enumerate(data["routes"]):
-                    if not route_data.get("sections"):
-                         continue
-                    
-                    section = route_data["sections"][0]
-                    summary = section["summary"]
-                    encoded_polyline = section["polyline"]
-                    
-                    if idx == 0:
-                        primary_encoded_polyline = encoded_polyline
-                        # Redis Cache (sadece ana rotayı önbellekle)
-                        try:
-                            redis_store.set_route(primary_encoded_polyline)
-                        except: pass
-                    
-                    route_info = {
-                        "isim": f"Rota {idx + 1}" if idx > 0 else "Ana Rota",
-                        "mesafe_km": round(summary["length"] / 1000, 2),
-                        "sure_dk": round(summary["duration"] / 60, 0),
-                        "polyline_encoded": encoded_polyline
-                    }
-                    all_routes.append(route_info)
-
-                if not all_routes:
-                     return {"error": "Rota bulunamadı (HERE API)"}
-                     
-                # Geriye uyumluluk için ilk rotayı ana alanlara taşı, alternatifleri içine sakla
-                primary_route = all_routes[0]
+                section = route_data["sections"][0]
+                summary = section["summary"]
+                encoded_polyline = section["polyline"]
                 
-                return {
-                    "source": "HERE_Maps_API",
-                    "mesafe_km": primary_route["mesafe_km"],
-                    "sure_dk": primary_route["sure_dk"],
-                    "polyline_encoded": primary_route["polyline_encoded"], 
-                    "alternatif_rotalar": all_routes,
-                    "geometry": None, 
-                    "analiz_noktalari": {
-                        "baslangic": {"coords": [lat1, lon1], "ad": origin},
-                        "bitis": {"coords": [lat2, lon2], "ad": destination}
-                    }
+                if idx == 0:
+                    primary_encoded_polyline = encoded_polyline
+                    # Redis Cache (sadece ana rotayı önbellekle)
+                    try:
+                        redis_store.set_route(primary_encoded_polyline)
+                    except: pass
+                
+                route_info = {
+                    "isim": f"Rota {idx + 1}" if idx > 0 else "Ana Rota",
+                    "mesafe_km": round(summary["length"] / 1000, 2),
+                    "sure_dk": round(summary["duration"] / 60, 0),
+                    "polyline_encoded": encoded_polyline
                 }
+                all_routes.append(route_info)
+
+            if not all_routes:
+                 return {"error": "Rota bulunamadı (HERE API)"}
+                 
+            # Geriye uyumluluk için ilk rotayı ana alanlara taşı, alternatifleri içine sakla
+            primary_route = all_routes[0]
             
-            return {"error": "Rota bulunamadı (HERE API)"}
+            return {
+                "source": "HERE_Maps_API",
+                "mesafe_km": primary_route["mesafe_km"],
+                "sure_dk": primary_route["sure_dk"],
+                "polyline_encoded": primary_route["polyline_encoded"], 
+                "alternatif_rotalar": all_routes,
+                "geometry": None, 
+                "analiz_noktalari": {
+                    "baslangic": {"coords": [lat1, lon1], "ad": origin},
+                    "bitis": {"coords": [lat2, lon2], "ad": destination}
+                }
+            }
+        
+        return {"error": "Rota bulunamadı (HERE API)"}
 
     except Exception as e:
         log.error(f"Genel Rota Hatası: {e}")

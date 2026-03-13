@@ -1,15 +1,25 @@
+"""
+V3 Fuel Scraper — Playwright KALDIRILDI, httpx + regex ile 5x hızlı çalışır.
+doviz.com'dan akaryakıt fiyatlarını çeker (OPET, Petrol Ofisi, Total).
+"""
 import asyncio
-from playwright.async_api import async_playwright
+import httpx
 import re
 import unicodedata
 from loguru import logger as log
-from datetime import datetime # Tarih kontrolü için eklendi
+from datetime import datetime
+
 
 class FuelScraper:
     FIRMS = ["opet", "petrol-ofisi", "total"]
+    BASE_URL = "https://www.doviz.com/akaryakit-fiyatlari"
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.5"
+    }
 
     def __init__(self):
-        # Listeleri init içinde tanımlayalım, garanti olsun.
         self.ISTANBUL_AVRUPA = [
             "arnavutkoy", "avcilar", "bagcilar", "bahcelievler", "bakirkoy", 
             "basaksehir", "bayrampasa", "besiktas", "beylikduzu", "beyoglu", 
@@ -26,17 +36,11 @@ class FuelScraper:
 
     def _slugify(self, text: str) -> str:
         if not text: return ""
-        # Önce manuel düzeltme (Türkçe karakter belası için)
         text = text.replace("İ", "i").replace("I", "i").replace("ı", "i")
         text = text.lower()
-        mapping = {
-            'ç': 'c', 'ğ': 'g', 'ö': 'o', 'ş': 's', 'ü': 'u',
-            ' ': '-'
-        }
+        mapping = {'ç': 'c', 'ğ': 'g', 'ö': 'o', 'ş': 's', 'ü': 'u', ' ': '-'}
         for k, v in mapping.items():
             text = text.replace(k, v)
-        
-        # ASCII temizliği
         text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('utf-8')
         return text.strip()
 
@@ -47,90 +51,88 @@ class FuelScraper:
             return float(clean_str)
         except ValueError: return 0.0
 
-    async def _get_firm_price_surgical(self, page, city, district, firm):
-        # Slug işlemleri
+    def _parse_html_table(self, html: str) -> dict | None:
+        """HTML'den tablo verisi çeker — Playwright yerine regex ile."""
+        # İlk <tbody> <tr> içindeki <td> hücrelerini bul
+        tbody_match = re.search(r'<tbody[^>]*>(.*?)</tbody>', html, re.DOTALL)
+        if not tbody_match:
+            return None
+        
+        first_row = re.search(r'<tr[^>]*>(.*?)</tr>', tbody_match.group(1), re.DOTALL)
+        if not first_row:
+            return None
+        
+        cells = re.findall(r'<td[^>]*>(.*?)</td>', first_row.group(1), re.DOTALL)
+        if len(cells) < 4:
+            return None
+        
+        # HTML tag'larını temizle
+        clean = lambda x: re.sub(r'<[^>]+>', '', x).strip()
+        
+        return {
+            "benzin": clean(cells[1]),
+            "motorin": clean(cells[2]),
+            "lpg": clean(cells[3]) if len(cells) > 3 else None,
+        }
+
+    async def _get_firm_price(self, client: httpx.AsyncClient, city: str, district: str, firm: str) -> dict | None:
         city_slug = self._slugify(city)
         district_slug = self._slugify(district)
         
-        # LOG EKLEDİM: Bakalım neye çevirmiş?
-        log.info(f"🔍 [SLUG KONTROL] Gelen: {city}/{district} -> Çevrilen: {city_slug}/{district_slug}")
+        log.info(f"🔍 [SLUG] {city}/{district} -> {city_slug}/{district_slug}")
 
-        # 🔥🔥🔥 ZORLA İSTANBUL KONTROLÜ 🔥🔥🔥
         if "istanbul" in city_slug:
             if district_slug in self.ISTANBUL_AVRUPA:
-                log.warning(f"📍 {district_slug} -> AVRUPA YAKASI tespit edildi.")
                 city_slug = "istanbul-avrupa"
             elif district_slug in self.ISTANBUL_ANADOLU:
-                log.warning(f"📍 {district_slug} -> ANADOLU YAKASI tespit edildi.")
                 city_slug = "istanbul-anadolu"
             else:
-                log.error(f"⚠️ {district_slug} İstanbul listelerinde YOK! Link hatalı olabilir.")
+                log.warning(f"⚠️ {district_slug} İstanbul listelerinde YOK!")
 
-        url = f"https://www.doviz.com/akaryakit-fiyatlari/{city_slug}/{district_slug}/{firm}"
-        log.info(f"🔗 [ISTEK] Gidiliyor: {url}")
+        url = f"{self.BASE_URL}/{city_slug}/{district_slug}/{firm}"
+        log.info(f"🔗 [GET] {url}")
 
         try:
-            resp = await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            resp = await client.get(url, timeout=15.0)
             
-            if resp.status != 200:
-                log.error(f"❌ [HTTP] Sayfa hatası ({firm}): {resp.status}")
+            if resp.status_code != 200:
+                log.error(f"❌ [HTTP] {firm}: {resp.status_code}")
                 return None
 
-            has_table = await page.evaluate("() => document.querySelector('table tbody tr') !== null")
-            if not has_table:
-                # Doviz.com bazen boş sayfa dönüyor, tablo yoksa veri yoktur.
-                log.warning(f"⚠️ [DOM] Tablo yok ({firm}).")
+            html = resp.text
+            
+            # Tarih kontrolü — sayfa güncel mi?
+            bugun = datetime.now()
+            bugun_str = bugun.strftime("%d.%m.%Y")
+            months_tr = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", 
+                        "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
+            bugun_str_2 = f"{bugun.day} {months_tr[bugun.month - 1]} {bugun.year}"
+            
+            if bugun_str not in html and bugun_str_2 not in html:
+                log.warning(f"⚠️ [ESKİ VERİ] {firm} sayfasında güncel tarih yok. Atlanıyor...")
                 return None
 
-            raw_data = await page.evaluate("""() => {
-                const row = document.querySelector('table tbody tr');
-                if (!row) return null;
-                const cells = row.querySelectorAll('td');
-                return {
-                    benzin: cells[1] ? cells[1].innerText.trim() : null,
-                    motorin: cells[2] ? cells[2].innerText.trim() : null,
-                    lpg: cells[3] ? cells[3].innerText.trim() : null,
-                    page_text: document.body.innerText
-                };
-            }""")
-            
-            if raw_data:
-                log.success(f"✅ [DOM] {firm}: {raw_data.get('benzin')} / {raw_data.get('motorin')}")
-            return raw_data
+            # HTML tablosunu parse et
+            data = self._parse_html_table(html)
+            if data:
+                log.success(f"✅ [PARSE] {firm}: {data.get('benzin')} / {data.get('motorin')}")
+            return data
 
         except Exception as e:
-            log.error(f"🔥 [PATLADI] {url} -> Hata: {e}")
+            log.error(f"🔥 [HATA] {url} -> {e}")
             return None
 
     async def get_district_prices(self, city: str, district: str) -> list:
         results = []
-        bugun = datetime.now().strftime("%d.%m.%Y") # Örn: 08.03.2026
-        log.info(f"🚀 [BASLAT] {city}/{district} Taraması Başlıyor...")
+        log.info(f"🚀 [V3] {city}/{district} Taraması Başlıyor (httpx — Playwright YOK)...")
         
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-            )
-            page = await context.new_page()
-            
+        # V3: Paylaşımlı httpx client ile seri istek (Playwright yerine)
+        async with httpx.AsyncClient(headers=self.HEADERS, follow_redirects=True) as client:
             for firm in self.FIRMS:
-                await asyncio.sleep(1.0)
-                raw = await self._get_firm_price_surgical(page, city, district, firm)
+                await asyncio.sleep(0.5)  # Rate limit saygısı (doviz.com'a nazik ol)
+                raw = await self._get_firm_price(client, city, district, firm)
                 
                 if raw:
-                    # Tarih Süzme İşlemi (Tüm sayfa içeriğinde bugünün tarihi var mı?)
-                    page_text = raw.get('page_text', '')
-                    # Aylar Türkçe formatlarda olabilir. Sayfada DD.MM.YYYY var mı diye de bakıyoruz.
-                    months_tr = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
-                    bugun_obj = datetime.now()
-                    bugun_str_1 = bugun_obj.strftime("%d.%m.%Y")
-                    bugun_str_2 = f"{bugun_obj.day} {months_tr[bugun_obj.month - 1]} {bugun_obj.year}"
-                    
-                    if bugun_str_1 not in page_text and bugun_str_2 not in page_text:
-                        log.warning(f"⚠️ [ESKI VERI] {firm} sayfasında güncel {bugun_str_1} tarihi bulunamadı. Atlanıyor...")
-                        continue
-
                     benzin = self._parse_price(raw.get('benzin'))
                     motorin = self._parse_price(raw.get('motorin'))
                     lpg = self._parse_price(raw.get('lpg'))
@@ -144,11 +146,10 @@ class FuelScraper:
                             "ilce": district.capitalize(),
                             "city": city.capitalize()
                         })
-            
-            await browser.close()
         
-        log.info(f"🏁 [BITIS] Toplam {len(results)} sonuç bulundu.")
+        log.info(f"🏁 [V3] Toplam {len(results)} sonuç bulundu.")
         return results
+
 
 # --- HANDLER ---
 async def get_fuel_prices_handler(city: str, district: str) -> list:

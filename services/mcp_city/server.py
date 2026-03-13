@@ -20,6 +20,7 @@ from tools.cache import redis_store
 from tools.route_summary import build_route_summary_handler
 from tools.ev_charging import get_ev_charging_handler
 from tools.traffic import get_route_traffic_handler
+from safe_tools import safe_tool
 
 # --- MCP SUNUCU KURULUMU ---
 # v2.0: Veri bütünlüğü ve koordinat güvenliği odaklı mimari
@@ -32,6 +33,7 @@ def handle_critical_error(e: Exception, tool_name: str) -> str:
 
 # --- 1. OSM ALTYAPI ARAMA ---
 @mcp.tool()
+@safe_tool(fallback_message="OSM araması şu an yapılamıyor.")
 async def search_infrastructure_osm(lat: float, lon: float, category: str, radius: int = 2000) -> str:
     """
     OSM ALTYAPI ARAMA: Belirtilen konumun çevresindeki kamusal (ticari olmayan) alanları bulur.
@@ -74,14 +76,13 @@ async def search_infrastructure_osm(lat: float, lon: float, category: str, radiu
     except Exception as e:
         return handle_critical_error(e, "search_infrastructure_osm")
 
-# --- 2. GOOGLE TİCARİ ARAMA (ROTA FİLTRELİ) ---
+# --- 2. GOOGLE PLACES ROTA/KONUM ARAMA ---
 @mcp.tool()
-async def search_places_google(query: str, lat: Optional[float] = None, lon: Optional[float] = None, route_polyline: Optional[str] = None) -> str:
+@safe_tool(fallback_message="Google Maps araması şu an yapılamıyor.")
+async def search_places_google(query: str, lat: float = 0.0, lon: float = 0.0, route_polyline: str = None) -> str:
     """
-    GOOGLE MEKAN ARAMA: Restoran, Benzinlik, Tamirci, Kafe gibi ticari yerleri arar.
-    
-    Eğer kullanıcı bir rota üzerindeyse 'route_polyline' parametresi mutlaka dolu gelmelidir.
-    Bu sayede yol üstü (strict) ve yakın çevre (relaxed) sonuçları döner.
+    ⚠️ DEPRECATED — BU ARACI DOĞRUDAN ÇAĞIRMA! Bunun yerine 'search_hybrid_places' kullan.
+    Bu araç sadece dahili sistemler (macro-tools) tarafından kullanılır.
     """
     try:
         logger.info(f"🛠️ [Tool: Google] Sorgu: '{query}' (Rota: {'Aktif' if route_polyline else 'Pasif'})")
@@ -128,8 +129,9 @@ async def search_places_google(query: str, lat: Optional[float] = None, lon: Opt
     except Exception as e:
         return handle_critical_error(e, "search_places_google")
 
-# --- 3. AKILLI ROTA HESAPLAMA (HİBRİT) ---
+# --- 3. HERE ROTA OLUŞTURMA ---
 @mcp.tool()
+@safe_tool(fallback_message="HERE Maps rota oluşturamadı.")
 async def get_route_data(origin: str, destination: str) -> str:
     """
     AKILLI ROTA MOTORU: İki nokta arasındaki trafik durumunu, süreyi ve mesafeyi hesaplar.
@@ -165,8 +167,9 @@ async def get_route_data(origin: str, destination: str) -> str:
     except Exception as e:
         return handle_critical_error(e, "get_route_data")
 
-# --- 4. HAVA DURUMU ---
+# --- 4. HAVA DURUMU (KONUM BAZLI) ---
 @mcp.tool()
+@safe_tool(fallback_message="Anlık hava durumu çekilemiyor.")
 async def get_weather(lat: float, lon: float) -> str:
     """Belirtilen koordinat için anlık ve saatlik hava durumu raporu sunar."""
     try:
@@ -191,8 +194,9 @@ async def get_weather(lat: float, lon: float) -> str:
     except Exception as e:
         return handle_critical_error(e, "get_weather")
 
-# --- 5. ROTA HAVA DURUMU ANALİZİ (WEATHER SHIELD) ---
+# --- 5. ROTA HAVA DURUMU (WHEATHER SHIELD) ---
 @mcp.tool()
+@safe_tool(fallback_message="Rota kalkanı (hava durumu analizi) yapılamadı.")
 async def analyze_route_weather(polyline: str) -> str:
     """
     WEATHER SHIELD: Rota boyunca (40km'lik dilimlerle) hava durumu risklerini (yağmur, kar, buzlanma) analiz eder.
@@ -372,6 +376,7 @@ async def get_route_radars(route_polyline: str) -> str:
 
 # --- 12. ROTA GEÇİŞ ÜCRETLERİ (GERÇEK ZAMANLI - HERE MAPS) ---
 @mcp.tool()
+@safe_tool(fallback_message="Geçiş ücretleri sorgulanamadı.")
 async def get_toll_for_route(route_polyline: str) -> str:
     """
     GERÇEK ZAMANLI GEÇİŞ ÜCRETİ (HERE Maps Routing API): Rota üzerindeki köprü, tünel ve
@@ -389,6 +394,7 @@ async def get_toll_for_route(route_polyline: str) -> str:
         return handle_critical_error(e, "get_toll_for_route")
 
 @mcp.tool()
+@safe_tool(fallback_message="Hibrit mekan arama başarısız oldu.")
 async def search_hybrid_places(query: str, location_name: Optional[str] = None, lat: Optional[float] = None, lon: Optional[float] = None, category: Optional[str] = "commercial", route_polyline: Optional[str] = None) -> str:
     """
     HİBRİT MEKAN ARAMA (Google + OSM Füzyonu): Kullanıcının aradığı mekanları bulur ve fiziksel doğruluğunu artırır.

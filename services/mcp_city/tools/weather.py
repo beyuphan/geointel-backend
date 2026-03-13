@@ -1,7 +1,7 @@
 import httpx
 import asyncio
 from datetime import datetime, timezone, timedelta
-from .config import settings
+from .config import settings, http_client
 from logger import log
 from .geometry import sample_route_points 
 
@@ -37,10 +37,9 @@ async def analyze_route_weather_handler(polyline: str) -> dict:
     risks = []
     summary = []
     
-    # 2. Paralel İstek At (Batch Request)
-    async with httpx.AsyncClient() as client:
-        tasks = [get_weather_simple(client, p["lat"], p["lon"]) for p in checkpoints]
-        results = await asyncio.gather(*tasks)
+    # 2. Paralel İstek At (Batch Request — V3: shared http_client)
+    tasks = [get_weather_simple(http_client, p["lat"], p["lon"]) for p in checkpoints]
+    results = await asyncio.gather(*tasks)
 
     # 3. Analiz ve Süzgeç
     for point, weather_data in zip(checkpoints, results):

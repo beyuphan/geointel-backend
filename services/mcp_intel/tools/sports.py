@@ -1,5 +1,5 @@
-import asyncio
-from playwright.async_api import async_playwright
+import httpx
+from selectolax.lexbor import LexborHTMLParser
 from datetime import datetime, timedelta
 from loguru import logger as log
 
@@ -11,81 +11,73 @@ class SportsScraper:
             "https://www.tff.org/default.aspx?pageID=142"
         ]
         self.base_url = "https://www.tff.org/"
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        }
 
     async def get_matches(self):
         log.info("⚽ [SPOR-INTEL] TFF Ligleri Taranıyor...")
         all_matches = []
         
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-            context = await browser.new_context(user_agent="Mozilla/5.0...")
-            
-            # Sadece Bugün ve Yarının maçlarını alıyoruz (Trafik etkisi için)
-            today = datetime.now().date()
-            tomorrow = today + timedelta(days=1)
+        today = datetime.now().date()
+        tomorrow = today + timedelta(days=1)
 
-            for url in self.urls:
-                page = await context.new_page()
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            async with httpx.AsyncClient(headers=self.headers, follow_redirects=True, timeout=20.0) as client:
+                for lig_url in self.urls:
+                    resp = await client.get(lig_url)
+                    if resp.status_code != 200: continue
                     
+                    parser = LexborHTMLParser(resp.text)
                     # Haftanın maçları tablosundaki detay linklerini topla
-                    target_links = await page.evaluate("""() => {
-                        const links = [];
-                        const table = document.querySelector("table[id$='dtlHaftaninMaclari']");
-                        if (table) {
-                            const anchors = table.querySelectorAll("a[href*='macId=']");
-                            anchors.forEach(a => {
-                                if (!links.includes(a.href)) links.push(a.href);
-                            });
-                        }
-                        return links;
-                    }""")
+                    # table[id$='dtlHaftaninMaclari'] table[id$='dtlHaftaninMaclari']
+                    # Sitede ID'ler dinamik olabiliyor, a[href*='macId='] güvenli
+                    links = []
+                    for a in parser.css("a[href*='macId=']"):
+                        href = a.attributes.get('href')
+                        if href:
+                            if not href.startswith("http"): href = self.base_url + href
+                            if href not in links: links.append(href)
                     
-                    # Her maça girip detay bak (Stadyum ve Şehir bilgisi detayda gizli)
-                    for link in target_links:
+                    # Her maça girip detay bak
+                    for link in links:
                         try:
-                            if not link.startswith("http"): link = self.base_url + link
+                            m_resp = await client.get(link)
+                            if m_resp.status_code != 200: continue
                             
-                            # Yeni sekme açmadan aynı page üzerinde gidebiliriz, daha hızlı olur
-                            await page.goto(link, wait_until="domcontentloaded", timeout=15000)
+                            m_parser = LexborHTMLParser(m_resp.text)
                             
-                            match_data = await page.evaluate("""() => {
-                                try {
-                                    const stadEl = document.querySelector('a[id*="lnkStad"]');
-                                    const dateEl = document.querySelector('span[id*="lblTarih"]');
-                                    const homeEl = document.querySelector('a[id*="lnkTakim1"]');
-                                    const awayEl = document.querySelector('a[id*="lnkTakim2"]');
-                                    
-                                    return {
-                                        stadium: stadEl ? stadEl.innerText.trim() : "Bilinmiyor",
-                                        date_str: dateEl ? dateEl.innerText.trim() : "",
-                                        home: homeEl ? homeEl.innerText.trim() : "Ev Sahibi",
-                                        away: awayEl ? awayEl.innerText.trim() : "Deplasman"
-                                    };
-                                } catch(e) { return null; }
-                            }""")
+                            stad_el = m_parser.css_first('a[id*="lnkStad"]')
+                            date_el = m_parser.css_first('span[id*="lblTarih"]')
+                            home_el = m_parser.css_first('a[id*="lnkTakim1"]')
+                            away_el = m_parser.css_first('a[id*="lnkTakim2"]')
+                            
+                            stadium = stad_el.text(strip=True) if stad_el else "Bilinmiyor"
+                            date_str = date_el.text(strip=True) if date_el else ""
+                            home = home_el.text(strip=True) if home_el else "Ev Sahibi"
+                            away = away_el.text(strip=True) if away_el else "Deplasman"
 
-                            if not match_data or not match_data['date_str']: continue
+                            if not date_str: continue
 
                             # Tarih Parse (Format: 30.01.2026 - 20:00)
-                            dt_str = match_data['date_str'].replace(" - ", " ")
-                            match_dt = datetime.strptime(dt_str, "%d.%m.%Y %H:%M")
+                            dt_str = date_str.replace(" - ", " ")
+                            try:
+                                match_dt = datetime.strptime(dt_str, "%d.%m.%Y %H:%M")
+                            except: continue
                             
                             # Zaman Filtresi
                             if match_dt.date() not in [today, tomorrow]:
                                 continue
                             
-                            # Şehir Ayıklama ("Ali Sami Yen - İstanbul" -> "İstanbul")
-                            full_stadium_txt = match_data['stadium']
+                            # Şehir Ayıklama
                             city_name = "Bilinmiyor"
-                            if " - " in full_stadium_txt:
-                                city_name = full_stadium_txt.split(" - ")[-1].strip()
+                            if " - " in stadium:
+                                city_name = stadium.split(" - ")[-1].strip()
                                 
                             item = {
-                                "match": f"{match_data['home']} vs {match_data['away']}",
+                                "match": f"{home} vs {away}",
                                 "time": dt_str,
-                                "stadium": full_stadium_txt,
+                                "stadium": stadium,
                                 "city": city_name,
                                 "warning": "Maç saatinde stadyum çevresinde trafik yoğun olabilir."
                             }
@@ -96,12 +88,8 @@ class SportsScraper:
                             log.warning(f"Maç Detay Hatası: {e}")
                             continue
 
-                except Exception as e:
-                    log.error(f"Lig Sayfası Hatası: {e}")
-                finally:
-                    await page.close()
-            
-            await browser.close()
+        except Exception as e:
+            log.error(f"Lig Sayfası Hatası: {e}")
             
         return all_matches
 
