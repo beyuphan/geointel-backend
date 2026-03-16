@@ -1,134 +1,152 @@
 import asyncio
-import httpx
-from selectolax.lexbor import LexborHTMLParser
-from thefuzz import fuzz
+from playwright.async_api import async_playwright
 import re
+import unicodedata
 from loguru import logger as log
+from thefuzz import fuzz
 
 class EventScraper:
     def __init__(self):
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         }
+        self.sources = {
+            "biletinial": "https://biletinial.com/tr-tr/etkinlikler/{}",
+            "bubilet": "https://www.bubilet.com.tr/{}/etkinlikler"
+        }
 
-    def _normalize(self, text):
+    def _normalize(self, text: str) -> str:
         """Fuzzy match için metni temizler"""
         if not text: return ""
         text = text.lower().replace('İ', 'i').replace('ı', 'i').replace('ğ', 'g').replace('ü', 'u').replace('ş', 's').replace('ö', 'o').replace('ç', 'c')
         return re.sub(r'[^a-z0-9]', '', text)
 
-    async def _get_biletinial(self, client, city):
-        log.info(f"🎫 [Biletinial] {city.upper()} taranıyor...")
-        url = f"https://biletinial.com/tr-tr/sehrineozel/{city}"
-        
-        try:
-            resp = await client.get(url)
-            if resp.status_code != 200: return []
-            
-            parser = LexborHTMLParser(resp.text)
-            results = []
-            
-            for li in parser.css('.sehir-detay__liste li'):
-                title_el = li.css_first('h2 a')
-                link_el = li.css_first('a.etlinlikLink')
-                date_el = li.css_first('.sehir-detay__liste-mobiltarih') or li.css_first('.sehir-detay__liste-tarih')
-                
-                if title_el and link_el:
-                    title = title_el.text(strip=True)
-                    link = link_el.attributes.get('href', '')
-                    if link and not link.startswith('http'): link = "https://biletinial.com" + link
-                    
-                    results.append({
-                        "title": title,
-                        "link": link,
-                        "date": date_el.text(strip=True).replace('\n', ' ') if date_el else "Tarih Yok", 
-                        "venue": "Biletinial",
-                        "price": "Detayda",
-                        "source": "biletinial"
-                    })
-            return results
+    def _slugify(self, text: str) -> str:
+        """Metni URL dostu hale getirir"""
+        if not text: return ""
+        text = self._normalize(text)
+        text = re.sub(r'[^a-z0-9\s-]', '', text).strip()
+        text = re.sub(r'[\s_-]+', '-', text)
+        return text
 
-        except Exception as e:
-            log.warning(f"❌ Biletinial Hatası: {e}")
-            return []
-
-    async def _get_bubilet(self, client, city):
-        log.info(f"🎫 [Bubilet] {city.upper()} taranıyor...")
-        url = f"https://www.bubilet.com.tr/{city}"
-        
-        try:
-            resp = await client.get(url)
-            if resp.status_code != 200: return []
-            
-            parser = LexborHTMLParser(resp.text)
-            results = []
-            
-            # Bubilet link.group.block kullanıyor
-            for link_el in parser.css('a.group.block'):
-                title_el = link_el.css_first('h3')
-                venue_el = link_el.css_first('p span.truncate')
-                date_elements = link_el.css('p.text-xs.text-gray-500')
-                price_el = link_el.css_first('div.flex.items-start.gap-2')
-
-                if title_el:
-                    title = title_el.text(strip=True)
-                    venue = venue_el.text(strip=True) if venue_el else "Bilinmiyor"
-                    date = date_elements[-1].text(strip=True) if date_elements else "Belirsiz"
-                    price = price_el.text(strip=True) if price_el else "Belirsiz"
-                    link = link_el.attributes.get('href', '')
-                    if link and not link.startswith('http'): link = "https://www.bubilet.com.tr" + link
-
-                    results.append({ 
-                        "title": title, 
-                        "venue": venue, 
-                        "date": date, 
-                        "price": price, 
-                        "link": link, 
-                        "source": "bubilet" 
-                    })
-            return results
-
-        except Exception as e:
-            log.warning(f"❌ Bubilet Hatası: {e}")
-            return []
-
-    async def get_city_events(self, city):
+    async def get_city_events(self, city: str) -> list:
         merged_results = []
+        biletinial_events = []
+        bubilet_events = []
         
         try:
-            async with httpx.AsyncClient(headers=self.headers, follow_redirects=True, timeout=15.0) as client:
-                # Paralel çekim yapalım
-                t1 = self._get_biletinial(client, city)
-                t2 = self._get_bubilet(client, city)
-                list_biletinial, list_bubilet = await asyncio.gather(t1, t2)
-            
-            log.info(f"📊 Ham Veri: Biletinial({len(list_biletinial)}) - Bubilet({len(list_bubilet)})")
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+                context = await browser.new_context(user_agent=self.headers["User-Agent"])
+                
+                # --- Biletinial ---
+                page_b = await context.new_page()
+                try:
+                    url_b = self.sources["biletinial"].format(self._slugify(city))
+                    log.info(f"🎭 [Biletinial] {url_b}")
+                    await page_b.goto(url_b, wait_until="domcontentloaded", timeout=30000)
+                    
+                    # Sayfanın yüklenmesini bekle ve biraz kaydır (Lazy load)
+                    try:
+                        await page_b.wait_for_selector('.event-item', timeout=5000)
+                    except:
+                        # Bazı şehirlerde farklı class olabiliyor
+                        await page_b.wait_for_selector('.sehir-detay__liste li', timeout=5000)
 
-            # --- BASİT FÜZYON (Merge) ---
-            fused_list = []
+                    await page_b.evaluate("window.scrollBy(0, 1000)")
+                    await asyncio.sleep(1)
+
+                    biletinial_events = await page_b.evaluate("""() => {
+                        const results = [];
+                        // Biletinial'da birden fazla layout var, ikisini de kontrol et
+                        let items = document.querySelectorAll('.event-item');
+                        if (items.length === 0) items = document.querySelectorAll('.sehir-detay__liste li');
+                        
+                        items.forEach(el => {
+                            const name = (el.querySelector('.event-title') || el.querySelector('h2 a'))?.innerText.trim();
+                            const venue = (el.querySelector('.event-venue') || el.querySelector('.sehir-detay__liste-mekan'))?.innerText.trim();
+                            const date = (el.querySelector('.event-date') || el.querySelector('.sehir-detay__liste-tarih'))?.innerText.trim();
+                            const img = el.querySelector('img')?.src;
+                            const link = el.querySelector('a')?.href;
+                            
+                            if (name) {
+                                results.push({
+                                    title: name,
+                                    venue: venue || "Bilinmiyor",
+                                    date: date || "Belirtilmemiş",
+                                    image: img,
+                                    link: link,
+                                    source: "biletinial"
+                                });
+                            }
+                        });
+                        return results;
+                    }""")
+                except Exception as e:
+                    log.warning(f"❌ Biletinial Hatası: {e}")
+                finally:
+                    await page_b.close()
+
+                # --- Bubilet ---
+                page_bu = await context.new_page()
+                try:
+                    url_bu = self.sources["bubilet"].format(self._slugify(city))
+                    log.info(f"🎭 [Bubilet] {url_bu}")
+                    await page_bu.goto(url_bu, wait_until="domcontentloaded", timeout=30000)
+                    
+                    await page_bu.wait_for_selector('.event-card, a.group.block', timeout=5000)
+                    await page_bu.evaluate("window.scrollBy(0, 1000)")
+                    await asyncio.sleep(1)
+                    
+                    bubilet_events = await page_bu.evaluate("""() => {
+                        const results = [];
+                        document.querySelectorAll('.event-card, a.group.block').forEach(el => {
+                            const name = (el.querySelector('.title') || el.querySelector('h3'))?.innerText.trim();
+                            const venue = (el.querySelector('.venue') || el.querySelector('p span.truncate'))?.innerText.trim();
+                            const date_els = el.querySelectorAll('p.text-xs.text-gray-500');
+                            const date = date_els.length > 0 ? date_els[date_els.length -1].innerText.trim() : (el.querySelector('.date')?.innerText.trim() || "Belirtilmemiş");
+                            const link = el.href || el.querySelector('a')?.href;
+                            
+                            if (name) {
+                                results.push({
+                                    title: name,
+                                    venue: venue || "Bilinmiyor",
+                                    date: date,
+                                    link: link,
+                                    source: "bubilet"
+                                });
+                            }
+                        });
+                        return results;
+                    }""")
+                except Exception as e:
+                    log.warning(f"❌ Bubilet Hatası: {e}")
+                finally:
+                    await page_bu.close()
+
+                await browser.close()
             
-            # 1. Bubilet'i ana liste yap
-            for ev in list_bubilet:
+            log.info(f"📊 Ham Veri: Biletinial({len(biletinial_events)}) - Bubilet({len(bubilet_events)})")
+
+            # --- Merge Logic (Restored) ---
+            fused_list = []
+            for ev in bubilet_events:
                 ev['normalized'] = self._normalize(ev['title'])
                 fused_list.append(ev)
 
-            # 2. Biletinial verisini kontrol et, yoksa ekle
-            for b_ev in list_biletinial:
+            for b_ev in biletinial_events:
                 b_norm = self._normalize(b_ev['title'])
                 match_found = False
-                
                 for f_ev in fused_list:
-                    ratio = fuzz.ratio(b_norm, f_ev['normalized'])
-                    if ratio > 85:
+                    if fuzz.ratio(b_norm, f_ev['normalized']) > 85:
                         f_ev['source'] += ", biletinial"
                         match_found = True
                         break
-                
                 if not match_found:
                     b_ev['normalized'] = b_norm
                     fused_list.append(b_ev)
-            
-            # 'normalized' anahtarını temizle
+
+            # Cleanup
             for ev in fused_list:
                 if 'normalized' in ev: del ev['normalized']
             

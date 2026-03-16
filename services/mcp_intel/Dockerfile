@@ -1,5 +1,5 @@
-# Hafif Python imajı kullanıyoruz (Playwright bağımlılığı kaldırıldı)
-FROM python:3.11-slim
+# Playwright için tam bağımlılıklı Python imajı
+FROM mcr.microsoft.com/playwright/python:v1.41.0-jammy
 
 WORKDIR /app
 
@@ -11,6 +11,9 @@ RUN apt-get update && apt-get install -y \
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Chromium Browser'ı yükle
+RUN playwright install chromium
 
 COPY . .
 

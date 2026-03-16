@@ -10,3 +10,5 @@ tzdata>=2023.3
 sqlmodel>=0.0.16
 pgvector>=0.2.5
 selectolax>=0.3.0
+playwright>=1.41.0
+thefuzz>=0.20.0

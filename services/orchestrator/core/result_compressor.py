@@ -10,17 +10,17 @@ from typing import Any
 # Her araç için maksimum sonuç sayısı ve korunacak alanlar
 COMPRESSION_RULES = {
     "get_route_data": {
-        "keep_fields": ["mesafe_km", "sure_dk", "origin", "destination", "traffic_summary"],
+        "keep_fields": ["mesafe_km", "sure_dk", "origin", "destination", "traffic_summary", "route_warnings", "summary"],
         "max_alternatives": 3,
         "strip_fields": ["polyline", "polyline_encoded", "coordinates", "legs", "maneuvers"]
     },
     "search_places_google": {
-        "max_results": 5,
-        "keep_place_fields": ["name", "address", "rating", "coords", "open_now", "eta_from_route_min"]
+        "max_results": 8,
+        "keep_place_fields": ["name", "address", "rating", "types", "description", "coords", "open_now", "eta_from_route_min", "user_ratings_total"]
     },
     "search_hybrid_places": {
-        "max_results": 5,
-        "keep_place_fields": ["name", "address", "rating", "lat", "lon", "fusion_status", "is_open"]
+        "max_results": 8,
+        "keep_place_fields": ["name", "address", "rating", "types", "description", "lat", "lon", "fusion_status", "is_open", "user_ratings_total"]
     },
     "get_fuel_prices": {
         "max_results": 8,

@@ -7,10 +7,39 @@ from core.mcp_client import orchestrator
 from core.result_compressor import compress_result
 
 async def intent_node(state: AgentState):
-    """V2.5: LLM çağrısı yapmadan, keyword regex ile sınıflandırma (500 token/istek tasarruf)."""
+    """V4: Hybrid Intent Router. 
+    Basit işlerde Regex hızı, karmaşık işlerde LLM zekası."""
     msg = state["messages"][-1].content
     intent_data = classify_intent_fast(msg)
-    log.success(f"🎯 [FastClassifier] Kategori: {intent_data['category'].upper()} | Karmaşıklık: {intent_data['complexity'].upper()}")
+    
+    if intent_data.get("needs_deep_analysis"):
+        log.info(f"🧠 [DeepIntent] Karmaşık cümle algılandı, LLM ile analiz ediliyor...")
+        # Gemini 2.0 Flash ile detaylı analiz (V2.5 mantığı geri geldi)
+        model = orchestrator.llm_gemini
+        # structured_output bazen nazlanabiliyor, garantici olalım
+        prompt = f"""Kullanıcı mesajını analiz et ve şu formatta JSON dön:
+        {{"category": "routing|fuel|pharmacy|event|city_data|general", "complexity": "high|low", "urgency": true|false, "focus_points": []}}
+        
+        Mesaj: {msg}"""
+        
+        try:
+            # Model bağlamında with_structured_output desteği varsa kullanalım
+            if hasattr(model, "with_structured_output"):
+                structured_model = model.with_structured_output(IntentAnalysis)
+                intent_llm = await structured_model.ainvoke(prompt)
+                # Pydantic objesini dict'e çevir
+                intent_data = intent_llm.model_dump() if hasattr(intent_llm, "model_dump") else intent_llm
+                log.success(f"🧠 [DeepIntent] LLM Kararı: {intent_data['category'].upper()}")
+            else:
+                # Fallback: String parse (eğer structured_output desteklenmiyorsa)
+                response = await model.ainvoke(prompt)
+                # Basit bir JSON extract (eğer model direkt JSON dönmezse)
+                clean_content = response.content.replace("```json", "").replace("```", "").strip()
+                intent_data = json.loads(clean_content)
+        except Exception as e:
+            log.warning(f"⚠️ [DeepIntent] LLM hatası, Regex'e dönülüyor: {e}")
+
+    log.success(f"🎯 [Intent] Kategori: {intent_data['category'].upper()} | Karmaşıklık: {intent_data['complexity'].upper()}")
     return {"intent": intent_data}
 
 from langgraph.graph import END
@@ -21,12 +50,23 @@ async def agent_node(state: AgentState):
     active_profile = await ProfileManager.get_user_context()
     route_history = await ProfileManager.get_route_history(limit=3)
     
-    # Rota geçmişini intent'e enjekte et (Prompt Manager kullanacak)
+    # AKTİF ROTA KONTROLÜ (Bunu yeni ekliyoruz)
+    session_id = state.get("session_id", "default_session")
+    active_route_encoded = orchestrator.redis_client.get(f"route:{session_id}")
+    has_active_route = True if active_route_encoded else False
+    
+    # Rota geçmişini ve aktif rota durumunu intent'e enjekte et
     intent_with_history = state["intent"].copy()
     intent_with_history["route_history"] = route_history
+    intent_with_history["has_active_route"] = has_active_route # Gemini'nin bilmesi için
     
-    # 2. Dinamik Prompt'u Üret
+    # 2. Dinamik Prompt'u Üret (Prompt Manager bu veriyi kullanacak)
     sys_prompt = get_dynamic_system_prompt(active_profile, intent_with_history)
+    
+    if has_active_route:
+        # Prompt'un sonuna küçük bir fısıltı ekleyelim
+        sys_prompt += "\n[SİSTEM BİLGİSİ: Kullanıcının şu anda haritada çizilmiş aktif bir rotası (polyline) bulunmaktadır. Eğer yol üstü mekan önerisi vs. isterse doğrudan tool'ları kullanarak veya sohbet geçmişindeki şehirlere bakarak yanıt ver.]"
+
     messages = [SystemMessage(content=sys_prompt)] + state["messages"]
     
     model = orchestrator.llm_claude if state["intent"].get("complexity") == "high" else orchestrator.llm_gemini

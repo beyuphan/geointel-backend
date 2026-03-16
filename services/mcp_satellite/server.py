@@ -6,8 +6,18 @@ import uvicorn
 # Host/Port burada YOK (0.1.0 standardı)
 mcp = FastMCP("GeoIntel Satellite Node")
 
-# İstemciyi başlat
-sat_client = SatelliteClient()
+# İstemciyi başlatmak için global değişken (Lazy Initialization)
+_sat_client = None
+
+def get_client():
+    """
+    SatelliteClient'ı sadece ihtiyaç anında başlatır.
+    Bu sayede sunucu ayağa kalkarken yaşanan DNS/Bağlantı hatalarının önüne geçilir.
+    """
+    global _sat_client
+    if _sat_client is None:
+        _sat_client = SatelliteClient()
+    return _sat_client
 
 @mcp.tool()
 def search_satellite_imagery(
@@ -23,7 +33,9 @@ def search_satellite_imagery(
     bbox = [min_lon, min_lat, max_lon, max_lat]
     
     try:
-        items = sat_client.search_sentinel2(bbox, days_back=days_back)
+        # İstemciyi burada çağırıyoruz
+        client = get_client()
+        items = client.search_sentinel2(bbox, days_back=days_back)
         
         if not items:
             return "Belirtilen kriterlerde uydu görüntüsü bulunamadı."
@@ -59,7 +71,9 @@ def calculate_ndvi(
     bbox = [min_lon, min_lat, max_lon, max_lat]
 
     try:
-        items = sat_client.search_sentinel2(
+        # İstemciyi burada çağırıyoruz
+        client = get_client()
+        items = client.search_sentinel2(
             bbox,
             days_back=days_back,
             max_cloud_cover=max_cloud_cover,
@@ -72,7 +86,7 @@ def calculate_ndvi(
             )
 
         item = items[0]
-        ndvi = sat_client.calculate_ndvi(item, bbox)
+        ndvi = client.calculate_ndvi(item, bbox)
 
         return json.dumps(
             {

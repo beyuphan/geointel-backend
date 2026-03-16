@@ -1,5 +1,5 @@
-import httpx
-from selectolax.lexbor import LexborHTMLParser
+import asyncio
+from playwright.async_api import async_playwright
 import re
 import unicodedata
 from loguru import logger as log
@@ -42,66 +42,72 @@ class PharmacyScraper:
         
         results = []
         
-        try:
-            async with httpx.AsyncClient(headers=self.headers, follow_redirects=True, timeout=15.0) as client:
-                resp = await client.get(url)
-                if resp.status_code != 200:
-                    log.error(f"❌ [HTTP] Eczane sitesi hatası: {resp.status_code}")
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            )
+            page = await context.new_page()
+            
+            try:
+                resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                if resp.status != 200:
+                    log.error(f"❌ [HTTP] Eczane sitesi hatası: {resp.status}")
                     return []
-                
-                parser = LexborHTMLParser(resp.text)
-                # Sitede div.tab-pane.active tbody tr veya direkt tbody tr olabiliyor
-                rows = parser.css('div.tab-pane.active tbody tr')
-                if not rows:
-                    rows = parser.css('tbody tr')
-                
-                if not rows:
+
+                # Tablo kontrolü
+                try:
+                    await page.wait_for_selector("tbody tr", state="attached", timeout=5000)
+                except:
                     log.warning(f"⚠️ [DOM] Tablo bulunamadı! Sayfa yapısı değişmiş olabilir.")
                     return []
 
-                log.info(f"📊 [HAM] Siteden {len(rows)} satır bulundu. Filtreleniyor...")
+                # JS Parsing (Restore deep parsing)
+                all_pharmacies = await page.evaluate("""() => {
+                    const results = [];
+                    let rows = document.querySelectorAll('div.tab-pane.active tbody tr');
+                    if (rows.length === 0) { rows = document.querySelectorAll('tbody tr'); }
+                    
+                    rows.forEach(row => {
+                        const rowContainer = row.querySelector('.row');
+                        if (!rowContainer) return;
+                        const name = rowContainer.querySelector('span.isim')?.innerText.trim();
+                        const district = rowContainer.querySelector('.bg-info')?.innerText.trim() || "";
+                        const addressDiv = rowContainer.querySelector('.col-lg-6');
+                        let address = "";
+                        if (addressDiv) {
+                            let rawAddress = addressDiv.innerText.trim();
+                            address = rawAddress.replace(district, '').trim().replace(/\\s+/g, ' ').trim();
+                        }
+                        const phone = rowContainer.querySelector('.col-lg-3.py-lg-2')?.innerText.trim();
+                        const mapLink = rowContainer.querySelector('a[href*="maps"]')?.href;
+                        if (name) { results.push({ name, district, address, phone, mapLink }); }
+                    });
+                    return results;
+                }""")
+                
+                log.info(f"📊 [HAM] Siteden {len(all_pharmacies)} eczane çekildi. Filtreleniyor...")
 
-                for row in rows:
-                    row_container = row.css_first('.row')
-                    if not row_container: continue
-
-                    name_el = row_container.css_first('span.isim')
-                    if not name_el: continue
-                    name = name_el.text(strip=True)
-
-                    district_el = row_container.css_first('.bg-info')
-                    district_text = district_el.text(strip=True) if district_el else ""
-
-                    # Adres çekimi
-                    address_div = row_container.css_first('.col-lg-6')
-                    address = ""
-                    if address_div:
-                        raw_address = address_div.text(strip=True)
-                        address = raw_address.replace(district_text, '').strip()
-                        address = re.sub(r'\s+', ' ', address)
-
-                    phone_el = row_container.css_first('.col-lg-3.py-lg-2')
-                    phone = phone_el.text(strip=True) if phone_el else "-"
-
-                    map_link_el = row_container.css_first('a[href*="maps"]')
-                    map_link = map_link_el.attributes.get('href') if map_link_el else ""
-
-                    # İlçe eşleştirme
-                    current_district_slug = self._slugify(district_text).replace("-", " ")
-                    if target_district_slug and target_district_slug not in current_district_slug:
+                for p_data in all_pharmacies:
+                    # İlçe eşleştirme (normalize edilmiş haliyle)
+                    current_district = self._slugify(p_data['district']).replace("-", " ")
+                    
+                    if target_district_slug and target_district_slug not in current_district:
                         continue
                     
-                    coords = self._extract_coords(map_link)
+                    coords = self._extract_coords(p_data['mapLink'])
                     results.append({
-                        "isim": name,
-                        "adres": address,
-                        "tel": phone,
-                        "ilce": district_text,
+                        "isim": p_data['name'],
+                        "adres": p_data['address'],
+                        "tel": p_data['phone'] or "-",
+                        "ilce": p_data['district'],
                         "koordinat": coords
                     })
 
-        except Exception as e:
-            log.error(f"🔥 [ECZANE PATLADI] Hata: {e}")
+            except Exception as e:
+                log.error(f"🔥 [ECZANE PATLADI] Hata: {e}")
+            finally:
+                await browser.close()
             
         log.success(f"✅ [SONUÇ] {len(results)} eczane bulundu.")
         return results
