@@ -30,3 +30,6 @@ MANUAL_TOOLS = [
         }
     }
 ]
+
+# main.py bu isimle import ediyor
+LOCAL_TOOLS = MANUAL_TOOLS

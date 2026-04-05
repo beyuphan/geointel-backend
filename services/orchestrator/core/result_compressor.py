@@ -10,7 +10,13 @@ from typing import Any
 # Her araç için maksimum sonuç sayısı ve korunacak alanlar
 COMPRESSION_RULES = {
     "get_route_data": {
-        "keep_fields": ["mesafe_km", "sure_dk", "origin", "destination", "traffic_summary", "route_warnings", "summary"],
+        "keep_fields": [
+            "mesafe_km", "sure_dk", "origin", "destination",
+            "traffic_summary", "traffic_status", "traffic_color",
+            "route_warnings", "summary", "source_system",
+            "source", "delay_min", "avg_speed_kmh",
+            "rain_factor_applied", "alternative_count"
+        ],
         "max_alternatives": 3,
         "strip_fields": ["polyline", "polyline_encoded", "coordinates", "legs", "maneuvers"]
     },
@@ -23,20 +29,20 @@ COMPRESSION_RULES = {
         "keep_place_fields": ["name", "address", "rating", "types", "description", "lat", "lon", "fusion_status", "is_open", "user_ratings_total"]
     },
     "get_fuel_prices": {
-        "max_results": 8,
-        "keep_fields": ["brand", "price", "district", "fuel_type"]
+        "max_results": 10,
+        "keep_fields": ["company", "gasoline", "diesel", "lpg", "district", "city"]
     },
     "get_pharmacies": {
-        "max_results": 5,
-        "keep_fields": ["name", "address", "phone", "distance"]
+        "max_results": 8,
+        "keep_fields": ["name", "address", "phone", "district", "coordinates"]
     },
     "get_events": {
         "max_results": 10,
-        "keep_fields": ["name", "date", "venue", "category"]
+        "keep_fields": ["title", "venue", "date", "category", "link", "source"]
     },
     "get_sports_matches": {
-        "max_results": 5,
-        "keep_fields": ["home_team", "away_team", "date", "venue", "league"]
+        "max_results": 10,
+        "keep_fields": ["match", "time", "stadium", "city", "warning"]
     }
 }
 

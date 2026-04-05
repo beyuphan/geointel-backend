@@ -33,8 +33,24 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
 
-# CORS
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# CORS — Mobil uygulama ve local development için izin verilen origin'ler
+# Production'da bu listeyi kendi domain'inize göre güncelleyin
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",       # React Native Metro
+    "http://localhost:8501",       # Streamlit Dashboard
+    "http://localhost:19006",      # Expo Dev
+    "http://geo_dashboard:8501",   # Docker internal
+    # "https://your-mobile-app.com",  # Production domain (uncomment & update)
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["X-Session-Id"],
+)
 
 # Router
 app.include_router(api_router)

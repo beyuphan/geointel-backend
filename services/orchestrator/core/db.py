@@ -70,5 +70,7 @@ class POIEmbedding(SQLModel, table=True):
     __tablename__ = "poi_embeddings"
     id: int | None = Field(default=None, primary_key=True)
     name: str = Field(index=True)
+    description: str | None = None
     category: str | None = None
-    embedding: list[float] | None = Field(default=None, sa_column=Column(Vector(1536)))
+    location: str | None = None  # "lat,lon" string
+    embedding: list[float] | None = Field(default=None, sa_column=Column(Vector(768)))  # Gemini text-embedding-004 = 768 dim

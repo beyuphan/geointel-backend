@@ -11,14 +11,13 @@ from .local_routing import is_in_service_area, get_local_route
 
 
 
-# Favori lokasyon çözücü (DB'den lazy import - döngüsel import önlemi)
+from .db import get_saved_locations as _db_get_saved_locations
+
+# Saved location resolver — artık orchestrator'a bağımlı değil
 async def _resolve_from_db(location: str, session_id: str = "test_pilot") -> str | None:
     """Kayıtlı konumları (Ev, İş vb.) DB'den koordinata çevirir."""
     try:
-        # Artık doğrudan orchestrator klasöründen çekebiliriz!
-        from orchestrator.profile_manager import ProfileManager
-        
-        saved = await ProfileManager.get_saved_locations(username=session_id)
+        saved = await _db_get_saved_locations(username=session_id)
         key = location.lower().strip()
         if key in saved:
             log.info(f"🏠 [SavedLocation] '{location}' → {saved[key]}")
@@ -84,21 +83,33 @@ async def _resolve_coordinates(location: str, session_id: str = "test_pilot") ->
         params = {
             "q": location,
             "format": "json",
-            "limit": 5,
-            "countrycodes": "tr"
+            "limit": 10,           # Daha fazla sonuç al, en iyisini seç
+            "countrycodes": "tr",
+            "addressdetails": "1",  # Adres detayları (şehir, ilçe ayrımı için)
+            "featuretype": "settlement",  # Sadece yerleşim yerleri
         }
         resp = await http_client.get(url, params=params, headers=headers, timeout=10.0)
         data = resp.json()
         if data:
-            # KRİTİK FİLTRE: "Rize" arandığında koskoca il sınırını (Hemşin merkezli) getirmek yerine Şehir/İlçe merkezine öncelik ver.
+            # importance skoruna göre sırala — en önemli sonuç en başta
+            data.sort(key=lambda x: float(x.get("importance", 0)), reverse=True)
+
+            # İl/ilçe merkezini tercih et, önce şehir/kasaba ara
             best_match = data[0]
             for item in data:
-                if item.get("class") == "place" and item.get("type") in ["city", "town", "village", "municipality"]:
+                item_type = item.get("type", "")
+                item_class = item.get("class", "")
+                # city > town > municipality > village sıralaması
+                if item_class == "place" and item_type in ["city", "town", "municipality"]:
                     best_match = item
                     break
-                    
+
             lat, lon = best_match["lat"], best_match["lon"]
-            log.success(f"✅ [OSM] Bulundu: {best_match.get('name', location)} -> {lat},{lon}")
+
+            # Seçilen sonucun adını logla (debug için)
+            addr = best_match.get("address", {})
+            city_name = addr.get("city") or addr.get("town") or addr.get("village") or best_match.get("display_name", location)
+            log.success(f"✅ [OSM] Bulundu: {city_name} → {lat},{lon} (importance: {best_match.get('importance', '?')})")
             return f"{lat},{lon}"
     except Exception as e:
         log.error(f"OSM Geocoding Hatası: {e}")

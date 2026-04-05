@@ -178,7 +178,7 @@ class ProfileManager:
                 new_route = RouteHistory(
                     user_id=user.id, origin=origin, destination=destination,
                     distance_km=distance_km, duration_min=duration_min,
-                    created_at=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                    created_at=datetime.utcnow()  # datetime objesi — str değil!
                 )
                 session.add(new_route)
                 await session.commit()

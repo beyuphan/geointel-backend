@@ -68,7 +68,6 @@ services:
       - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
       - HERE_API_KEY=${HERE_API_KEY}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-      - PYTHONPATH=/app/orchestrator
     depends_on:
       postgres_postgis:
         condition: service_healthy
@@ -76,7 +75,6 @@ services:
       - geo_net
     volumes:
       - ./services/mcp_city:/app
-      - ./services/orchestrator:/app/orchestrator  # Orchestrator koduna erişim için
 
   # 5. UYDU AJANI (MCP SATELLITE - İleride kodlayacağız)
   mcp_satellite:
@@ -103,12 +101,11 @@ services:
     ports:
       - "8001:8001" # Dışarıdan test etmek istersen diye
     environment:
-      - PYTHONPATH=/app/orchestrator
+      - PYTHONPATH=/app
     networks:
       - geo_net
     volumes:
       - ./services/mcp_intel:/app
-      - ./services/orchestrator:/app/orchestrator
 
 
   # 6. arayüz AJANI

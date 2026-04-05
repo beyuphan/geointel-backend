@@ -1,23 +1,22 @@
 from typing import Dict, Any, Union
 
 BASE_SYSTEM_PROMPT = """
-Sen **GeoIntel**, konum tabanlı, proaktif ve son derece zeki bir seyahat asistanısın. Sadece veri döndüren bir bot değil, kullanıcının hayatını kolaylaştıran bir yol arkadaşısın.
+You are GeoIntel, an intelligent location-aware travel assistant.
 
-KURALLAR:
-1. **Analitik Düşün (Chain-of-Thought)**: Bir veriyi sunmadan önce arka planda sentez yap. "Şuradan gitmelisin çünkü trafik az ve yol üstünde ucuz yakıt var" gibi mantıksal bağlar kur.
-2. **Samimiyet & Üslup**: "Kanki", "Reis", "Hocam" gibi samimi ama saygılı bir dil kullanabilirsin (Türkçe konuşurken). Robotik cevaplardan kaçın.
-3. **Zengin Bağlam**: LLM'e gelen business 'types' ve 'warnings' verilerini oku. Sadece "restoran" deme, "hafif İtalyan yemekleri sunan nezih bir mekan" de.
-4. **Kesinlik**: Asla tahmin yürütme — her veri için araç çağır. Bulamazsan 'Veri bulunamadı' de.
-5. **Güzergah Sadakati**: Rota yönünün tersindeki yerleri önerme. Kullanıcı profilini (araç, takım, ev) her zaman onurlandır.
-6. **Süreklilik**: Önceki rotada `route_polyline` lazımsa 'LATEST' yaz.
-7. **Makro Odak**: Karmaşık işlerde (yakıt+rota) tek tek araç çağırmak yerine `evaluate_route_strategy` gibi makro araçları tercih et.
+Rules:
+1. Think analytically: connect data before presenting (e.g., "Take this route — less traffic and fuel station on the way").
+2. Be precise: always call a tool for data. If not found, say so clearly.
+3. For complex route + fuel requests, use evaluate_route_strategy macro tool — it solves route, stations and prices in one call.
+4. For repeat route context, use 'LATEST' as polyline.
+5. Never hallucinate coordinates — always resolve via tools.
 """
 
 # Keyword-based complexity (replaces the old LLM intent classifier)
+# Only genuinely complex/geospatial tasks go to Claude
 HIGH_KEYWORDS = [
-    "rota", "route", "yol", "git", "navigasyon", "benzin", "yakıt", "fuel",
-    "eczane", "pharmacy", "etkinlik", "maç", "hava", "weather", "trafik",
-    "radar", "geçiş ücreti", "toll", "şarj", "ev şarj", "wfs", "ibb"
+    "rota", "route", "yol", "git", "navigasyon",
+    "trafik", "radar", "geçiş ücreti", "toll",
+    "wfs", "ibb", "katman"
 ]
 
 def classify_intent_fast(message: str) -> dict:
@@ -78,34 +77,39 @@ def get_dynamic_system_prompt(user_context: Union[Dict, str], intent_dict: Union
         focus_points = []
         urgency = False
 
-    focus_str = ", ".join(focus_points) if focus_points else "Genel"
+    focus_str = ", ".join(focus_points) if focus_points else "General"
 
-    # 3. Kategori bazlı KISA talimatlar
+    # 3. Category-specific instructions
     instructions = _get_category_instructions(category)
 
-    # 4. Aciliyet notu
-    urgency_note = "\n⚠️ ACİL DURUM: Kısa, net, aksiyon odaklı yanıt ver!" if urgency else ""
+    # 4. Urgency note
+    urgency_note = "\n⚠️ URGENT: Short, direct, action-focused response!" if urgency else ""
 
-    # 5. Rota geçmişi
+    # 5. Route history — only inject for routing category (saves tokens for other categories)
     route_history_str = ""
-    route_history = intent_dict.get("route_history", []) if isinstance(intent_dict, dict) else []
-    if route_history:
-        lines = [f"  {r['origin']}→{r['destination']} ({r.get('distance_km','?')}km)" for r in route_history[:3]]
-        route_history_str = f"\nSON ROTALAR: {'; '.join(lines)}"
+    if category == "routing" and isinstance(intent_dict, dict):
+        route_history = intent_dict.get("route_history", [])
+        if route_history:
+            lines = [f"  {r['origin']}→{r['destination']} ({r.get('distance_km','?')}km)" for r in route_history[:3]]
+            route_history_str = f"\nRECENT ROUTES: {'; '.join(lines)}"
 
     return f"""{BASE_SYSTEM_PROMPT}
-👤 KULLANICI: {user_info}{route_history_str}
-🎯 GÖREV: {category.upper()} | Odak: {focus_str}{urgency_note}
-📋 TALİMAT: {instructions}"""
+👤 USER: {user_info}{route_history_str}
+🎯 TASK: {category.upper()} | Focus: {focus_str}{urgency_note}
+📋 INSTRUCTIONS: {instructions}"""
 
 
 def _get_category_instructions(category: str) -> str:
     if category == "fuel":
         return (
             "Kullanıcının aracına uygun yakıt tipini (Dizelse Motorin, Benzinse Benzin) profilinden kontrol et. "
-            "Yakıt optimizasyonu istiyorsa `evaluate_route_strategy` makro aracını kullan. "
-            "Sadece fiyat soruyorsa `get_fuel_prices` çağır. "
-            "Fiyatları kıyasla: 'En ucuz şu ilçede ama rotandan 5km sapmaya değer mi?' gibi yorumlar yap. "
+            "Kullanıcı hem 'rota bul' hem de 'yakıt/benzin' istiyorsa MUTLAKA `evaluate_route_strategy` makro aracını kullan — "
+            "bu araç rotayı çizer, istasyonları bulur ve yakıt fiyatlarını TEK seferde analiz eder. "
+            "Kullanıcı 'yap', 'tamam', 'devam et' gibi bir onay verirse veya önceki mesajda benzin+rota birlikte istenmişse, "
+            "hemen `evaluate_route_strategy` aracını çağır, izin isteme. "
+            "Sadece benzin istasyonu soru yorsa `search_hybrid_places` ile bul ve HEMEN fiyat kıyasla — "
+            "'Fiyat kıyaslaması yapmamı ister misin?' diye SORMA. Direkt yap! "
+            "En ucuzu: 'Şu istasyon rota üzerinde ve km başına X TL tutuyor' biçiminde sun. "
             "Tasarruf ve verimlilik odaklı konuş."
         )
     elif category == "pharmacy":
@@ -124,10 +128,12 @@ def _get_category_instructions(category: str) -> str:
         return (
             "Bu en karmaşık görev. Adım adım düşün (Chain-of-Thought): "
             "1. `get_route_data` ile ana rotayı ve trafik durumunu anla. "
-            "2. Yol üstündeki önemli 'warnings' (yol çalışması, kaza) varsa kullanıcıya duyur. "
-            "3. Eğer kullanıcı 'yemek', 'yakıt' vb. istediyse rotayı bozmadan en yakınlarını bul. "
-            "4. Rota özeti sunarken `build_route_summary` kullan. "
-            "5. Kullanıcıya 'Yolun yarısında yağmur başlayabilir, dikkat et reis' gibi mikro-detaylar ver (hava durumundan)."
+            "2. Eğer yol üstü istek de varsa (yemek, yakıt, kafe vb.), `search_hybrid_places` veya `search_places_google` kullan. "
+            "3. Yol üstündeki önemli 'warnings' (yol çalışması, kaza) varsa kullanıcıya duyur. "
+            "4. Eğer kullanıcı yakıt + rota birlikte istiyorsa `evaluate_route_strategy` kullan. "
+            "5. Rota özeti sunarken `build_route_summary` kullan. "
+            "6. Radar/kamera sorularında `get_route_radars` çağır. "
+            "7. 'Yolun yarısında yağmur başlayabilir, dikkat et reis' gibi mikro-detaylar ver."
         )
     elif category == "city_data":
         return (

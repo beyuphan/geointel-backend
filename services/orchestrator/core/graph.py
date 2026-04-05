@@ -7,33 +7,48 @@ from core.mcp_client import orchestrator
 from core.result_compressor import compress_result
 
 async def intent_node(state: AgentState):
-    """V4: Hybrid Intent Router. 
+    """V4.1: Hybrid Intent Router. 
     Basit işlerde Regex hızı, karmaşık işlerde LLM zekası."""
-    msg = state["messages"][-1].content
+    messages = state["messages"]
+    msg = messages[-1].content
     intent_data = classify_intent_fast(msg)
     
+    # [Hafıza Entegrasyonu] Kısa veya genel mesajlarda geçmişe bak
+    if (intent_data["category"] == "general" or len(msg.split()) < 3) and len(messages) > 1:
+        prev_content = messages[-2].content if hasattr(messages[-2], "content") else ""
+        prev_intent = classify_intent_fast(str(prev_content))
+        if prev_intent["category"] != "general":
+            log.info(f"🔄 [Intent Memory] Kategori miras alındı: {prev_intent['category'].upper()}")
+            intent_data["category"] = prev_intent["category"]
+            # Bağlam miras alındığında daima high — devam soruları genelde karmaşık
+            intent_data["complexity"] = "high"
+            intent_data["needs_deep_analysis"] = False  # LLM çağrısına gerek yok, zaten high
+
+    # [Model Güvenliği] Rota ve şehir verisi HER ZAMAN Claude'a — Gemini Flash başaramaz
+    ALWAYS_CLAUDE_CATEGORIES = {"routing", "city_data"}
+    if intent_data["category"] in ALWAYS_CLAUDE_CATEGORIES:
+        intent_data["complexity"] = "high"
+        log.info(f"🔒 [Model Lock] Kategori {intent_data['category'].upper()} → Claude zorunlu.")
+
     if intent_data.get("needs_deep_analysis"):
         log.info(f"🧠 [DeepIntent] Karmaşık cümle algılandı, LLM ile analiz ediliyor...")
-        # Gemini 2.0 Flash ile detaylı analiz (V2.5 mantığı geri geldi)
         model = orchestrator.llm_gemini
-        # structured_output bazen nazlanabiliyor, garantici olalım
         prompt = f"""Kullanıcı mesajını analiz et ve şu formatta JSON dön:
         {{"category": "routing|fuel|pharmacy|event|city_data|general", "complexity": "high|low", "urgency": true|false, "focus_points": []}}
         
         Mesaj: {msg}"""
         
         try:
-            # Model bağlamında with_structured_output desteği varsa kullanalım
             if hasattr(model, "with_structured_output"):
                 structured_model = model.with_structured_output(IntentAnalysis)
                 intent_llm = await structured_model.ainvoke(prompt)
-                # Pydantic objesini dict'e çevir
                 intent_data = intent_llm.model_dump() if hasattr(intent_llm, "model_dump") else intent_llm
                 log.success(f"🧠 [DeepIntent] LLM Kararı: {intent_data['category'].upper()}")
+                # LLM sonrası da kategori kilidi kontrol et
+                if intent_data.get("category") in ALWAYS_CLAUDE_CATEGORIES:
+                    intent_data["complexity"] = "high"
             else:
-                # Fallback: String parse (eğer structured_output desteklenmiyorsa)
                 response = await model.ainvoke(prompt)
-                # Basit bir JSON extract (eğer model direkt JSON dönmezse)
                 clean_content = response.content.replace("```json", "").replace("```", "").strip()
                 intent_data = json.loads(clean_content)
         except Exception as e:
@@ -80,13 +95,22 @@ async def agent_node(state: AgentState):
     return {"messages": [response], "retry_count": 0}
 
 def should_continue(state: AgentState) -> str:
+    """
+    Sadece 2 yol var:
+      - Tool çağrısı varsa → 'tools' node'una git
+      - Tool çağrısı yoksa → END (sonsuz loop yok)
+    Retry guard: 3 turdan fazla tool döngüsü olursa zorla bitir.
+    """
     last_msg = state["messages"][-1]
-    
-    if hasattr(last_msg, "tool_calls") and len(last_msg.tool_calls) > 0:
+
+    has_tool_calls = hasattr(last_msg, "tool_calls") and len(last_msg.tool_calls) > 0
+
+    if has_tool_calls:
         if state.get("retry_count", 0) >= 3:
-            log.warning("⚠️ Max tool retry limit reached! Killing execution loop.")
+            log.warning("⚠️ Max tool retry (3) aşıldı! Döngü sonlandırılıyor.")
             return END
         return "tools"
+
     return END
 
 async def custom_tool_node(state: AgentState):

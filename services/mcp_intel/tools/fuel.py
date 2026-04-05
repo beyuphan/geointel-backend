@@ -126,12 +126,13 @@ class FuelScraper:
         results = []
         log.info(f"🚀 [V3] {city}/{district} Taraması Başlıyor (httpx — Playwright YOK)...")
         
-        # V3: Paylaşımlı httpx client ile seri istek (Playwright yerine)
+        # V3.5: Paylaşımlı httpx client ile paralel istek
         async with httpx.AsyncClient(headers=self.HEADERS, follow_redirects=True) as client:
-            for firm in self.FIRMS:
-                await asyncio.sleep(0.5)  # Rate limit saygısı (doviz.com'a nazik ol)
-                raw = await self._get_firm_price(client, city, district, firm)
-                
+            tasks = [self._get_firm_price(client, city, district, firm) for firm in self.FIRMS]
+            raw_results = await asyncio.gather(*tasks)
+            
+            for i, raw in enumerate(raw_results):
+                firm = self.FIRMS[i]
                 if raw:
                     benzin = self._parse_price(raw.get('benzin'))
                     motorin = self._parse_price(raw.get('motorin'))

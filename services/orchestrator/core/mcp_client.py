@@ -22,17 +22,18 @@ class GeoIntelOrchestrator:
         self.tool_router: Dict[str, str] = {}
         self.sessions: Dict[str, str] = {}
         self.pending_requests: Dict[str, asyncio.Future] = {}
-        self.rpc_timeout = 25.0
+        self.rpc_timeout = 60.0
         self.redis_client = self._init_redis()
         
-        # V2.5: Cache TTLs (saniye)
+        # V2.5: Cache TTLs (seconds)
         self.cache_ttls = {
-            "get_fuel_prices": 1800,      # 30 dk
-            "get_weather": 900,           # 15 dk
-            "get_pharmacies": 3600,       # 60 dk
-            "get_events": 7200,           # 120 dk
-            "get_toll_prices": 3600,      # 60 dk
-            "get_sports_matches": 3600,   # 60 dk
+            "get_route_data": 600,          # 10 min (traffic changes)
+            "get_fuel_prices": 3600,        # 60 min
+            "get_weather": 900,             # 15 min
+            "get_pharmacies": 3600,         # 60 min
+            "get_events": 7200,             # 120 min
+            "get_toll_prices": 3600,        # 60 min
+            "get_sports_matches": 3600,     # 60 min
         }
         
         # LLM Clients

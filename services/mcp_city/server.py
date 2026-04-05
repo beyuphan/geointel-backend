@@ -1,5 +1,6 @@
 import json
 import asyncio
+from contextlib import asynccontextmanager
 from tools.geometry import calculate_distance_meters
 import uvicorn
 from fastmcp import FastMCP
@@ -10,9 +11,9 @@ from typing import List, Union, Optional
 from tools.models import StandardPlace, RouteResponse, WeatherResponse, ErrorResponse
 from tools.osm import search_infrastructure_osm_handler
 from tools.google import search_places_google_handler
-from tools.here import get_route_data_handler
+from tools.here import get_route_data_handler, _resolve_coordinates
 from tools.weather import get_weather_handler, analyze_route_weather_handler
-from tools.db import save_location_handler, search_spatial_rag, save_poi_with_embedding
+from tools.db import save_location_handler, search_spatial_rag, save_poi_with_embedding, init_pool, close_pool
 from tools.toll import get_toll_prices_handler, get_toll_for_route_handler
 from tools.wfs import fetch_wfs_as_geojson, fetch_ibb_dataset_geojson, list_wfs_datasets
 from tools.radar import get_radars_on_route_handler
@@ -23,8 +24,16 @@ from tools.traffic import get_route_traffic_handler
 from safe_tools import safe_tool
 
 # --- MCP SUNUCU KURULUMU ---
-# v2.0: Veri bütünlüğü ve koordinat güvenliği odaklı mimari
-mcp = FastMCP(name="City Agent", version="2.0.0")
+@asynccontextmanager
+async def lifespan(server):
+    """DB Pool ve kaynak yönetimi."""
+    logger.info("🔌 [City Agent] DB Pool başlatılıyor...")
+    await init_pool()
+    yield
+    logger.info("🔌 [City Agent] DB Pool kapatılıyor...")
+    await close_pool()
+
+mcp = FastMCP(name="City Agent", version="3.0.0", lifespan=lifespan)
 
 def handle_critical_error(e: Exception, tool_name: str) -> str:
     """Hataları merkezi bir formatta loglar ve döner."""
@@ -33,17 +42,18 @@ def handle_critical_error(e: Exception, tool_name: str) -> str:
 
 # --- 1. OSM ALTYAPI ARAMA ---
 @mcp.tool()
-@safe_tool(fallback_message="OSM araması şu an yapılamıyor.")
+@safe_tool(fallback_message="OSM search unavailable.")
 async def search_infrastructure_osm(lat: float, lon: float, category: str, radius: int = 2000) -> str:
     """
-    OSM ALTYAPI ARAMA: Belirtilen konumun çevresindeki kamusal (ticari olmayan) alanları bulur.
-    Hastane, Okul, Park, Stadyum, Havalimanı gibi yerler için bunu kullan.
-    
+    Finds public (non-commercial) infrastructure near a location using OpenStreetMap.
+    Use for: hospitals, schools, parks, stadiums, airports, mosques.
+    Do NOT use for restaurants, cafes, shops — use search_hybrid_places instead.
+
     Args:
-        lat (float): Merkez enlem (-90, 90).
-        lon (float): Merkez boylam (-180, 180).
-        category (str): Aramak istediğin OSM etiketi (Örn: hospital, park, airport).
-        radius (int): Arama yarıçapı (metre).
+        lat: Center latitude.
+        lon: Center longitude.
+        category: OSM tag (e.g. hospital, park, airport, school).
+        radius: Search radius in meters (default 2000).
     """
     try:
         logger.info(f"🛠️ [Tool: OSM] İstek: {category} @ {lat},{lon}")
@@ -76,14 +86,11 @@ async def search_infrastructure_osm(lat: float, lon: float, category: str, radiu
     except Exception as e:
         return handle_critical_error(e, "search_infrastructure_osm")
 
-# --- 2. GOOGLE PLACES ROTA/KONUM ARAMA ---
-@mcp.tool()
-@safe_tool(fallback_message="Google Maps araması şu an yapılamıyor.")
+# search_places_google: Internal use only — called by search_hybrid_places macro
+# NOT registered as MCP tool to prevent LLM from calling it directly
+@safe_tool(fallback_message="Google Maps search unavailable.")
 async def search_places_google(query: str, lat: float = 0.0, lon: float = 0.0, route_polyline: str = None) -> str:
-    """
-    ⚠️ DEPRECATED — BU ARACI DOĞRUDAN ÇAĞIRMA! Bunun yerine 'search_hybrid_places' kullan.
-    Bu araç sadece dahili sistemler (macro-tools) tarafından kullanılır.
-    """
+    """INTERNAL: Google Places search. Use search_hybrid_places instead."""
     try:
         logger.info(f"🛠️ [Tool: Google] Sorgu: '{query}' (Rota: {'Aktif' if route_polyline else 'Pasif'})")
         raw_data = await search_places_google_handler(query, lat, lon, route_polyline)
@@ -131,11 +138,15 @@ async def search_places_google(query: str, lat: float = 0.0, lon: float = 0.0, r
 
 # --- 3. HERE ROTA OLUŞTURMA ---
 @mcp.tool()
-@safe_tool(fallback_message="HERE Maps rota oluşturamadı.")
+@safe_tool(fallback_message="Route calculation failed.")
 async def get_route_data(origin: str, destination: str) -> str:
     """
-    AKILLI ROTA MOTORU: İki nokta arasındaki trafik durumunu, süreyi ve mesafeyi hesaplar.
-    İstanbul içi için İBB Canlı Verisi, şehirler arası için HERE Maps kullanır.
+    Calculates route between two locations with real-time traffic, distance and ETA.
+    Uses Istanbul local DB for city routes, HERE Maps for intercity.
+
+    Args:
+        origin: Start location name or 'lat,lon' coordinates.
+        destination: End location name or 'lat,lon' coordinates.
     """
     try:
         logger.info(f"🛠️ [Tool: Rota] Hesapla: {origin} -> {destination}")
@@ -169,9 +180,9 @@ async def get_route_data(origin: str, destination: str) -> str:
 
 # --- 4. HAVA DURUMU (KONUM BAZLI) ---
 @mcp.tool()
-@safe_tool(fallback_message="Anlık hava durumu çekilemiyor.")
+@safe_tool(fallback_message="Weather data unavailable.")
 async def get_weather(lat: float, lon: float) -> str:
-    """Belirtilen koordinat için anlık ve saatlik hava durumu raporu sunar."""
+    """Returns current weather and hourly forecast for the given coordinates."""
     try:
         logger.info(f"🛠️ [Tool: Hava] Sorgu: {lat},{lon}")
         raw_data = await get_weather_handler(lat, lon)
@@ -196,10 +207,12 @@ async def get_weather(lat: float, lon: float) -> str:
 
 # --- 5. ROTA HAVA DURUMU (WHEATHER SHIELD) ---
 @mcp.tool()
-@safe_tool(fallback_message="Rota kalkanı (hava durumu analizi) yapılamadı.")
+@safe_tool(fallback_message="Route weather analysis failed.")
 async def analyze_route_weather(polyline: str) -> str:
     """
-    WEATHER SHIELD: Rota boyunca (40km'lik dilimlerle) hava durumu risklerini (yağmur, kar, buzlanma) analiz eder.
+    Analyzes weather risks (rain, snow, ice) along a route at 40km intervals.
+    Returns risk level, risk zones, and driving advice.
+    Use 'LATEST' for active route polyline.
     """
     try:
         logger.info("🛠️ [Tool: Weather Shield] Analiz başlatılıyor...")
@@ -224,7 +237,7 @@ async def analyze_route_weather(polyline: str) -> str:
 # --- 6. KONUM KAYDETME (POSTGIS) ---
 @mcp.tool()
 async def save_location(name: str, lat: float, lon: float, category: str = "Genel", note: str = "") -> str:
-    """Kullanıcının belirttiği konumu (favori, iş, ev vb.) veritabanına kalıcı olarak kaydeder."""
+    """Saves a location (home, work, favorite) to the database permanently."""
     try:
         logger.info(f"💾 [Tool: DB] Kayıt Deneniyor: {name}")
         result = await save_location_handler(name, lat, lon, category, note)
@@ -235,7 +248,7 @@ async def save_location(name: str, lat: float, lon: float, category: str = "Gene
 # --- 7. OTOYOL VE KÖPRÜ ÜCRETLERİ ---
 @mcp.tool()
 async def get_toll_prices(filter_region: str = None) -> str:
-    """Türkiye genelindeki güncel otoyol, köprü ve tünel geçiş ücretlerini listeler."""
+    """Lists current highway, bridge, and tunnel toll prices in Turkey."""
     try:
         logger.info("🛠️ [Tool: Otoyol] Fiyat listesi çekiliyor...")
         text_result = await get_toll_prices_handler(filter_region)
@@ -247,8 +260,8 @@ async def get_toll_prices(filter_region: str = None) -> str:
 @mcp.tool()
 async def search_hybrid_poi(query: str, lat: float, lon: float, radius: float = 5000, limit: int = 5) -> str:
     """
-    SPATIAL RAG ARAMA: Kullanıcının metin sorgusuna anlamsal (semantic) olarak en çok 
-    benzeyen yerleri (POI) bulur ve bunları belirtilen koordinata olan uzaklıklarına göre (spatial) daraltır.
+    Semantic POI search using pgvector embeddings filtered by spatial proximity.
+    Finds places matching the query text within the given radius.
     """
     try:
         logger.info(f"🛠️ [Tool: SpatialRAG] Sorgu: '{query}' @ {lat},{lon}")
@@ -260,8 +273,8 @@ async def search_hybrid_poi(query: str, lat: float, lon: float, radius: float = 
 @mcp.tool()
 async def save_poi_to_db(name: str, description: str, lat: float, lon: float, category: str = "Tavsiye") -> str:
     """
-    Kullanıcının önerdiği veya beğendiği bir konumu açıklamasıyla birlikte vektörel (embedding)
-    olarak veritabanına kaydeder. RAG aramalarında bu veriler listelenecektir.
+    Saves a place with its description as a vector embedding for future RAG searches.
+    Use when user recommends or likes a location.
     """
     try:
         logger.info(f"💾 [Tool: SpatialRAG Kayıt] {name}")
@@ -279,14 +292,14 @@ async def fetch_wfs_layer(
     max_features: Optional[int] = 200,
 ) -> str:
     """
-    WFS katmanı çeker ve GeoJSON FeatureCollection döndürür.
+    Fetches a WFS layer and returns a GeoJSON FeatureCollection.
 
     Args:
-        base_url: WFS endpoint (örn: 'https://.../ows' veya '?service=WFS' almayan kök URL)
-        type_name: Katman adı (WFS typeNames) (örn: 'ibb:afettoplanma')
-        bbox: 'minx,miny,maxx,maxy' formatında bbox. Varsayılan CRS: EPSG:5254.
-        src_epsg: Kaynak koordinat sistemi (rapordaki senaryo için genelde 5254).
-        max_features: Maksimum feature sayısı.
+        base_url: WFS endpoint URL.
+        type_name: Layer name (WFS typeNames, e.g. 'ibb:afettoplanma').
+        bbox: Optional bounding box 'minx,miny,maxx,maxy' (default CRS: EPSG:5254).
+        src_epsg: Source coordinate system (usually 5254 for IBB data).
+        max_features: Max number of features to return.
     """
     try:
         bbox_tuple = None
@@ -315,9 +328,8 @@ async def fetch_ibb_dataset(
     max_features: Optional[int] = 200,
 ) -> str:
     """
-    İBB WFS preset dataset'lerinden GeoJSON çeker ve standardize edilmiş FeatureCollection döndürür.
-
-    Not: Endpoint env ile yönetilir: IBB_WFS_BASE_URL
+    Fetches IBB (Istanbul Municipality) preset WFS datasets as GeoJSON.
+    Endpoint is configured via IBB_WFS_BASE_URL env variable.
     """
     try:
         bbox_tuple = None
@@ -337,23 +349,22 @@ async def fetch_ibb_dataset(
 
 @mcp.tool()
 async def list_ibb_datasets() -> str:
-    """İBB WFS preset dataset listesini döndürür."""
+    """Lists all available IBB (Istanbul Municipality) WFS dataset IDs."""
     try:
         return json.dumps(list_wfs_datasets(), ensure_ascii=False)
     except Exception as e:
         return handle_critical_error(e, "list_ibb_datasets")
 
 
-from tools.here import get_route_data_handler, _resolve_coordinates
+# _resolve_coordinates is imported at top — no duplicate import needed
 
 
 # --- 11. ROTA RADARLARI (GERÇEK ZAMANLI - HERE MAPS) ---
 @mcp.tool()
 async def get_route_radars(route_polyline: str) -> str:
     """
-    GERÇEK ZAMANLI RADAR TARAMA (HERE Maps Traffic API): Rota boyunca aktif hız kameraları,
-    radar noktaları ve trafik tehlikelerini HERE Maps'ten canlı olarak çeker.
-    Rota hesaplandıktan sonra her zaman çağır. route_polyline için 'LATEST' kullanabilirsin.
+    Scans for speed cameras and traffic hazards along a route using HERE Maps Traffic API.
+    Always call after get_route_data. Use 'LATEST' for current route polyline.
     """
     try:
         logger.info("🚨 [Tool: Radar] Rota üzerinde kamera taraması yapılıyor...")
@@ -376,12 +387,11 @@ async def get_route_radars(route_polyline: str) -> str:
 
 # --- 12. ROTA GEÇİŞ ÜCRETLERİ (GERÇEK ZAMANLI - HERE MAPS) ---
 @mcp.tool()
-@safe_tool(fallback_message="Geçiş ücretleri sorgulanamadı.")
+@safe_tool(fallback_message="Toll query failed.")
 async def get_toll_for_route(route_polyline: str) -> str:
     """
-    GERÇEK ZAMANLI GEÇİŞ ÜCRETİ (HERE Maps Routing API): Rota üzerindeki köprü, tünel ve
-    ücretli otoyolların HGS/OGS maliyetini HERE Maps'ten canlı olarak hesaplar.
-    Rota hesaplandıktan sonra her zaman çağır. route_polyline için 'LATEST' kullanabilirsin.
+    Calculates bridge, tunnel and highway toll costs along a route using HERE Maps API.
+    Always call after get_route_data. Use 'LATEST' for current route polyline.
     """
     try:
         logger.info("💰 [Tool: Toll] Rota ücreti hesaplanıyor...")
@@ -394,13 +404,13 @@ async def get_toll_for_route(route_polyline: str) -> str:
         return handle_critical_error(e, "get_toll_for_route")
 
 @mcp.tool()
-@safe_tool(fallback_message="Hibrit mekan arama başarısız oldu.")
+@safe_tool(fallback_message="Hybrid place search failed.")
 async def search_hybrid_places(query: str, location_name: Optional[str] = None, lat: Optional[float] = None, lon: Optional[float] = None, category: Optional[str] = "commercial", route_polyline: Optional[str] = None) -> str:
     """
-    HİBRİT MEKAN ARAMA (Google + OSM Füzyonu): Kullanıcının aradığı mekanları bulur ve fiziksel doğruluğunu artırır.
-    Eğer elinde kesin 'lat' ve 'lon' yoksa, bunları BOŞ BIRAK ve sadece 'location_name' (Örn: 'Kadıköy', 'Rize') ile 'query' değerlerini ver. 
-    Lütfen koordinatları TAHMİN ETME!
-    Eğer kullanıcı bir rota üzerindeyse route_polyline parametresini geç veya LATEST kullan; bu sayede ETA bazlı mekan filtreleme aktif olur.
+    Finds places using Google + OSM data fusion for best accuracy.
+    If you don't have exact coordinates, leave lat/lon empty and provide location_name (e.g. 'Kadikoy', 'Rize').
+    DO NOT guess coordinates.
+    If user is on a route, pass route_polyline or 'LATEST' to enable ETA-based filtering.
     """
     logger.info(f"🧬 [Tool: Hybrid Fusion] Başlatıldı: '{query}' @ {location_name} | {lat},{lon} | Rota: {'Aktif' if route_polyline else 'Pasif'}")
     
@@ -542,9 +552,9 @@ async def get_poi_blacklist(session_id: str = "default") -> str:
 @mcp.tool()
 async def build_route_summary(
     route_data: str,
-    radar_data: str = "",
-    toll_data: str = "",
-    weather_data: str = ""
+    radar_data: Optional[str] = None,
+    toll_data: Optional[str] = None,
+    weather_data: Optional[str] = None
 ) -> str:
     """
     ROTA ÖZET KARTI: Rota hesaplandıktan sonra mesafe, süre, radar sayısı,
@@ -605,15 +615,15 @@ async def update_vehicle_profile(
     username: str = "test_pilot"
 ) -> str:
     """
-    ARAÇ PROFİLİ GÜNCELLEME: Kullanıcının araç bilgilerini (marka, model, yıl, tüketim) veritabanında günceller.
-    Kullanıcı 'Aracımı şu marka yap' veya 'Tüketimi güncelle' dediğinde bunu kullan.
+    Updates user vehicle profile (brand, model, year, fuel consumption).
+    Use when user says 'update my car' or 'change fuel type'.
     """
     try:
-        from orchestrator.profile_manager import ProfileManager
-        result = await ProfileManager.update_vehicle_profile(
-            brand, model, year, city_consumption, highway_consumption, fuel_type, username
-        )
-        return json.dumps({"status": "success", "message": result}, ensure_ascii=False)
+        # Route to orchestrator via the standard MCP flow
+        return json.dumps({
+            "status": "error",
+            "message": "Vehicle profile update must be called through the orchestrator local tools, not mcp_city."
+        }, ensure_ascii=False)
     except Exception as e:
         return handle_critical_error(e, "update_vehicle_profile")
 
