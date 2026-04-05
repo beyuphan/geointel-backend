@@ -11,11 +11,17 @@ class SportsScraper:
             "https://www.tff.org/default.aspx?pageID=142"
         ]
         self.base_url = "https://www.tff.org/"
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        }
 
     async def get_matches(self):
         log.info("⚽ [SPOR-INTEL] TFF Ligleri Taranıyor...")
         all_matches = []
         
+        today = datetime.now().date()
+        tomorrow = today + timedelta(days=1)
+
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
             context = await browser.new_context(user_agent="Mozilla/5.0...")
@@ -47,7 +53,6 @@ class SportsScraper:
                         try:
                             if not link.startswith("http"): link = self.base_url + link
                             
-                            # Yeni sekme açmadan aynı page üzerinde gidebiliriz, daha hızlı olur
                             await page.goto(link, wait_until="domcontentloaded", timeout=15000)
                             
                             match_data = await page.evaluate("""() => {

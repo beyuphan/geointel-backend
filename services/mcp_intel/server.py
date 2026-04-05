@@ -14,6 +14,8 @@ from tools.pharmacy import get_pharmacies_handler
 from tools.events import get_events_handler
 from tools.sports import get_matches_handler
 
+from safe_tools import safe_tool
+
 # Yeni Modellerimiz
 from tools.models import IntelResponse, FuelPrice, Pharmacy, Event, Match
 
@@ -64,15 +66,14 @@ def create_response(data_list, model_class) -> str:
 # --- TOOL TANIMLARI (HİBRİT MOD + JSON ÇIKIŞ) ---
 
 @mcp.tool()
+@safe_tool(fallback_message="Pharmacy data unavailable.")
 async def get_pharmacies(city: str, district: str = "") -> str:
     """
-    Belirtilen şehir ve ilçedeki nöbetçi eczaneleri bulur.
-    
+    Finds on-duty pharmacies in the specified city/district.
+
     Args:
-        city (str): Şehir adı (Örn: 'Samsun', 'Istanbul').
-        district (str): İlçe adı (Örn: 'Atakum', 'Kadikoy').
-    Returns:
-        JSON string formatında eczane listesi.
+        city: City name (e.g. 'Samsun', 'Istanbul').
+        district: District name (e.g. 'Atakum', 'Kadikoy').
     """
     logger.info(f"💊 [REQ] Eczane: {city}/{district}")
     
@@ -117,14 +118,15 @@ async def get_pharmacies(city: str, district: str = "") -> str:
     return create_response(live_data, Pharmacy) # Hata mesajını basar
 
 @mcp.tool()
+@safe_tool(fallback_message="Fuel price data unavailable.")
 async def get_fuel_prices(city: str, district: str) -> str:
     """
-    Güncel akaryakıt (Benzin, Motorin, LPG) fiyatlarını getirir.
-    En ucuz istasyonları bulmak için kullanılır.
-    
+    Returns current fuel prices (gasoline, diesel, LPG) for a city/district.
+    Use to find cheapest nearby fuel stations.
+
     Args:
-        city (str): Şehir adı.
-        district (str): İlçe adı.
+        city: City name.
+        district: District name.
     """
     logger.info(f"⛽ [REQ] Yakıt: {city}/{district}")
     
@@ -165,10 +167,10 @@ async def get_fuel_prices(city: str, district: str) -> str:
 @mcp.tool()
 async def get_city_events(city: str) -> str:
     """
-    Şehirdeki yaklaşan konser, tiyatro ve sanat etkinliklerini listeler.
-    
+    Lists upcoming concerts, theater and cultural events in a city.
+
     Args:
-        city (str): Etkinliklerin aranacağı şehir.
+        city: City name to search events for.
     """
     logger.info(f"🎭 [REQ] Etkinlik: {city}")
     
@@ -187,8 +189,8 @@ async def get_city_events(city: str) -> str:
 @mcp.tool()
 async def get_sports_events() -> str:
     """
-    Yaklaşan futbol maçlarını, stadyum ve saat bilgilerini getirir.
-    Trafik yoğunluğunu tahmin etmek veya maç programını öğrenmek için kullanılır.
+    Returns upcoming football matches with stadium and time info.
+    Use to anticipate traffic congestion around stadiums.
     """
     logger.info(f"⚽ [REQ] Maç Fikstürü")
     

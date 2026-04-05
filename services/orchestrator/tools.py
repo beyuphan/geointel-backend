@@ -15,5 +15,21 @@ MANUAL_TOOLS = [
             },
             "required": ["category", "value"]
         }
+    },
+    {
+        "name": "evaluate_route_strategy",
+        "description": "Kullanıcı uzun yola gideceğini ve yakıt alacağını söylediğinde TEK SEFERDE rotayı çizer, istasyonları bulur ve en ucuz yakıt fiyatlarını analiz eder.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "origin": {"type": "string", "description": "Başlangıç noktası (Örn: Rize)"},
+                "destination": {"type": "string", "description": "Varış noktası (Örn: İstanbul)"},
+                "fuel_type": {"type": "string", "description": "Yakıt tipi, varsayılan: benzin"}
+            },
+            "required": ["origin", "destination"]
+        }
     }
 ]
+
+# main.py bu isimle import ediyor
+LOCAL_TOOLS = MANUAL_TOOLS

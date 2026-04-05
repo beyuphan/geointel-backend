@@ -44,9 +44,11 @@ async def get_radars_on_route_handler(route_polyline: str) -> dict:
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
+            # HERE Traffic API v7: bbox sorgusu için locationReferencing=shape zorunlu
             params = {
                 "apiKey": settings.HERE_API_KEY,
                 "in": f"bbox:{min_lon},{min_lat},{max_lon},{max_lat}",
+                "locationReferencing": "shape",
                 "incidentType": "SAFETY_CAMERA,SPEED_LIMIT_ENFORCEMENT",
                 "lang": "tr",
             }
@@ -55,9 +57,9 @@ async def get_radars_on_route_handler(route_polyline: str) -> dict:
             resp = await client.get(HERE_TRAFFIC_URL, params=params)
 
             if resp.status_code != 200:
-                # HERE Traffic API yanıt vermezse genel trafik incidents dene
-                logger.warning(f"⚠️ [HERE Radar] Safety camera endpoint döndü: {resp.status_code}. Genel incidents deneniyor...")
-                params["incidentType"] = "ROAD_CLOSED,CONSTRUCTION,HAZARDOUS_CONDITION"
+                # Kamera endpoint'i başarısız, genel trafik olaylarını dene
+                logger.warning(f"⚠️ [HERE Radar] Kamera endpoint {resp.status_code}. Genel incidents deneniyor...")
+                params["incidentType"] = "ROAD_CLOSED,CONSTRUCTION,HAZARDOUS_CONDITION,ACCIDENT"
                 resp = await client.get(HERE_TRAFFIC_URL, params=params)
 
             if resp.status_code != 200:

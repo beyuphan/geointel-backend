@@ -1,5 +1,6 @@
 # services/mcp_city/config.py
 from pydantic_settings import BaseSettings
+import httpx
 
 class Settings(BaseSettings):
     # --- API ANAHTARLARI (Otomatik .env'den okur) ---
@@ -40,3 +41,12 @@ class Settings(BaseSettings):
         extra = "ignore" # .env içinde fazladan bişey varsa patlama
 
 settings = Settings()
+
+# V3: Shared HTTP Client — TCP connection pooling, DNS caching, TLS reuse
+# Tüm handler'lar bu client'ı kullanacak (her çağrıda yeni client açmak yerine)
+http_client = httpx.AsyncClient(
+    timeout=httpx.Timeout(30.0, connect=10.0),
+    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    headers={"User-Agent": "GeoIntel_City/3.0"},
+    follow_redirects=True
+)

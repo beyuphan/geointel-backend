@@ -13,3 +13,5 @@ shapely>=2.1.0
 redis>=4.5.0
 pyproj>=3.6.0
 google-generativeai>=0.1.0
+sqlmodel>=0.0.16
+pgvector>=0.2.5

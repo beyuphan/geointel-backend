@@ -1,7 +1,9 @@
 services:
-  # 1. VERİTABANI (POSTGIS)
+  # 1. VERİTABANI (POSTGIS + PGROUTING + PGVECTOR)
   postgres_postgis:
-    image: pgrouting/pgrouting:15-3.5-3.7
+    build:
+      context: ./infra/postgres
+      dockerfile: Dockerfile
     container_name: geo_db
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
@@ -73,7 +75,6 @@ services:
       - geo_net
     volumes:
       - ./services/mcp_city:/app
-      - ./services/orchestrator:/app/orchestrator  # Orchestrator koduna erişim için
 
   # 5. UYDU AJANI (MCP SATELLITE - İleride kodlayacağız)
   mcp_satellite:
@@ -99,8 +100,12 @@ services:
     container_name: geo_mcp_intel
     ports:
       - "8001:8001" # Dışarıdan test etmek istersen diye
+    environment:
+      - PYTHONPATH=/app
     networks:
       - geo_net
+    volumes:
+      - ./services/mcp_intel:/app
 
 
   # 6. arayüz AJANI

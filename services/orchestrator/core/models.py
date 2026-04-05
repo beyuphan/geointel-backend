@@ -1,0 +1,21 @@
+import operator
+from typing import Literal, List, Dict, Any, Union, Annotated, TypedDict, Optional
+from pydantic import BaseModel, create_model, Field
+
+class IntentAnalysis(BaseModel):
+    category: Literal["fuel", "pharmacy", "event", "routing", "city_data", "general"] = Field(
+        description="Kullanıcının isteğinin ana kategorisi"
+    )
+    urgency: bool = Field(description="İşlem acil mi?")
+    focus_points: List[str] = Field(description="Anahtar kelimeler")
+    complexity: Literal["low", "high"] = Field(
+        description="Basit bilgi çekme ve arama (Örn: Eczane nerede, fiyatlar nedir) için 'low'. "
+                    "Çoklu adım, analiz, rota kıyaslaması ve çevresel faktör sentezi için 'high'."
+    )
+
+class AgentState(TypedDict):
+    messages: Annotated[List[Any], operator.add]
+    intent: Dict[str, Any]
+    retry_count: int
+    session_id: str 
+    visual_data: Dict[str, Any]

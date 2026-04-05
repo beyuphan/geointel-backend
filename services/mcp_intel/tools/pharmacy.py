@@ -7,6 +7,9 @@ from loguru import logger as log
 class PharmacyScraper:
     def __init__(self):
         self.base_url = "https://www.eczaneler.gen.tr/nobetci-{}"
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        }
 
     def _slugify(self, text: str) -> str:
         """Türkçe karakterleri URL dostu hale getirir."""
@@ -59,7 +62,7 @@ class PharmacyScraper:
                     log.warning(f"⚠️ [DOM] Tablo bulunamadı! Sayfa yapısı değişmiş olabilir.")
                     return []
 
-                # JS Parsing
+                # JS Parsing (Restore deep parsing)
                 all_pharmacies = await page.evaluate("""() => {
                     const results = [];
                     let rows = document.querySelectorAll('div.tab-pane.active tbody tr');
