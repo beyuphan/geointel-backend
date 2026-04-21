@@ -57,17 +57,24 @@ def get_pool() -> asyncpg.Pool:
 # EMBEDDING
 # ---------------------------------------------------------------------------
 
-async def _get_embedding(text: str) -> list[float]:
-    """Gemini API kullanarak metin için embedding oluşturur."""
-    try:
-        response = generate_embeddings(
-            model="models/text-embedding-004",
-            content=text,
-        )
-        return response["embedding"]
-    except Exception as e:
-        log.error(f"Embedding API Hatası: {e}")
-        return []
+async def _get_embedding(text: str, max_retries: int = 2) -> list[float]:
+    """Gemini API kullanar ile embedding oluşturur. Rate limit retry destekli."""
+    import asyncio
+    for attempt in range(max_retries + 1):
+        try:
+            response = generate_embeddings(
+                model="models/text-embedding-004",
+                content=text,
+            )
+            return response["embedding"]
+        except Exception as e:
+            if attempt < max_retries and ("429" in str(e) or "rate" in str(e).lower()):
+                wait = (attempt + 1) * 2
+                log.warning(f"[Embedding] Rate limit, {wait}s bekleniyor... (deneme {attempt + 1})")
+                await asyncio.sleep(wait)
+                continue
+            log.error(f"Embedding API Hatası: {e}")
+            return []
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +97,12 @@ async def save_poi_with_embedding(
             query = """
             INSERT INTO poi_embeddings (name, description, category, location, geom, embedding)
             VALUES ($1, $2, $3, $4, ST_SetSRID(ST_MakePoint($6, $5), 4326), $7::vector)
-            ON CONFLICT DO NOTHING
+            ON CONFLICT (name) DO UPDATE SET
+                description = EXCLUDED.description,
+                category = EXCLUDED.category,
+                location = EXCLUDED.location,
+                geom = EXCLUDED.geom,
+                embedding = EXCLUDED.embedding
             """
             await conn.execute(query, name, description, category, location_str, lat, lon, vector_str)
         return f"✅ POI & Embedding Kaydedildi: {name}"
@@ -146,7 +158,7 @@ async def search_spatial_rag(
                 "category": r["category"],
                 "location": r["location"],
                 "distance_meters": round(r["distance_meters"], 1),
-                "semantic_score": round(1 - r["semantic_distance"], 4),  # 1=mükemmel eşleşme
+                "semantic_score": round(max(0.0, 1.0 - r["semantic_distance"]), 4),  # Clamp to [0,1]
             }
             for r in records
         ]

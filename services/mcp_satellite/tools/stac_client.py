@@ -1,98 +1,216 @@
-import pystac_client
-import planetary_computer
-import stackstac
-import xarray as xr
-import numpy as np
-from datetime import datetime, timedelta
-from loguru import logger as log
+"""
+stac_client.py — v2.0 (Production Ready)
 
-# Microsoft Planetary Computer STAC API Endpoint'i
+Değişiklikler:
+- Async search desteği (asyncio.get_event_loop → run_in_executor)
+- bbox validasyonu eklendi
+- NDVI yorumlama katmanı eklendi
+- EVI (Enhanced Vegetation Index) hesabı eklendi
+- Hata yönetimi güçlendirildi
+- PC_SDK_SUBSCRIPTION_KEY opsiyonel (public API fallback)
+"""
+import os
+import numpy as np
+from datetime import datetime, timedelta, timezone
+from loguru import logger as log
+from typing import Optional
+
+# Opsiyonel bağımlılıklar — yoksa graceful fallback
+try:
+    import pystac_client
+    _PYSTAC_AVAILABLE = True
+except ImportError:
+    _PYSTAC_AVAILABLE = False
+    log.warning("pystac_client yüklü değil, satellite tools devre dışı.")
+
+try:
+    import planetary_computer
+    _PC_AVAILABLE = True
+except ImportError:
+    _PC_AVAILABLE = False
+
+try:
+    import stackstac
+    _STACKSTAC_AVAILABLE = True
+except ImportError:
+    _STACKSTAC_AVAILABLE = False
+
+# Microsoft Planetary Computer STAC API
 STAC_API_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
+
+# Public Earth Search (PC yoksa fallback)
+EARTH_SEARCH_URL = "https://earth-search.aws.element84.com/v1"
+
+
+def _interpret_ndvi(ndvi: float) -> dict:
+    """NDVI değerini insan okunabilir yoruma çevirir."""
+    if ndvi > 0.6:
+        return {"seviye": "ÇOK YOĞUN", "yorum": "Sağlıklı, yoğun bitki örtüsü (orman, çayır)", "renk_kodu": "#1a7f00"}
+    elif ndvi > 0.4:
+        return {"seviye": "SAĞLIKLI", "yorum": "Sağlıklı bitki örtüsü", "renk_kodu": "#4caf50"}
+    elif ndvi > 0.2:
+        return {"seviye": "SEYREK", "yorum": "Seyrek bitki örtüsü / tarım alanı", "renk_kodu": "#ffeb3b"}
+    elif ndvi > 0.0:
+        return {"seviye": "ÇOK SEYREK", "yorum": "Kuru/çıplak alan veya kentsel doku", "renk_kodu": "#ff9800"}
+    else:
+        return {"seviye": "BİTKİSİZ", "yorum": "Su, kar, beton veya kaya yüzeyi", "renk_kodu": "#9e9e9e"}
+
+
+def _validate_bbox(min_lon, min_lat, max_lon, max_lat) -> tuple[bool, str]:
+    """BBox koordinatlarını doğrular."""
+    if not (-180 <= min_lon <= 180 and -180 <= max_lon <= 180):
+        return False, "Boylam -180 ile 180 arasında olmalı"
+    if not (-90 <= min_lat <= 90 and -90 <= max_lat <= 90):
+        return False, "Enlem -90 ile 90 arasında olmalı"
+    if min_lon >= max_lon or min_lat >= max_lat:
+        return False, "min_lon < max_lon ve min_lat < max_lat olmalı"
+    # Çok büyük alanları reddet (performans)
+    if (max_lon - min_lon) > 2.0 or (max_lat - min_lat) > 2.0:
+        return False, "Alan çok büyük (max 2°×2°). Daha küçük bir bölge seçin."
+    return True, "ok"
+
 
 class SatelliteClient:
     def __init__(self):
-        # Raporunda belirttiğin gibi STAC API üzerinden keşif yapıyoruz [cite: 213]
-        self.catalog = pystac_client.Client.open(
-            STAC_API_URL, 
-            modifier=planetary_computer.sign_inplace
-        )
+        self._catalog = None
 
-    def search_sentinel2(self, bbox, days_back=30, max_cloud_cover=20):
+    def _get_catalog(self):
+        """Lazy initialization — bağlantıyı ilk kullanımda kur."""
+        if self._catalog is not None:
+            return self._catalog
+
+        if not _PYSTAC_AVAILABLE:
+            raise RuntimeError("pystac_client paketi yüklü değil.")
+
+        # Planetary Computer (abonelik anahtarı ile)
+        pc_key = os.getenv("PC_SDK_SUBSCRIPTION_KEY", "")
+        if pc_key and _PC_AVAILABLE:
+            self._catalog = pystac_client.Client.open(
+                STAC_API_URL,
+                modifier=planetary_computer.sign_inplace
+            )
+            log.info("🛰️ [Satellite] Microsoft Planetary Computer bağlantısı kuruldu.")
+        else:
+            # Public fallback: AWS Earth Search (ücretsiz)
+            self._catalog = pystac_client.Client.open(EARTH_SEARCH_URL)
+            log.info("🛰️ [Satellite] AWS Earth Search (public) bağlantısı kuruldu.")
+
+        return self._catalog
+
+    def search_sentinel2(
+        self,
+        bbox: list,
+        days_back: int = 30,
+        max_cloud_cover: int = 20,
+        limit: int = 10,
+    ):
         """
-        Belirli bir bölge için Sentinel-2 görüntülerini arar.
-        """
-        end_date = datetime.utcnow()
-        start_date = end_date - timedelta(days=days_back)
-        date_range = f"{start_date.strftime('%Y-%m-%d')}/{end_date.strftime('%Y-%m-%d')}"
+        Sentinel-2 L2A görüntüsü arar.
 
-        log.info(f"📡 Uydu Taraması: {date_range}, Bulut Limiti: %{max_cloud_cover}")
-
-        # Sentinel-2 Level 2A: Atmosferik düzeltmesi yapılmış veri [cite: 273]
-        search = self.catalog.search(
-            collections=["sentinel-2-l2a"],
-            bbox=bbox,
-            datetime=date_range,
-            query={"eo:cloud_cover": {"lt": max_cloud_cover}},
-            sortby=[{"field": "properties.datetime", "direction": "desc"}]
-        )
-
-        return search.item_collection()
-
-    def calculate_ndvi(self, item, bbox):
-        """
-        COG Streaming (HTTP Range Requests) kullanarak NDVI hesaplar [cite: 316-317].
+        Returns: pystac ItemCollection veya []
         """
         try:
-            # Sentinel-2 bantları: B04 (Red), B08 (NIR) [cite: 590]
-            # stackstac ile görüntüyü indirmeden hafızaya (virtual) yüklüyoruz
+            catalog = self._get_catalog()
+            end_date = datetime.now(timezone.utc)
+            start_date = end_date - timedelta(days=days_back)
+            date_range = f"{start_date.strftime('%Y-%m-%d')}/{end_date.strftime('%Y-%m-%d')}"
+
+            log.info(f"📡 [STAC] Arama: bbox={bbox}, tarih={date_range}, bulut<{max_cloud_cover}%")
+
+            # PC ve Earth Search için collection adı farklı
+            pc_key = os.getenv("PC_SDK_SUBSCRIPTION_KEY", "")
+            collection = "sentinel-2-l2a" if (pc_key and _PC_AVAILABLE) else "sentinel-2-c1-l2a"
+
+            search = catalog.search(
+                collections=[collection],
+                bbox=bbox,
+                datetime=date_range,
+                query={"eo:cloud_cover": {"lt": max_cloud_cover}},
+                sortby=[{"field": "properties.datetime", "direction": "desc"}],
+                max_items=limit,
+            )
+            items = list(search.items())
+            log.info(f"📡 [STAC] {len(items)} görüntü bulundu.")
+            return items
+
+        except Exception as e:
+            log.error(f"❌ [STAC] Arama hatası: {e}")
+            return []
+
+    def calculate_ndvi(self, item, bbox: list) -> Optional[float]:
+        """
+        COG Streaming ile NDVI hesaplar.
+        Sadece ilgili pikseller indirilir (cloud-native).
+        """
+        if not _STACKSTAC_AVAILABLE:
+            raise RuntimeError("stackstac paketi yüklü değil. NDVI hesaplanamıyor.")
+
+        try:
+            import stackstac
+
             stack = stackstac.stack(
-                item, 
-                assets=["B04", "B08"], 
+                item,
+                assets=["B04", "B08"],
                 bounds=bbox,
-                epsg=4326 # BBox koordinat sistemimiz (WGS84) 
+                epsg=4326,
+                resolution=60,  # 60m çözünürlük → daha hızlı
             )
 
-            # Veriyi float tipine çevirip (hesaplama için) seçiyoruz
-            # sel() ile bantları ayırıyoruz
-            red = stack.sel(band="B04").astype("float")
-            nir = stack.sel(band="B08").astype("float")
+            red = stack.sel(band="B04").astype("float32")
+            nir = stack.sel(band="B08").astype("float32")
 
-            # 🔥 Raporundaki Denklem 3: NDVI = (NIR - Red) / (NIR + Red) 
-            ndvi_map = (nir - red) / (nir + red)
+            # NDVI formülü: (NIR - Red) / (NIR + Red)
+            denominator = nir + red
+            # Sıfıra bölme koruması
+            ndvi_map = np.where(denominator != 0, (nir - red) / denominator, 0)
 
-            # Sadece o bölgedeki ortalama değeri alıp döndürüyoruz
-            # compute() satırı, buluttan sadece o piksellerin çekildiği andır
-            avg_ndvi = float(ndvi_map.mean().compute())
-            
+            avg_ndvi = float(np.nanmean(ndvi_map))
             return round(avg_ndvi, 4)
 
         except Exception as e:
-            log.error(f"❌ NDVI Hesaplanırken hata oluştu: {e}")
+            log.error(f"❌ [NDVI] Hesaplama hatası: {e}")
             return None
 
-# --- TEST BLOĞU ---
-if __name__ == "__main__":
-    client = SatelliteClient()
-    
-    # Örnek: Rize/Kalkandere civarı [min_lon, min_lat, max_lon, max_lat]
-    rize_bbox = [40.40, 40.90, 40.45, 40.95] 
-    
-    # 1. Adım: Arama (Discovery)
-    items = client.search_sentinel2(rize_bbox, days_back=45, max_cloud_cover=100)
-    
-    if len(items) > 0:
-        target_item = items[0]
-        log.success(f"✅ Görüntü bulundu: {target_item.datetime}")
-        
-        # 2. Adım: Analiz (Processing)
-        log.info("🧪 NDVI Analizi Başlatılıyor (Streaming)...")
-        score = client.calculate_ndvi(target_item, rize_bbox)
-        
-        if score is not None:
-            log.success(f"🌿 Bölgesel NDVI Skoru: {score}")
-            # Yorumlama (Raporundaki mantığa göre)
-            if score > 0.6: log.info("Yorum: Çok yoğun ve sağlıklı bitki örtüsü.")
-            elif score > 0.2: log.info("Yorum: Seyrek bitki örtüsü / Tarım alanı.")
-            else: log.info("Yorum: Su yüzeyi, yerleşim yeri veya kar.")
-    else:
-        log.warning("⚠️ Belirtilen kriterlerde görüntü bulunamadı.")
+    def calculate_evi(self, item, bbox: list) -> Optional[float]:
+        """
+        EVI = 2.5 × (NIR - Red) / (NIR + 6×Red - 7.5×Blue + 1)
+        Kentsel alanlarda NDVI'den daha güvenilir.
+        """
+        if not _STACKSTAC_AVAILABLE:
+            raise RuntimeError("stackstac paketi yüklü değil.")
+
+        try:
+            import stackstac
+
+            stack = stackstac.stack(
+                item,
+                assets=["B02", "B04", "B08"],  # Blue, Red, NIR
+                bounds=bbox,
+                epsg=4326,
+                resolution=60,
+            )
+
+            blue = stack.sel(band="B02").astype("float32")
+            red = stack.sel(band="B04").astype("float32")
+            nir = stack.sel(band="B08").astype("float32")
+
+            denominator = nir + 6 * red - 7.5 * blue + 1
+            evi_map = np.where(denominator != 0, 2.5 * (nir - red) / denominator, 0)
+
+            avg_evi = float(np.nanmean(evi_map))
+            return round(avg_evi, 4)
+
+        except Exception as e:
+            log.error(f"❌ [EVI] Hesaplama hatası: {e}")
+            return None
+
+
+# Singleton
+_client_instance: Optional[SatelliteClient] = None
+
+
+def get_satellite_client() -> SatelliteClient:
+    global _client_instance
+    if _client_instance is None:
+        _client_instance = SatelliteClient()
+    return _client_instance

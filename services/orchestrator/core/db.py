@@ -4,6 +4,8 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import Column
 import os
+from datetime import datetime, timezone
+from typing import Optional
 
 # We extract the db connection logic to here
 DB_DSN = os.getenv("DATABASE_URL", "postgresql+asyncpg://user:password@geo_db:5432/geodb")
@@ -25,6 +27,8 @@ class User(SQLModel, table=True):
     __tablename__ = "users"
     id: uuid.UUID | None = Field(default_factory=uuid.uuid4, primary_key=True)
     username: str = Field(unique=True, index=True)
+    password_hash: Optional[str] = None
+    created_at: Optional[datetime] = Field(default_factory=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 class UserVehicle(SQLModel, table=True):
     __tablename__ = "user_vehicles"
@@ -45,6 +49,7 @@ class SavedLocation(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     user_id: uuid.UUID = Field(foreign_key="users.id", index=True)
     name: str
+    address: str | None = None
     coordinates: str
     category: str | None = None
 
@@ -63,8 +68,7 @@ class RouteHistory(SQLModel, table=True):
     destination: str
     distance_km: float
     duration_min: float
-    # We will use string for now to match the existing schema, or timestamp
-    created_at: str | None = None # Simplified
+    created_at: datetime | None = Field(default_factory=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 class POIEmbedding(SQLModel, table=True):
     __tablename__ = "poi_embeddings"

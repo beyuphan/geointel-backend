@@ -1,42 +1,34 @@
 """
-routes.py — v2.0 (Mobil'e Hazır API)
+routes.py — v3.0 (Mobil API + Geriye Uyumlu)
 
-Yeni endpoint'ler:
-- POST /location/update  → Arka plan konum güncellemesi
-- WS   /ws/chat/{id}    → Streaming WebSocket chat
-- POST /chat            → Geliştirilmiş response şeması (action_cards, metadata)
+Endpoint'ler:
+- POST /chat            → Eski format (geriye uyumluluk)
+- POST /api/v1/chat     → Yeni standart envelope (mobil app)
+- POST /location/update → Eski konum güncelleme
+- POST /api/v1/location/update → Yeni konum güncelleme (auth'lu)
+- WS   /ws/chat/{id}    → Streaming WebSocket
+- GET  /health          → Sağlık kontrolü
 """
 import json
 import asyncio
 import time
 from typing import Optional
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.graph import StateGraph, END
 from logger import log
 from core.graph import intent_node, agent_node, custom_tool_node, should_continue, AgentState
 from core.mcp_client import orchestrator
+from api.schemas import (
+    ApiResponse as ApiEnvelope, ApiError, ApiMetadata,
+    ChatResponse, MapData, MapMarker, ActionCard,
+    ChatRequest as ChatRequestV1, LocationUpdateRequest as LocUpdateV1,
+)
+from api.deps import get_current_user, get_optional_user
 
 router = APIRouter()
 
-
-# ---------------------------------------------------------------------------
-# REQUEST / RESPONSE SCHEMAS
-# ---------------------------------------------------------------------------
-
-class ChatRequest(BaseModel):
-    session_id: str = "default_session"
-    message: str
-    current_lat: Optional[float] = None   # Anlık konum (frontend/mobile'dan gelir)
-    current_lon: Optional[float] = None
-    fcm_token: Optional[str] = None       # Firebase push token
-
-
-class LocationUpdateRequest(BaseModel):
-    session_id: str
-    lat: float
-    lon: float
 
 
 # ---------------------------------------------------------------------------
@@ -108,86 +100,49 @@ def _save_history(session_id: str, user_msg: str, assistant_msg: str):
 # ---------------------------------------------------------------------------
 
 @router.post("/chat")
-async def chat_endpoint(request: ChatRequest):
+async def chat_endpoint(request: ChatRequestV1):
     """
-    Ana chat endpoint'i. Mobil uygulama bu endpoint'i kullanır.
-    Response'da action_cards ve metadata alanları eklendi.
+    Eski chat endpoint'i (geriye uyumluluk).
+    Yeni mobil app /api/v1/chat kullanmalı.
     """
     t_start = time.monotonic()
     log.info(f"📩 [Request] Session: {request.session_id} | Msg: {request.message[:40]}...")
 
-    # Anlık konumu Redis'e kaydet
-    if orchestrator.redis_client and request.current_lat and request.current_lon:
-        loc_str = f"{request.current_lat},{request.current_lon}"
-        orchestrator.redis_client.setex(f"loc:{request.session_id}", 3600, loc_str)
-        log.info(f"📍 [CurrentLoc] Kaydedildi → {loc_str}")
+    result = await _run_chat(
+        message=request.message,
+        session_id=request.session_id,
+        current_lat=request.current_lat,
+        current_lon=request.current_lon,
+        fcm_token=request.fcm_token,
+    )
 
-    # FCM token kaydet
-    if orchestrator.redis_client and request.fcm_token:
-        orchestrator.redis_client.setex(f"fcm:{request.session_id}", 86400 * 30, request.fcm_token)
-
-    # Geçmişi oku + yeni mesajı ekle
-    history = _load_history(request.session_id)
-    history.append(HumanMessage(content=request.message))
-
-    # LangGraph çalıştır
-    executor = _build_workflow()
-    final_state = await executor.ainvoke({
-        "messages": history,
-        "intent": {},
-        "retry_count": 0,
-        "session_id": request.session_id,
-        "visual_data": {"markers": [], "polyline": None, "geojson_layers": []},
-    })
-
-    # Yanıt metni çıkar
-    raw = final_state["messages"][-1].content
-    if isinstance(raw, list):
-        response_text = "".join(b.get("text", "") for b in raw if isinstance(b, dict) and "text" in b)
-    else:
-        response_text = str(raw)
-
-    # Geçmişi kaydet
-    _save_history(request.session_id, request.message, response_text)
-
-    # Son polyline'ı Redis'ten al
-    route_polyline = None
-    if orchestrator.redis_client:
-        val = orchestrator.redis_client.get(f"route:{request.session_id}")
-        route_polyline = val.decode("utf-8") if isinstance(val, bytes) else val
-
-    visual_data = final_state.get("visual_data", {})
     elapsed_ms = int((time.monotonic() - t_start) * 1000)
 
-    # Kullanılan model adını belirle
-    intent = final_state.get("intent", {})
-    model_used = "claude" if intent.get("complexity") == "high" else "gemini"
-
     return {
-        "response": response_text,
+        "response": result["response_text"],
         "session_id": request.session_id,
-        "visual_data": visual_data,
-        "route_polyline": route_polyline,
-        # 📱 Mobil için yeni alanlar
-        "action_cards": _build_action_cards(response_text, visual_data),
+        "visual_data": result["visual_data"],
+        "route_polyline": result["route_polyline"],
+        "action_cards": result["action_cards"],
         "metadata": {
-            "model_used": model_used,
+            "model_used": result["model_used"],
             "response_time_ms": elapsed_ms,
-            "tool_calls_count": final_state.get("retry_count", 0),
+            "tool_calls_count": result.get("retry_count", 0),
         },
     }
 
 
 @router.post("/location/update")
-async def update_location(req: LocationUpdateRequest):
+async def update_location(req: LocUpdateV1):
     """
     Mobil uygulama arka planda çalışırken konumu günceller.
     Her /chat isteğinde göndermek yerine bu endpoint kullanılabilir.
     """
+    session_id = req.session_id or "default_session"
     if orchestrator.redis_client:
         loc_str = f"{req.lat},{req.lon}"
-        orchestrator.redis_client.setex(f"loc:{req.session_id}", 3600, loc_str)
-        log.info(f"📍 [LocationUpdate] Session: {req.session_id} → {loc_str}")
+        orchestrator.redis_client.setex(f"loc:{session_id}", 3600, loc_str)
+        log.info(f"📍 [LocationUpdate] Session: {session_id} → {loc_str}")
         return {"status": "ok", "location": loc_str}
     return {"status": "error", "message": "Redis unavailable"}
 
@@ -301,3 +256,169 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
             await websocket.send_json({"type": "error", "message": str(e)})
         except Exception:
             pass
+
+
+# ===========================================================================
+# V1 API — STANDART ENVELOPE (MOBİL APP)
+# ===========================================================================
+
+
+async def _run_chat(message: str, session_id: str, current_lat=None, current_lon=None, fcm_token=None):
+    """Ortak chat işleme mantığı. Hem eski hem yeni endpoint kullanır."""
+    # Anlık konumu Redis'e kaydet
+    if orchestrator.redis_client and current_lat and current_lon:
+        loc_str = f"{current_lat},{current_lon}"
+        orchestrator.redis_client.setex(f"loc:{session_id}", 3600, loc_str)
+
+    # FCM token kaydet
+    if orchestrator.redis_client and fcm_token:
+        orchestrator.redis_client.setex(f"fcm:{session_id}", 86400 * 30, fcm_token)
+
+    # Geçmişi oku + yeni mesajı ekle
+    history = _load_history(session_id)
+    history.append(HumanMessage(content=message))
+
+    # LangGraph çalıştır
+    executor = _build_workflow()
+    final_state = await executor.ainvoke({
+        "messages": history,
+        "intent": {},
+        "retry_count": 0,
+        "session_id": session_id,
+        "visual_data": {"markers": [], "polyline": None, "geojson_layers": []},
+    })
+
+    # Yanıt metni çıkar
+    raw = final_state["messages"][-1].content
+    if isinstance(raw, list):
+        response_text = "".join(b.get("text", "") for b in raw if isinstance(b, dict) and "text" in b)
+    else:
+        response_text = str(raw)
+
+    # Geçmişi kaydet
+    _save_history(session_id, message, response_text)
+
+    # Son polyline'ı Redis'ten al
+    route_polyline = None
+    if orchestrator.redis_client:
+        val = orchestrator.redis_client.get(f"route:{session_id}")
+        route_polyline = val.decode("utf-8") if isinstance(val, bytes) else val
+
+    visual_data = final_state.get("visual_data", {})
+    intent = final_state.get("intent", {})
+    model_used = "claude" if intent.get("complexity") == "high" else "gemini"
+    action_cards = _build_action_cards(response_text, visual_data)
+
+    return {
+        "response_text": response_text,
+        "visual_data": visual_data,
+        "route_polyline": route_polyline,
+        "intent": intent,
+        "model_used": model_used,
+        "action_cards": action_cards,
+        "retry_count": final_state.get("retry_count", 0),
+    }
+
+
+@router.post("/api/v1/chat", response_model=ApiEnvelope, tags=["Chat v1"])
+async def chat_v1(request: ChatRequestV1, user: dict = Depends(get_optional_user)):
+    """
+    📱 Mobil API chat endpoint'i.
+    Standart ApiResponse envelope ile döner.
+    Auth opsiyonel — token varsa user context kullanılır.
+    """
+    t_start = time.monotonic()
+    session_id = request.session_id
+
+    # Auth'lu kullanıcı varsa session_id'yi user-scoped yap
+    if user:
+        session_id = f"{user['user_id']}:{request.session_id}"
+
+    log.info(f"📩 [v1/Chat] Session: {session_id} | Msg: {request.message[:40]}...")
+
+    try:
+        result = await _run_chat(
+            message=request.message,
+            session_id=session_id,
+            current_lat=request.current_lat,
+            current_lon=request.current_lon,
+            fcm_token=request.fcm_token,
+        )
+
+        elapsed_ms = int((time.monotonic() - t_start) * 1000)
+
+        # Marker'ları MapMarker formatına çevir
+        raw_markers = result["visual_data"].get("markers", [])
+        markers = []
+        for m in raw_markers:
+            if isinstance(m, dict) and "lat" in m:
+                markers.append(MapMarker(
+                    lat=m["lat"], lon=m.get("lon", m.get("lng", 0)),
+                    title=m.get("title", m.get("name")),
+                    type=m.get("type"),
+                    icon=m.get("icon"),
+                ))
+
+        # Action cardsı ActionCard formatına
+        cards = []
+        for i, c in enumerate(result["action_cards"]):
+            cards.append(ActionCard(
+                id=c.get("action", f"action_{i}"),
+                label=c["label"],
+                action=c["action"],
+                icon=c.get("icon", ""),
+                style="primary" if i == 0 else "secondary",
+            ))
+
+        polyline = result["route_polyline"] or result["visual_data"].get("polyline")
+
+        return ApiEnvelope(
+            success=True,
+            data=ChatResponse(
+                message=result["response_text"],
+                intent=result["intent"],
+                map=MapData(
+                    markers=markers,
+                    polyline=polyline,
+                    geojson_layers=result["visual_data"].get("geojson_layers", []),
+                ),
+                action_cards=cards,
+                model_used=result["model_used"],
+            ).model_dump(),
+            metadata=ApiMetadata(
+                response_time_ms=elapsed_ms,
+                session_id=session_id,
+            ),
+        )
+
+    except Exception as e:
+        log.error(f"🔥 [v1/Chat] Hata: {e}")
+        elapsed_ms = int((time.monotonic() - t_start) * 1000)
+        return ApiEnvelope(
+            success=False,
+            error=ApiError(code="CHAT_ERROR", message=str(e)),
+            metadata=ApiMetadata(response_time_ms=elapsed_ms, session_id=session_id),
+        )
+
+
+@router.post("/api/v1/location/update", response_model=ApiEnvelope, tags=["Location v1"])
+async def update_location_v1(req: LocUpdateV1, user: dict = Depends(get_current_user)):
+    """📱 Auth'lu konum güncelleme."""
+    t_start = time.monotonic()
+    session_id = req.session_id or f"{user['user_id']}:default"
+
+    if orchestrator.redis_client:
+        loc_str = f"{req.lat},{req.lon}"
+        orchestrator.redis_client.setex(f"loc:{session_id}", 3600, loc_str)
+        log.info(f"📍 [v1/Location] {user['username']} → {loc_str}")
+        return ApiEnvelope(
+            success=True,
+            data={"location": loc_str, "session_id": session_id},
+            metadata=ApiMetadata(response_time_ms=int((time.monotonic() - t_start) * 1000)),
+        )
+
+    return ApiEnvelope(
+        success=False,
+        error=ApiError(code="REDIS_UNAVAILABLE", message="Konum kaydedilemedi."),
+        metadata=ApiMetadata(response_time_ms=int((time.monotonic() - t_start) * 1000)),
+    )

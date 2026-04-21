@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timezone, timedelta
 from loguru import logger
 from sqlmodel import select, update, delete
 from core.db import async_session_maker, User, UserVehicle, SavedLocation, UserPreference, RouteHistory
@@ -156,33 +157,55 @@ class ProfileManager:
             return f"Hata oluştu: {e}"
 
     @staticmethod
-    async def save_route_history(origin: str, destination: str, distance_km: float, duration_min: float, username: str = "test_pilot"):
-        """Rota geçmişini ORM üzerinden kaydeder. Limit (24 saat duplicate logic) basit string kontrolü veya count ile yapılabilir."""
+    async def save_route_history(
+        origin: str,
+        destination: str,
+        distance_km: float,
+        duration_min: float,
+        username: str = "test_pilot",
+    ):
+        """Rota geçmişini kaydeder. 24 saat içinde aynı rota tekrar kaydedilmez."""
         try:
             async with async_session_maker() as session:
                 result = await session.execute(select(User).where(User.username == username))
                 user = result.scalars().first()
-                if not user: return
+                if not user:
+                    return
 
-                from datetime import datetime
-                # Basic check, just get latest route for this origin-dest
-                stmt = select(RouteHistory).where(RouteHistory.user_id == user.id, RouteHistory.origin == origin, RouteHistory.destination == destination).order_by(RouteHistory.id.desc())
-                result = await session.execute(stmt)
-                last_route = result.scalars().first()
-                
-                if last_route:
-                    # Let's just bypass 24 hours strict check for simplicity in the ORM refactor right now or we can implement it
-                    logger.info("⏭️ [RouteHistory] Aynı rota zaten geçmişte görünüyor, atlandı (basit kontrol).")
+                # 24 saatlik pencerede aynı rota var mı?
+                # Asyncpg timezone information ile doğrudan kıyaslama yapmayı bekler, string atarsak patlar.
+                cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=24)
+
+                stmt = (
+                    select(RouteHistory)
+                    .where(
+                        RouteHistory.user_id == user.id,
+                        RouteHistory.origin == origin,
+                        RouteHistory.destination == destination,
+                        RouteHistory.created_at >= cutoff,
+                    )
+                    .limit(1)
+                )
+                existing = (await session.execute(stmt)).scalars().first()
+
+                if existing:
+                    logger.info(
+                        f"⏭️ [RouteHistory] 24h içinde aynı rota zaten var, atlandı: "
+                        f"{origin} → {destination}"
+                    )
                     return
 
                 new_route = RouteHistory(
-                    user_id=user.id, origin=origin, destination=destination,
-                    distance_km=distance_km, duration_min=duration_min,
-                    created_at=datetime.utcnow()  # datetime objesi — str değil!
+                    user_id=user.id,
+                    origin=origin,
+                    destination=destination,
+                    distance_km=distance_km,
+                    duration_min=duration_min,
+                    created_at=datetime.now(timezone.utc).replace(tzinfo=None),
                 )
                 session.add(new_route)
                 await session.commit()
-                logger.success(f"✅ [RouteHistory] Rota kaydedildi: {origin} -> {destination}")
+                logger.success(f"✅ [RouteHistory] Rota kaydedildi: {origin} → {destination}")
         except Exception as e:
             logger.warning(f"⚠️ [RouteHistory] Kayıt başarısız: {e}")
 

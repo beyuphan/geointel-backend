@@ -2,7 +2,7 @@
 local_routing.py — v2.0
 
 Değişiklikler:
-- asyncpg.connect() → pool.acquire() (Connection Pool entegrasyonu)
+- Connection Pool entegrasyonu (get_pool() ile)
 - rain_factor parametresi eklendi — C_edge = L_edge × (1 + rain_factor × 0.3)
 """
 import json

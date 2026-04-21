@@ -6,28 +6,59 @@ from logger import log
 from .geometry import sample_route_points 
 
 
-async def get_weather_simple(client, lat, lon):
-    """Tekil nokta için hızlı sorgu (Batch işlemde kullanacağız)"""
+async def _get_forecast_at_eta(client, lat: float, lon: float, eta_minutes: float) -> dict | None:
+    """
+    ETA dakikasına en yakın hava tahminini döner.
+    OpenWeatherMap /forecast → 3 saatlik dilimler, 5 gün.
+    """
     try:
+        # /forecast endpoint'i (onecall değil)
+        forecast_url = "https://api.openweathermap.org/data/2.5/forecast"
         params = {
-            "lat": lat, "lon": lon, 
-            "appid": settings.OPENWEATHER_API_KEY, 
+            "lat": lat, "lon": lon,
+            "appid": settings.OPENWEATHER_API_KEY,
             "units": "metric",
-            "exclude": "minutely,hourly,daily,alerts" # Sadece anlık yeterli
+            "cnt": 16,   # max 48 saat (16 x 3h)
         }
-        resp = await client.get(settings.OPENWEATHER_URL, params=params)
-        return resp.json()
-    except:
+        resp = await client.get(forecast_url, params=params)
+        data = resp.json()
+
+        forecast_list = data.get("list", [])
+        if not forecast_list:
+            return None
+
+        # ETA'yı UTC timestamp'e çevir
+        now_ts = datetime.now(timezone.utc).timestamp()
+        target_ts = now_ts + (eta_minutes * 60)
+
+        # En yakın forecast dilimini sec
+        best = min(forecast_list, key=lambda f: abs(f["dt"] - target_ts))
+        return best
+
+    except Exception as e:
+        log.warning(f"⚠️ [ForecastETA] lat={lat:.3f} lon={lon:.3f}: {e}")
         return None
 
-async def analyze_route_weather_handler(polyline: str) -> dict:
+async def analyze_route_weather_handler(
+    polyline: str,
+    avg_speed_kmh: float = 80.0,
+    departure_minutes_from_now: float = 0.0,
+) -> dict:
     """
-    WEATHER SHIELD: Rota boyunca hava durumunu tarar ve risk raporu oluşturur.
+    WEATHER SHIELD v2 — ETA-Adjusted Forecast.
+
+    Her waypoint için tahmini varış süresi hesaplanır ve o ana ait
+    forecast verisi çekilir. "320. km'de yağmur var" = gerçekten
+    o noktaya vardığındaki hava tahmindir, şu anki değil.
+
+    Args:
+        polyline: Rota polyline'i
+        avg_speed_kmh: Ortalama hız (varsayılan 80 km/h)
+        departure_minutes_from_now: Kaç dakika sonra yola çıkılacak
     """
     if not polyline:
         return {"error": "Rota verisi (polyline) eksik."}
 
-    # 1. Rotayı 40km'lik parçalara böl
     checkpoints = sample_route_points(polyline, interval_km=40)
     if not checkpoints:
         return {"error": "Rota geometrisi çözülemedi."}
@@ -36,61 +67,69 @@ async def analyze_route_weather_handler(polyline: str) -> dict:
 
     risks = []
     summary = []
-    
-    # 2. Paralel İstek At (Batch Request — V3: shared http_client)
-    tasks = [get_weather_simple(http_client, p["lat"], p["lon"]) for p in checkpoints]
-    results = await asyncio.gather(*tasks)
 
-    # 3. Analiz ve Süzgeç
-    for point, weather_data in zip(checkpoints, results):
-        if not weather_data or "current" not in weather_data: continue
+    async with httpx.AsyncClient(timeout=10) as client:
+        tasks = []
+        for point in checkpoints:
+            eta_min = departure_minutes_from_now + (point["km_point"] / avg_speed_kmh) * 60
+            tasks.append(_get_forecast_at_eta(client, point["lat"], point["lon"], eta_min))
+        results = await asyncio.gather(*tasks)
 
-        current = weather_data["current"]
-        temp = current.get("temp")
-        condition = current.get("weather", [{}])[0].get("main", "") # Rain, Snow, Clear
-        desc = current.get("weather", [{}])[0].get("description", "")
-        
-        # Risk Tespiti (LLM için bayraklar)
-        is_risky = False
+    for point, forecast in zip(checkpoints, results):
+        if not forecast:
+            continue
+
+        km = point["km_point"]
+        eta_min = departure_minutes_from_now + (km / avg_speed_kmh) * 60
+        eta_dt  = datetime.now(timezone.utc) + timedelta(minutes=eta_min)
+        eta_str = eta_dt.strftime("%H:%M")
+
+        main_weather = forecast.get("weather", [{}])[0]
+        condition    = main_weather.get("main", "")
+        desc         = main_weather.get("description", "")
+        temp         = forecast.get("main", {}).get("temp")
+        wind         = forecast.get("wind", {}).get("speed", 0)
+
+        is_risky   = False
         risk_emoji = "🌤️"
-        
+
         if condition in ["Rain", "Drizzle", "Thunderstorm"]:
-            is_risky = True
-            risk_emoji = "🌧️"
-        elif condition in ["Snow"]:
-            is_risky = True
-            risk_emoji = "❄️"
+            is_risky, risk_emoji = True, "🌧️"
+        elif condition == "Snow":
+            is_risky, risk_emoji = True, "❄️"
         elif condition in ["Fog", "Mist"]:
-            is_risky = True
-            risk_emoji = "🌫️"
-        elif temp < 2: # Buzlanma riski
-            is_risky = True
-            risk_emoji = "🧊"
-        
-        # Sadece riskli durumları veya başlangıç/bitiş noktalarını rapora ekle
-        # (Nokta sayısı 0 ise Başlangıç, -1 ise Bitiş)
-        if is_risky or point["km_point"] == 0 or point == checkpoints[-1]:
+            is_risky, risk_emoji = True, "🌫️"
+        elif temp is not None and temp < 2:
+            is_risky, risk_emoji = True, "🧈"
+
+        if is_risky or km == 0 or point == checkpoints[-1]:
             summary.append({
-                "km": f"{point['km_point']}. km",
-                "durum": f"{risk_emoji} {desc.title()}",
-                "sicaklik": f"{temp}°C",
-                "riskli_mi": is_risky
+                "km":            f"{km}. km",
+                "tahmini_saat":  eta_str,   # Kullanicinin o noktada olacagi saat
+                "durum":         f"{risk_emoji} {desc.title()}",
+                "sicaklik":      f"{temp}°C" if temp is not None else "?",
+                "ruzgar":        f"{wind} m/s",
+                "riskli_mi":     is_risky,
             })
-            
             if is_risky:
-                risks.append(f"{point['km_point']}. km civarında {desc} ({temp}°C)")
+                risks.append(f"{km}. km (~{eta_str}'de) {risk_emoji} {desc} ({temp}°C)")
 
-    # 4. Final Rapor
-    shield_report = {
+    return {
         "tarama_noktasi_sayisi": len(checkpoints),
-        "risk_durumu": "YÜKSEK" if len(risks) > 0 else "TEMİZ",
+        "ortalama_hiz_kmh":      avg_speed_kmh,
+        "risk_durumu":           "YÜKSEK" if risks else "TEMİZ",
+        "not": (
+            "Hava uyarıları o noktaya tahmini varış saatine göre hesaplanmıştır "
+            "(şu anki değil, o saatteki tahmin)."
+        ),
         "riskli_bolgeler": risks,
-        "detayli_ozet": summary,
-        "tavsiye": "Güzergah temiz görünüyor, iyi yolculuklar." if not risks else "Dikkat! Rotada kritik hava değişimleri var."
+        "detayli_ozet":    summary,
+        "tavsiye": (
+            "Güzergah temiz görünüyor, iyi yolculuklar."
+            if not risks else
+            "Dikkat! Rotada kritik hava değişimleri var."
+        ),
     }
-    
-    return shield_report
-
 
 
 async def get_weather_handler(lat: float, lon: float) -> dict:

@@ -14,15 +14,23 @@ async def search_infrastructure_osm_handler(lat: float, lon: float, category: Op
         
         # Pydantic validasyonu
         req = OSMRequest(lat=lat, lon=lon, category=actual_category, radius=radius)
-        
-        tag = req.category.strip().lower()
+        raw_tag = req.category.strip().lower()
+        tag_map = {
+            "restoran": "restaurant", "lokanta": "restaurant", "yemek": "restaurant", "food": "restaurant",
+            "kafe": "cafe", "kahve": "cafe", "kahvaltı": "cafe",
+            "döner": "fast_food", "büfe": "fast_food", "hamburger": "fast_food",
+            "benzin": "fuel", "yakıt": "fuel", "istasyon": "fuel", "benzinlik": "fuel",
+            "eczane": "pharmacy", "ilaç": "pharmacy",
+            "avm": "mall", "market": "supermarket"
+        }
+        tag = tag_map.get(raw_tag, raw_tag)
         search_radius = 50000 if "airport" in tag else req.radius
 
         # --- OPTİMİZE SORGUSU ---
-        # Timeout süresini 45 saniyeye çıkardık.
+        # Timeout süresini kıstık.
         # Çok ağır olmaması için en kritik katmanları bıraktık.
         query = f"""
-        [out:json][timeout:45];
+        [out:json][timeout:8];
         (
           nwr["amenity"="{tag}"](around:{search_radius},{req.lat},{req.lon});
           nwr["shop"="{tag}"](around:{search_radius},{req.lat},{req.lon});
@@ -34,7 +42,8 @@ async def search_infrastructure_osm_handler(lat: float, lon: float, category: Op
         out center 10;
         """
 
-        async with httpx.AsyncClient(timeout=60.0) as client: # Client timeout sunucudan uzun olmalı
+        # Client timeout: 8 saniye (ayna başına maksimum)
+        async with httpx.AsyncClient(timeout=8.0) as client:
             last_error = None
             
             # Header ekleyelim ki bot sanıp engellemesinler
@@ -42,7 +51,7 @@ async def search_infrastructure_osm_handler(lat: float, lon: float, category: Op
 
             for url in settings.OVERPASS_URLS:
                 try:
-                    log.info(f"🌍 [OSM] Deneniyor: {url} | Tag: {tag}")
+                    log.info(f"🌍 [OSM] Deneniyor: {url} | Tag Çevrildi: {raw_tag} -> {tag}")
                     
                     # --- FIX: data= yerine content= kullanıyoruz (Deprecation Fix) ---
                     resp = await client.post(url, content=query, headers=headers)
@@ -57,8 +66,8 @@ async def search_infrastructure_osm_handler(lat: float, lon: float, category: Op
                         elements = data.get("elements", [])
                         
                         if not elements:
-                            log.warning(f"⚠️ [OSM] Sonuç boş döndü ({url}) - Diğerleri deneniyor...")
-                            continue 
+                            log.warning(f"⚠️ [OSM] Sonuç boş döndü ({url}) - Gerçek boş sonuç, çıkılıyor.")
+                            break 
                         
                         places = []
                         for el in elements:

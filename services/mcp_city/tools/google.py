@@ -48,9 +48,12 @@ async def search_places_google_handler(query: str, lat: float = None, lon: float
                      (points[-1]['lat'], points[-1]['lon'])
                  ]
     
-    if not locations_to_search and lat and lon:
-         locations_to_search = [(lat, lon)]
-    elif not locations_to_search:
+    # Eğer LLM spesifik bir lat/lon hedefi verdiyse, rota olsa dahi O hedefi muhakkak aramaya ekle
+    if lat and lon and lat != 0.0 and lon != 0.0:
+        if (lat, lon) not in locations_to_search:
+             locations_to_search.insert(0, (lat, lon))
+
+    if not locations_to_search:
          locations_to_search = [(None, None)]
 
     async with httpx.AsyncClient() as client:
@@ -60,7 +63,8 @@ async def search_places_google_handler(query: str, lat: float = None, lon: float
             all_raw_results = []
             seen_place_ids = set()
             
-            # API İstekleri
+            # API İstekleri - PARALEL ÇALIŞTIR! (Timeout önlemek için)
+            tasks = []
             for s_lat, s_lon in locations_to_search:
                 params = {
                     "query": query,
@@ -71,15 +75,28 @@ async def search_places_google_handler(query: str, lat: float = None, lon: float
                     params["location"] = f"{s_lat},{s_lon}"
                     params["radius"] = "50000" # 50km tarama alanı
                     
-                resp = await client.get(url, params=params, timeout=15.0)
-                data = resp.json()
-                
-                if data.get("status") == "OK":
-                    for place in data.get("results", []):
-                        pid = place.get("place_id") or place.get("name")
-                        if pid not in seen_place_ids:
-                            seen_place_ids.add(pid)
-                            all_raw_results.append(place)
+                tasks.append(client.get(url, params=params, timeout=15.0))
+            
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for resp in responses:
+                if isinstance(resp, Exception):
+                    logger.warning(f"⚠️ [Google API] Bir istek zaman aşımına uğradı veya hata verdi: {resp}")
+                    continue
+                try:
+                    data = resp.json()
+                    if data.get("status") == "OK":
+                        for place in data.get("results", []):
+                            pid = place.get("place_id") or place.get("name")
+                            if pid not in seen_place_ids:
+                                seen_place_ids.add(pid)
+                                all_raw_results.append(place)
+                    elif data.get("status") in ["REQUEST_DENIED", "OVER_QUERY_LIMIT"]:
+                        logger.error(f"❌ [Google API] Kritik Hata: API reddetti ({data.get('status')}): {data.get('error_message')}")
+                        return {"error": f"Google API Hatası: {data.get('status')} - {data.get('error_message')}"}
+                except Exception as e:
+                    logger.warning(f"⚠️ [Google API] JSON Pars/İstek hatası: {e}")
+                    continue
                      
             if not all_raw_results:
                  return {"strict_route_places": [], "relaxed_route_places": []}
@@ -159,10 +176,13 @@ async def search_places_google_handler(query: str, lat: float = None, lon: float
             on_route_list.sort(key=lambda x: x.get('score', 0), reverse=True)
             detour_list.sort(key=lambda x: x.get('score', 0), reverse=True)
 
+            # Rota pasifse (şehir araması) LLM'e daha bol veri (15) sun, rota aktifse 5 ile sınırla (token tasarrufu)
+            limit = 5 if should_calc_distance else 15
+            
             result = {
                 "route_status": "active" if should_calc_distance else "inactive",
-                "strict_route_places": on_route_list[:5], # En iyi 5 yol üstü
-                "relaxed_route_places": detour_list[:5]   # En iyi 5 sapma
+                "strict_route_places": on_route_list[:limit], 
+                "relaxed_route_places": detour_list[:limit]   
             }
             
             # 3. Sonucu 12 saatliğine (43200 saniye) cache'le

@@ -208,26 +208,38 @@ async def get_weather(lat: float, lon: float) -> str:
 # --- 5. ROTA HAVA DURUMU (WHEATHER SHIELD) ---
 @mcp.tool()
 @safe_tool(fallback_message="Route weather analysis failed.")
-async def analyze_route_weather(polyline: str) -> str:
+async def analyze_route_weather(
+    polyline: str,
+    avg_speed_kmh: Optional[float] = 80.0,
+    departure_minutes_from_now: Optional[float] = 0.0,
+) -> str:
     """
-    Analyzes weather risks (rain, snow, ice) along a route at 40km intervals.
-    Returns risk level, risk zones, and driving advice.
+    Analyzes weather risks (rain, snow, ice) along a route at 40km intervals based on estimated time of arrival (ETA).
+    Returns risk level, ETA-adjusted risk zones, and conditions.
     Use 'LATEST' for active route polyline.
+    You can tune avg_speed_kmh and departure_minutes_from_now if the user specifies them.
     """
     try:
-        logger.info("🛠️ [Tool: Weather Shield] Analiz başlatılıyor...")
-        result = await analyze_route_weather_handler(polyline)
+        speed = avg_speed_kmh if avg_speed_kmh is not None else 80.0
+        departure = departure_minutes_from_now if departure_minutes_from_now is not None else 0.0
+        logger.info(f"🛠️ [Tool: Weather Shield] Analiz başlatılıyor... (Hız: {speed}km/h, Kalkış: +{departure}dk)")
+        result = await analyze_route_weather_handler(
+            polyline,
+            avg_speed_kmh=speed,
+            departure_minutes_from_now=departure
+        )
         
         if isinstance(result, dict) and "error" in result:
             return ErrorResponse(message=result["error"]).model_dump_json()
 
         logger.success("✅ [Tool: Weather Shield] Analiz tamamlandı.")
         
-        # TOKEN OPTIMIZATION: LLM'e sadece özeti gönder, tüm koordinat dizisi gereksiz bağlam yaratır.
+        # Token optimisation logic — include ETA hour details so LLM can advise correctly
         summary_result = {
             "tarama_noktasi_sayisi": result.get("tarama_noktasi_sayisi", 0),
             "risk_durumu": result.get("risk_durumu", "BİLİNMİYOR"),
             "riskli_bolgeler": result.get("riskli_bolgeler", []),
+            "detayli_ozet": result.get("detayli_ozet", []), # ETA saatleri burada
             "tavsiye": result.get("tavsiye", "")
         }
         return json.dumps(summary_result, ensure_ascii=False)
@@ -462,9 +474,10 @@ async def search_hybrid_places(query: str, location_name: Optional[str] = None, 
         # Kesin koordinat varsa normal OSM füzyonu devam eder...
         # 3. OSM'den Fiziksel (Bina/Altyapı) Verisini Çek
         osm_raw = await search_infrastructure_osm_handler(lat, lon, category)
-        osm_places = osm_raw if isinstance(osm_raw, list) and len(osm_raw) > 0 and "error" not in osm_raw[0] else []
+        osm_places = osm_raw if isinstance(osm_raw, list) and len(osm_raw) > 0 and "error" not in osm_raw[0] and "warning" not in osm_raw[0] else []
 
         fused_results = []
+        matched_osm_ids = set()
         
         # 4. Çakıştırma (Füzyon) Algoritması
         for g_place in google_places:
@@ -484,7 +497,9 @@ async def search_hybrid_places(query: str, location_name: Optional[str] = None, 
             }
 
             # OSM ile 20 Metre (Sapma) Kontrolü
-            for o_place in osm_places:
+            for idx, o_place in enumerate(osm_places):
+                if idx in matched_osm_ids: continue
+                
                 o_lat, o_lon = float(o_place.get("lat", 0)), float(o_place.get("lon", 0))
                 distance = calculate_distance_meters(g_lat, g_lon, o_lat, o_lon)
                 
@@ -495,12 +510,30 @@ async def search_hybrid_places(query: str, location_name: Optional[str] = None, 
                     fused_place["lon"] = o_lon
                     fused_place["fusion_status"] = "Fused (Google+OSM)"
                     fused_place["osm_distance_shift"] = f"{distance:.1f}m"
+                    matched_osm_ids.add(idx)
                     break # Bu mekan için eşleşme tamam, diğer OSM noktalarına bakmaya gerek yok
             
             fused_results.append(fused_place)
 
+        # 5. Eşleşmeyen ve sadece OSM'de bulunan mekanları ekle (Google'da yoksa bile)
+        for idx, o_place in enumerate(osm_places):
+            if idx not in matched_osm_ids:
+                fused_results.append({
+                    "name": o_place.get("name", "Bilinmeyen Mekan"),
+                    "address": "OSM Altyapısı",
+                    "rating": 0.0,
+                    "is_open": "Bilinmiyor",
+                    "lat": float(o_place.get("lat", 0)),
+                    "lon": float(o_place.get("lon", 0)),
+                    "fusion_status": "OSM Only"
+                })
+
         logger.success(f"✅ [Tool: Hybrid Fusion] {len(fused_results)} nesne oluşturuldu.")
-        return json.dumps(fused_results, ensure_ascii=False)
+        return json.dumps({
+            "places": fused_results,
+            "count": len(fused_results),
+            "data_source": "Google + OSM Fusion"
+        }, ensure_ascii=False)
 
     except Exception as e:
         logger.error(f"🔥 [Tool: Hybrid Fusion] Kritik Hata: {e}")
