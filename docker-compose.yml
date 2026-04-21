@@ -22,7 +22,7 @@ services:
       timeout: 5s
       retries: 5
 
-  # 2. ÖNBELLEK (REDIS)
+  # 2. ONBELLEK (REDIS)
   redis_cache:
     image: redis:alpine
     container_name: geo_redis
@@ -30,6 +30,11 @@ services:
       - "6379:6379"
     networks:
       - geo_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   # 3. BEYİN (ORCHESTRATOR - LANGGRAPH)
   orchestrator:
@@ -42,10 +47,12 @@ services:
     environment:
       - MCP_CITY_URL=http://mcp_city:8000
       - MCP_INTEL_URL=http://mcp_intel:8001
+      - MCP_SATELLITE_URL=http://mcp_satellite:8002
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-      - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY} # Rota çizmek için gerekebilir
+      - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
       - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_postgis:5432/${POSTGRES_DB}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
     depends_on:
       postgres_postgis:
         condition: service_healthy
@@ -71,42 +78,54 @@ services:
     depends_on:
       postgres_postgis:
         condition: service_healthy
+      redis_cache:
+        condition: service_healthy
     networks:
       - geo_net
     volumes:
       - ./services/mcp_city:/app
 
-  # 5. UYDU AJANI (MCP SATELLITE - İleride kodlayacağız)
+  # 5. UYDU AJANI (MCP SATELLITE)
   mcp_satellite:
-    build: 
+    build:
       context: ./services/mcp_satellite
       dockerfile: Dockerfile
     container_name: geo_mcp_satellite
     ports:
-      - "8002:8002" # Dışarıdan erişim (Debug için)
+      - "8002:8002"
     environment:
-      # Microsoft Planetary Computer için (Gerekirse)
-      - PC_SDK_SUBSCRIPTION_KEY=${PC_SDK_SUBSCRIPTION_KEY} 
+      - PC_SDK_SUBSCRIPTION_KEY=${PC_SDK_SUBSCRIPTION_KEY}
+      - REDIS_HOST=geo_redis
+    depends_on:
+      redis_cache:
+        condition: service_healthy
     networks:
       - geo_net
     volumes:
       - ./services/mcp_satellite:/app
 
-  # 6. İSTİHBARAT AJANI (MCP INTEL)
+  # 6. ISTIHBARAT AJANI (MCP INTEL)
   mcp_intel:
-    build: 
+    build:
       context: ./services/mcp_intel
       dockerfile: Dockerfile
     container_name: geo_mcp_intel
     ports:
-      - "8001:8001" # Dışarıdan test etmek istersen diye
+      - "8001:8001"
     environment:
       - PYTHONPATH=/app
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_postgis:5432/${POSTGRES_DB}
+      - REDIS_HOST=geo_redis
+      - REDIS_PORT=6379
+    depends_on:
+      postgres_postgis:
+        condition: service_healthy
+      redis_cache:
+        condition: service_healthy
     networks:
       - geo_net
     volumes:
       - ./services/mcp_intel:/app
-
 
   # 6. arayüz AJANI
   geo_dashboard:

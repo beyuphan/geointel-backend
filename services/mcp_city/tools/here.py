@@ -7,6 +7,7 @@ from .config import settings, http_client
 from .models import RouteRequest
 from .cache import redis_store
 from .local_routing import is_in_service_area, get_local_route
+from .weather import get_weather_handler as _get_weather
 
 
 
@@ -176,9 +177,27 @@ async def get_route_data_handler(origin: str, destination: str, waypoints: list[
         # B. HİBRİT KARAR MEKANİZMASI: İSTANBUL MU?
         if is_in_service_area(lat1, lon1) and is_in_service_area(lat2, lon2):
             log.info(f"🏙️ [GEOINTEL] Yerel Veritabanı Devrede: {origin} -> {destination}")
-            
+
+            # --- Hava durumu ile rain_factor hesapla ---
+            rain_factor = 0.0
+            try:
+                mid_lat = (lat1 + lat2) / 2
+                mid_lon = (lon1 + lon2) / 2
+                weather = await _get_weather(mid_lat, mid_lon)
+                current = weather.get("ANLIK_DURUM", {})
+                condition_raw = current.get("durum", "").lower()
+                if any(w in condition_raw for w in ["rain", "drizzle", "thunderstorm", "yağmur"]):
+                    rain_factor = 0.8
+                elif any(w in condition_raw for w in ["snow", "kar"]):
+                    rain_factor = 1.0  # Kar → max maliyet
+                elif any(w in condition_raw for w in ["fog", "mist", "sis"]):
+                    rain_factor = 0.4
+                log.info(f"🌧️ [WeatherCost] rain_factor={rain_factor} ({condition_raw})")
+            except Exception as we:
+                log.warning(f"⚠️ [WeatherCost] Hava durumu alınamadı: {we}")
+
             # PostGIS Sorgusu
-            local_result = await get_local_route(lat1, lon1, lat2, lon2, preference="fastest")
+            local_result = await get_local_route(lat1, lon1, lat2, lon2, preference="fastest", rain_factor=rain_factor)
             
             if local_result:
                 # 🔥🔥🔥 FİNAL DÜZELTME: MULTILINESTRING DESTEĞİ 🔥🔥🔥
@@ -213,19 +232,21 @@ async def get_route_data_handler(origin: str, destination: str, waypoints: list[
 
                 return {
                     "source": "GeoIntel_Local_DB",
-                    "mesafe_km": local_result["distance_km"], 
+                    "mesafe_km": local_result["distance_km"],
                     "sure_dk": local_result["duration_min"],
                     "mode": local_result["mode"],
-                    
-                    # ARTIK ŞİFRELENMİŞ STRING BURAYA GİDİYOR 👇
-                    "polyline_encoded": encoded_poly, 
-                    
-                    "geometry": local_result["geometry"], 
+                    "traffic_status": local_result.get("traffic_status"),
+                    "traffic_color": local_result.get("traffic_color"),
+                    "delay_min": local_result.get("delay_min"),
+                    "avg_speed_kmh": local_result.get("avg_speed_kmh"),
+                    "rain_factor_applied": rain_factor,
+                    "polyline_encoded": encoded_poly,
+                    "geometry": local_result["geometry"],
                     "analiz_noktalari": {
                         "baslangic": {"coords": [lat1, lon1], "ad": origin},
                         "bitis": {"coords": [lat2, lon2], "ad": destination}
                     },
-                    "not": "Bu veri İBB Canlı Trafik ve OSM verileriyle yerel sunucuda hesaplanmıştır."
+                    "not": "IBB Live Traffic + OSM local routing."
                 }
 
         # C. FALLBACK: HERE MAPS API

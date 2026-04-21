@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS city_events (
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     username VARCHAR(50) UNIQUE NOT NULL,
+    password_hash VARCHAR(255),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -99,10 +100,15 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS user_vehicles (
     id SERIAL PRIMARY KEY,
     user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-    vehicle_name VARCHAR(50), -- Örn: "Benim Kara Şimşek"
+    vehicle_name VARCHAR(50),
+    brand VARCHAR(50),
+    model VARCHAR(50),
+    year INTEGER,
+    city_consumption NUMERIC(4,1),
+    highway_consumption NUMERIC(4,1),
     fuel_type VARCHAR(20),    -- 'gasoline', 'diesel', 'lpg', 'electric'
     avg_consumption NUMERIC(4,1), -- 100km'de kaç litre? (Örn: 6.5)
-    is_primary BOOLEAN DEFAULT FALSE -- Varsayılan araç mı?
+    is_primary BOOLEAN DEFAULT FALSE
 );
 
 -- 3. Kayıtlı Konumlar (Ev, İş, Favoriler)

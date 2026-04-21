@@ -7,6 +7,9 @@ from config import settings
 from logger import log
 from core.mcp_client import orchestrator
 from api.routes import router as api_router
+from api.auth import router as auth_router
+from api.profile import router as profile_router
+from api.history import router as history_router
 
 try:
     from tools import LOCAL_TOOLS
@@ -47,13 +50,16 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["X-Session-Id"],
 )
 
-# Router
-app.include_router(api_router)
+# Routers
+app.include_router(api_router)                              # Eski: /chat, /health, /ws/chat + Yeni: /api/v1/chat
+app.include_router(auth_router, prefix="/api/v1")           # /api/v1/auth/register, /login, /refresh
+app.include_router(profile_router, prefix="/api/v1")        # /api/v1/profile, /vehicle, /locations, /preferences
+app.include_router(history_router, prefix="/api/v1")        # /api/v1/history/routes, /chat
 
 if __name__ == "__main__":
     import uvicorn

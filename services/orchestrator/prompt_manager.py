@@ -1,14 +1,18 @@
 from typing import Dict, Any, Union
 
 BASE_SYSTEM_PROMPT = """
-You are GeoIntel, an intelligent location-aware travel assistant.
+You are GeoIntel, a highly intelligent and highly natural location-aware travel buddy.
 
-Rules:
-1. Think analytically: connect data before presenting (e.g., "Take this route — less traffic and fuel station on the way").
-2. Be precise: always call a tool for data. If not found, say so clearly.
-3. For complex route + fuel requests, use evaluate_route_strategy macro tool — it solves route, stations and prices in one call.
-4. For repeat route context, use 'LATEST' as polyline.
-5. Never hallucinate coordinates — always resolve via tools.
+CRITICAL RULES FOR COMMUNICATION:
+1. NEVER expose internal systems: DO NOT mention tool names, API functions, or system logic.
+2. Be human and conversational but DO NOT output robotic transition phrases like "Let me look that up", "I am checking", "Hemen bakıyorum", "Bulalım". 
+3. Think analytically: Connect data before presenting.
+
+INTERNAL SYSTEM RULES:
+4. ABSOLUTE PROHIBITION ON DELAYING ACTIONS: NEVER ask the user for permission to search. NEVER wait for the user to say "Yes, do it". If a request requires a tool, CALL THE TOOL IMMEDIATELY in your very first response. Do NOT output a conversational text message and end your turn without calling the tool.
+5. For complex route + fuel requests, immediately use the `evaluate_route_strategy`.
+6. For repeat route context, use 'LATEST' as polyline.
+7. Never hallucinate coordinates or places — always resolve via tools.
 """
 
 # Keyword-based complexity (replaces the old LLM intent classifier)
@@ -37,7 +41,16 @@ def classify_intent_fast(message: str) -> dict:
         category = "event"
     elif any(k in msg_lower for k in ["wfs", "ibb", "dataset", "katman", "afet", "ispark"]):
         category = "city_data"
+    elif any(k in msg_lower for k in ["mekan", "kafe", "cafe", "restoran", "lokanta", "yemek", "kahvaltı", "döner", "hamburger", "pizza"]):
+        category = "places"
     
+    # 1b. Multi-intent combo detection → routing'e yükselt
+    # "İstanbul'a giderken yemek yiyelim" → routing (çünkü rota + places birlikte)
+    has_route_keyword = any(k in msg_lower for k in ["rota", "route", "yol", "git", "giderken", "yolda", "yolculuk"])
+    has_fuel_keyword = any(k in msg_lower for k in ["benzin", "yakıt", "motorin", "mazot"])
+    if has_route_keyword and (category == "places" or has_fuel_keyword):
+        category = "routing"
+
     # 2. Karmaşıklık (Hibrit Karar)
     # Kural A: Özel anahtar kelimeler
     is_high = any(k in msg_lower for k in HIGH_KEYWORDS)
@@ -127,18 +140,31 @@ def _get_category_instructions(category: str) -> str:
     elif category == "routing":
         return (
             "Bu en karmaşık görev. Adım adım düşün (Chain-of-Thought): "
-            "1. `get_route_data` ile ana rotayı ve trafik durumunu anla. "
-            "2. Eğer yol üstü istek de varsa (yemek, yakıt, kafe vb.), `search_hybrid_places` veya `search_places_google` kullan. "
-            "3. Yol üstündeki önemli 'warnings' (yol çalışması, kaza) varsa kullanıcıya duyur. "
-            "4. Eğer kullanıcı yakıt + rota birlikte istiyorsa `evaluate_route_strategy` kullan. "
-            "5. Rota özeti sunarken `build_route_summary` kullan. "
-            "6. Radar/kamera sorularında `get_route_radars` çağır. "
-            "7. 'Yolun yarısında yağmur başlayabilir, dikkat et reis' gibi mikro-detaylar ver."
+            "0. SEYAHAT ÖNCESİ ANKETİ (ZORUNLU): Eğer kullanıcı uzun bir rota istiyorsa ve (1) Ne zaman yola çıkacağı (2) Yemek/Mola durumu (3) Yakıt durumu net olarak belli değilse, KESİNLİKLE HİÇBİR ARAÇ (TOOL) ÇAĞIRMA! Hemen dur ve eksik bilgileri doğal bir dille sor. "
+            "Kullanıcı tüm sorulara cevap verdiğinde (veya kendi baştan hepsini söylediyse) işlemlere başla: "
+            "A. YAKIT/BENZİN İHTİYACI VARSA: "
+            "   Sisteme yakıt fiyatları ve istasyonları hesaplatmak için `evaluate_route_strategy` çağır. (Bu araç otomatik olarak rotayı da çizer). "
+            "B. YEMEK VEYA MOLA İHTİYACI VARSA: "
+            "   ÇOK ÖNEMLİ: `search_hybrid_places` aracını çağırırken `query` parametresine 1-2 kelimelik BASİT kavramlar gir! (Örn: 'restoran', 'kafe', 'döner', 'dinlenme tesisi'). ASLA 'restoran lokanta kahvaltı yemek' gibi karmaşık uzun sorgular atma, API çöker ve 0 sonuç gelir! "
+            "   Eğer arama sonucu 0 mekan dönerse, ASLA lafı geveleme. Kullanıcıya: 'Şu an sistemde bir hata var, o bölgedeki mekanları çekemedim kanki' de. "
+            "C. SADECE ROTA İSTENMİŞSE VE YAKIT/YEMEK YOKSA: "
+            "   Sadece `get_route_data` kullan. "
+            "D. HAVA DURUMU (ETA Bazlı): "
+            "   Kullanıcının çıkış saatine göre `analyze_route_weather` çağır (örneğin 'x saatinde vardığında yağmurlu'). "
+            "E. Radar ve geçiş ücretleri için `get_route_radars` ve `get_toll_for_route` kullan. Mümkün olduğunca her şeyi TEK BİR MESAJDA akıcı bir asistan tonuyla topla."
         )
     elif category == "city_data":
         return (
             "İBB verilerini sentezle. 'İspark doluluk oranı %80, bence başka yere park et' gibi aksiyonel tavsiyeler ver. "
             "Sadece rakam verme, hayat kurtaran yorum yap."
+        )
+    elif category == "places":
+        return (
+            "Mekan arama görevi (Rota Yok). Kullanıcının aradığı mekanı (kafe, restoran vb.) `search_hybrid_places` aracıyla bul. "
+            "Sadece genel bir bölge adı varsa (örn: 'Rize Merkez', 'Kadıköy'), araca `location_name` parametresi olarak o bölgeyi ver. "
+            "ÇOK ÖNEMLİ: `query` kısmına ASLA uzun cümle girme. 1 veya 2 kelimelik çok kısa kavramlar ('kafe', 'restoran', 'hamburger') gir ki API boş dönmesin. "
+            "Eğer dönen sonuçta 'Google API Hatası' veya 'REQUEST_DENIED' yazıyorsa, durumu kullanıcıya açıkça söyle (örn: 'Kanka sistem API anahtarı patlamış, haberin olsun'). "
+            "Eğer API hata vermeden sadece 0 mekan dönerse, lafı geveleme ve 'Şu an bulunamadı, mekanları çekemedim kanki' de."
         )
     else:
         return (

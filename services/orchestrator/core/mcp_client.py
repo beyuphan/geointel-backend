@@ -22,7 +22,9 @@ class GeoIntelOrchestrator:
         self.tool_router: Dict[str, str] = {}
         self.sessions: Dict[str, str] = {}
         self.pending_requests: Dict[str, asyncio.Future] = {}
-        self.rpc_timeout = 60.0
+        # Geointel-Backend Timeout
+        # Rize-İstanbul gibi karmaşık ve uzun menzilli aramalarda süreyi 3 dakikaya (180s) uzatıyoruz
+        self.rpc_timeout = 180.0
         self.redis_client = self._init_redis()
         
         # V2.5: Cache TTLs (seconds)
@@ -116,7 +118,10 @@ class GeoIntelOrchestrator:
 
         if "properties" in schema:
             for field_name, field_info in schema["properties"].items():
-                t_map = {"string": str, "number": float, "integer": int, "boolean": bool}
+                t_map = {
+                    "string": str, "number": float, "integer": int, "boolean": bool,
+                    "array": list, "object": dict,
+                }
                 field_type = t_map.get(field_info.get("type"), str)
                 description = field_info.get("description", "")
                 if field_name in required_fields:
@@ -162,23 +167,25 @@ class GeoIntelOrchestrator:
                 poly_param = polyline_tools[name]
                 poly_val = kwargs.get(poly_param, "")
                 poly_val_str = str(poly_val) if poly_val else ""
-                
-                # Broad safety net: check for missing strings, known proxy keywords, or implausibly short polylines
+
                 is_proxy = (
-                    not poly_val_str or 
-                    "LATEST" in poly_val_str.upper() or 
-                    "GİZLENDİ" in poly_val_str.upper() or 
-                    "HARİTA" in poly_val_str.upper() or 
-                    len(poly_val_str) < 100
+                    not poly_val_str
+                    or "LATEST" in poly_val_str.upper()
+                    or "GIZLENDI" in poly_val_str.upper()
+                    or "HARITA" in poly_val_str.upper()
+                    or len(poly_val_str) < 100
                 )
-                
+
                 if is_proxy:
-                    latest = self.redis_client.get(route_key)
-                    if latest: 
-                        kwargs[poly_param] = latest
-                        log.info(f"🔄 [Proxy] Sahte polyline algılandı ('{poly_val_str[:20]}...'), Redis'teki gerçek koordinatlarla değiştirildi.")
-                    else:
-                        log.warning(f"⚠️ [Proxy] Redis'te '{route_key}' boş ama sahte bir polyline gönderildi!")
+                    try:
+                        latest = self.redis_client.get(route_key)
+                        if latest:
+                            kwargs[poly_param] = latest
+                            log.info(f"🔄 [Proxy] Sahte polyline algılandı, Redis'ten gerçeğiyle değiştirildi.")
+                        else:
+                            log.warning(f"⚠️ [Proxy] Redis '{route_key}' boş ama sahte polyline gönderildi!")
+                    except Exception as redis_err:
+                        log.warning(f"⚠️ [Proxy] Redis okunamadı: {redis_err}")
 
             mcp_args = {k: v for k, v in kwargs.items() if k != "session_id"}
             
@@ -292,9 +299,11 @@ class GeoIntelOrchestrator:
                             asyncio.create_task(initiate_service())
                             
             except Exception as e:
-                next_backoff = min(_backoff * 2, 30)  # V3: Exponential backoff — max 30s
+                next_backoff = min(_backoff * 2, 30)
                 log.error(f"📡 [{service_name.upper()}] SSE Koptu: {e} — {_backoff}s sonra yeniden denenecek...")
                 await asyncio.sleep(_backoff)
-                asyncio.create_task(self.sse_listener_loop(service_name, base_url, next_backoff))
+                # Store task reference to prevent garbage collection
+                reconnect_task = asyncio.create_task(self.sse_listener_loop(service_name, base_url, next_backoff))
+                reconnect_task.add_done_callback(lambda t: t.exception() if not t.cancelled() and t.exception() else None)
 
 orchestrator = GeoIntelOrchestrator()

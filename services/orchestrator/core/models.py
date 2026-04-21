@@ -3,7 +3,7 @@ from typing import Literal, List, Dict, Any, Union, Annotated, TypedDict, Option
 from pydantic import BaseModel, create_model, Field
 
 class IntentAnalysis(BaseModel):
-    category: Literal["fuel", "pharmacy", "event", "routing", "city_data", "general"] = Field(
+    category: Literal["fuel", "pharmacy", "event", "routing", "city_data", "places", "general"] = Field(
         description="Kullanıcının isteğinin ana kategorisi"
     )
     urgency: bool = Field(description="İşlem acil mi?")

@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from loguru import logger
 
 # Helper & Tools
-from db_helper import DBHelper
+from db_helper import DBHelper, init_pool, close_pool
 from worker import create_scheduler
 
 # Handler'lar (Yedek Kuvvetler)
@@ -31,12 +31,16 @@ logger.add(
 # --- LIFESPAN (YAŞAM DÖNGÜSÜ) ---
 @asynccontextmanager
 async def lifespan(request: object):
+    logger.info("🕰️ [SYSTEM] DB Pool başlatılıyor...")
+    await init_pool()
     logger.info("🕰️ [SYSTEM] Scheduler Başlatılıyor...")
     scheduler = create_scheduler()
     scheduler.start()
     yield
     logger.info("🕰️ [SYSTEM] Scheduler Kapatılıyor...")
     scheduler.shutdown()
+    logger.info("🕰️ [SYSTEM] DB Pool kapatılıyor...")
+    await close_pool()
 
 # --- MCP KURULUMU ---
 mcp = FastMCP(name="Intel Agent", lifespan=lifespan)
@@ -47,7 +51,13 @@ def create_response(data_list, model_class) -> str:
     if not data_list:
         return json.dumps({"status": "error", "message": "Veri bulunamadı.", "data": []}, ensure_ascii=False)
     
-    # Eğer handler direkt hata döndüyse (dict içinde 'error' veya 'bilgi' varsa)
+    # Tekil dict gelirse listeye çevir
+    if isinstance(data_list, dict):
+        if "error" in data_list:
+            return json.dumps({"status": "error", "message": data_list["error"], "data": []}, ensure_ascii=False)
+        data_list = [data_list]
+    
+    # Liste içinde hata/bilgi dict kontrolü
     if isinstance(data_list, list) and len(data_list) > 0 and isinstance(data_list[0], dict):
         if "error" in data_list[0]:
              return json.dumps({"status": "error", "message": data_list[0]["error"], "data": []}, ensure_ascii=False)
@@ -59,7 +69,6 @@ def create_response(data_list, model_class) -> str:
         return json.dumps({"status": "success", "data": validated_data}, ensure_ascii=False)
     except Exception as e:
         logger.error(f"Validasyon Hatası: {e}")
-        # Hata olsa bile ham veriyi 'data' olarak dönelim ki sistem durmasın
         return json.dumps({"status": "partial_error", "message": str(e), "data": data_list}, ensure_ascii=False)
 
 
@@ -202,10 +211,10 @@ async def get_sports_events() -> str:
         for d in data:
             mapped.append({
                 "match": d.get("mac"),
-                "time": d.get("zaman"),
-                "stadium": d.get("stadyum"),
-                "city": d.get("sehir"),
-                "warning": d.get("uyari")
+                "time": d.get("zaman", "Tarih Bilinmiyor"),
+                "stadium": d.get("stadyum", "Bilinmiyor"),
+                "city": d.get("sehir", "Bilinmiyor"),
+                "warning": d.get("uyari", "Normal trafik seyri.")
             })
         return create_response(mapped, Match)
         

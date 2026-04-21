@@ -1,4 +1,5 @@
 import json
+import asyncio
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from logger import log
 from prompt_manager import get_dynamic_system_prompt, classify_intent_fast
@@ -24,8 +25,11 @@ async def intent_node(state: AgentState):
             intent_data["complexity"] = "high"
             intent_data["needs_deep_analysis"] = False  # LLM çağrısına gerek yok, zaten high
 
+    # Regex'ten gelen ilk tahmini sakla
+    category_from_regex = intent_data["category"]
+
     # [Model Güvenliği] Rota ve şehir verisi HER ZAMAN Claude'a — Gemini Flash başaramaz
-    ALWAYS_CLAUDE_CATEGORIES = {"routing", "city_data"}
+    ALWAYS_CLAUDE_CATEGORIES = {"routing", "city_data", "places"}
     if intent_data["category"] in ALWAYS_CLAUDE_CATEGORIES:
         intent_data["complexity"] = "high"
         log.info(f"🔒 [Model Lock] Kategori {intent_data['category'].upper()} → Claude zorunlu.")
@@ -33,8 +37,17 @@ async def intent_node(state: AgentState):
     if intent_data.get("needs_deep_analysis"):
         log.info(f"🧠 [DeepIntent] Karmaşık cümle algılandı, LLM ile analiz ediliyor...")
         model = orchestrator.llm_gemini
-        prompt = f"""Kullanıcı mesajını analiz et ve şu formatta JSON dön:
-        {{"category": "routing|fuel|pharmacy|event|city_data|general", "complexity": "high|low", "urgency": true|false, "focus_points": []}}
+        prompt = f"""Kullanıcı mesajını analiz et ve JSON dön. Format:
+        {{"category": "routing|fuel|pharmacy|event|city_data|places|general", "complexity": "high|low", "urgency": true|false, "focus_points": []}}
+        
+        Açıklamalar:
+        - routing: Rota, yol tarifi, navigasyon, mesafe, seyahat süresi ile ilgili istekler.
+        - fuel: Benzin, motorin, yakıt fiyatları, akaryakıt istasyonu aramaları.
+        - pharmacy: Nöbetçi eczane ve ilaç aramaları.
+        - event: Konser, festival, etkinlik, maç aramaları.
+        - city_data: İBB WFS verileri, İSPARK, afet toplanma gibi şehir altyapı sorguları.
+        - places: Kafe, restoran, mekan bulma veya yemek yeme ile ilgili istekler.
+        - general: Hiçbir kategoriye uymayan düz muhabbet.
         
         Mesaj: {msg}"""
         
@@ -44,6 +57,12 @@ async def intent_node(state: AgentState):
                 intent_llm = await structured_model.ainvoke(prompt)
                 intent_data = intent_llm.model_dump() if hasattr(intent_llm, "model_dump") else intent_llm
                 log.success(f"🧠 [DeepIntent] LLM Kararı: {intent_data['category'].upper()}")
+                
+                # Eğer LLM "general" dediyse ama eski Regex "places" vb dediyse, Regex haklıdır
+                if intent_data.get("category") == "general" and category_from_regex != "general":
+                     log.info(f"🛡️ [DeepIntent] LLM general dediği için Regex'in '{category_from_regex}' niyetine dönüldü.")
+                     intent_data["category"] = category_from_regex
+                
                 # LLM sonrası da kategori kilidi kontrol et
                 if intent_data.get("category") in ALWAYS_CLAUDE_CATEGORIES:
                     intent_data["complexity"] = "high"
@@ -61,38 +80,98 @@ from langgraph.graph import END
 
 async def agent_node(state: AgentState):
     from profile_manager import ProfileManager
-    # 1. Kullanıcı Profilini ve Rota Geçmişini Çek
-    active_profile = await ProfileManager.get_user_context()
-    route_history = await ProfileManager.get_route_history(limit=3)
     
-    # AKTİF ROTA KONTROLÜ (Bunu yeni ekliyoruz)
+    # Defensive: Profile loading failures must not crash the LLM pipeline
+    try:
+        active_profile = await ProfileManager.get_user_context()
+    except Exception as profile_err:
+        log.warning(f"⚠️ [agent_node] Profil yüklenemedi: {profile_err}")
+        active_profile = "Profil verisi alınamadı."
+    
+    try:
+        route_history = await ProfileManager.get_route_history(limit=3)
+    except Exception as hist_err:
+        log.warning(f"⚠️ [agent_node] Rota geçmişi alınamadı: {hist_err}")
+        route_history = []
+
+    # Active route check — safe with or without Redis
     session_id = state.get("session_id", "default_session")
-    active_route_encoded = orchestrator.redis_client.get(f"route:{session_id}")
-    has_active_route = True if active_route_encoded else False
-    
-    # Rota geçmişini ve aktif rota durumunu intent'e enjekte et
+    has_active_route = False
+    if orchestrator.redis_client:
+        try:
+            active_route_encoded = orchestrator.redis_client.get(f"route:{session_id}")
+            has_active_route = bool(active_route_encoded)
+        except Exception as redis_err:
+            log.warning(f"⚠️ [agent_node] Redis get failed: {redis_err}")
+
     intent_with_history = state["intent"].copy()
     intent_with_history["route_history"] = route_history
-    intent_with_history["has_active_route"] = has_active_route # Gemini'nin bilmesi için
-    
-    # 2. Dinamik Prompt'u Üret (Prompt Manager bu veriyi kullanacak)
+    intent_with_history["has_active_route"] = has_active_route
+
     sys_prompt = get_dynamic_system_prompt(active_profile, intent_with_history)
-    
     if has_active_route:
-        # Prompt'un sonuna küçük bir fısıltı ekleyelim
-        sys_prompt += "\n[SİSTEM BİLGİSİ: Kullanıcının şu anda haritada çizilmiş aktif bir rotası (polyline) bulunmaktadır. Eğer yol üstü mekan önerisi vs. isterse doğrudan tool'ları kullanarak veya sohbet geçmişindeki şehirlere bakarak yanıt ver.]"
+        sys_prompt += (
+            "\n[SYSTEM: User has an active route on the map. "
+            "For nearby POI/fuel requests, use LATEST polyline via tools.]"
+        )
 
     messages = [SystemMessage(content=sys_prompt)] + state["messages"]
-    
-    model = orchestrator.llm_claude if state["intent"].get("complexity") == "high" else orchestrator.llm_gemini
-    
-    m_name = getattr(model, "model_name", getattr(model, "model", "Unknown"))
-    log.info(f"🧠 [LLM Router] Session: {state.get('session_id')[-8:]} | Model: {m_name} (Karmaşıklık: {state['intent'].get('complexity')})")
-    
-    model_with_tools = model.bind_tools(orchestrator.runtime_tools)
-    response = await model_with_tools.ainvoke(messages)
-    
-    return {"messages": [response], "retry_count": 0}
+
+    is_high = state["intent"].get("complexity") == "high"
+    primary_model  = orchestrator.llm_claude if is_high else orchestrator.llm_gemini
+    fallback_model = orchestrator.llm_gemini
+
+    m_name = getattr(primary_model, "model_name", getattr(primary_model, "model", "Unknown"))
+    log.info(
+        f"🧠 [LLM Router] Session: {session_id[-8:]} | "
+        f"Model: {m_name} (complexity: {state['intent'].get('complexity')})"
+    )
+
+    # ── Retry + Gemini Fallback ────────────────────────────────────────────
+    # Claude 529 (Overloaded) → exponential backoff → Gemini fallback
+    MAX_RETRIES = 3
+    RETRY_DELAYS = [1.0, 3.0, 8.0]   # saniye
+    last_exc = None
+
+    for attempt in range(MAX_RETRIES + 1):      # 0,1,2 = retry; 3 = fallback
+        use_model = primary_model if attempt < MAX_RETRIES else fallback_model
+
+        if attempt == MAX_RETRIES:
+            fb_name = getattr(fallback_model, "model_name",
+                              getattr(fallback_model, "model", "Gemini"))
+            log.warning(
+                f"⚡ [Fallback] Claude {MAX_RETRIES} denemede yanıt vermedi → {fb_name} devreye girdi."
+            )
+
+        try:
+            model_with_tools = use_model.bind_tools(orchestrator.runtime_tools)
+            response = await model_with_tools.ainvoke(messages)
+            if attempt > 0:
+                log.success(f"✅ [Retry] Deneme {attempt + 1}'de yanıt alındı.")
+            return {"messages": [response], "retry_count": 0}
+
+        except Exception as exc:
+            last_exc = exc
+            exc_str = str(exc)
+            is_retryable = (
+                "529" in exc_str
+                or "overloaded" in exc_str.lower()
+                or "503" in exc_str
+                or "502" in exc_str
+                or "rate_limit" in exc_str.lower()
+            )
+            if is_retryable and attempt < MAX_RETRIES:
+                delay = RETRY_DELAYS[attempt]
+                log.warning(
+                    f"⏳ [Retry {attempt + 1}/{MAX_RETRIES}] "
+                    f"Claude aşırı yüklenmiş (529). {delay}s bekleyip tekrar deneniyor..."
+                )
+                await asyncio.sleep(delay)
+                continue
+            log.error(f"🔥 [LLM] Model yanıt vermedi (deneme {attempt + 1}): {exc_str[:150]}")
+            raise
+    # ────────────────────────────────────────────────────────────────
+    raise RuntimeError(f"[agent_node] Tüm denemeler başarısız: {last_exc}")
 
 def should_continue(state: AgentState) -> str:
     """
@@ -159,11 +238,19 @@ async def custom_tool_node(state: AgentState):
                 )
                 
                 if poly_str and not is_proxy_return:
-                     visual_data["polyline"] = poly_str
-                     if isinstance(poly_str, str) and len(poly_str) > 100:
-                         orchestrator.redis_client.setex(route_key, 3600, poly_str)
+                    visual_data["polyline"] = poly_str
+                    if orchestrator.redis_client and isinstance(poly_str, str) and len(poly_str) > 100:
+                        try:
+                            orchestrator.redis_client.setex(route_key, 3600, poly_str)
+                        except Exception as e:
+                            log.warning(f"[Visualizer] Redis setex failed: {e}")
                 elif poly_str and is_proxy_return:
-                    latest = orchestrator.redis_client.get(route_key)
+                    latest = None
+                    if orchestrator.redis_client:
+                        try:
+                            latest = orchestrator.redis_client.get(route_key)
+                        except Exception as e:
+                            log.warning(f"[Visualizer] Redis get failed: {e}")
                     if latest:
                         visual_data["polyline"] = latest
                         log.info("🔄 [Visualizer] Gizlenmiş polyline yakalandı, Redis'ten haritaya aktarıldı.")
