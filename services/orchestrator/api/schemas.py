@@ -41,12 +41,22 @@ class ApiResponse(BaseModel, Generic[T]):
 
 class RegisterRequest(BaseModel):
     username: str = Field(min_length=3, max_length=30, description="Kullanıcı adı")
+    email: Optional[str] = Field(default=None, description="E-posta adresi (opsiyonel)")
     password: str = Field(min_length=6, max_length=128, description="Şifre")
 
 
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str = Field(description="Kayıtlı e-posta adresi")
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(description="Şifre sıfırlama token'ı")
+    new_password: str = Field(min_length=6, max_length=128, description="Yeni şifre")
 
 
 class TokenData(BaseModel):
@@ -63,6 +73,7 @@ class RefreshRequest(BaseModel):
 class UserPublic(BaseModel):
     id: str
     username: str
+    email: Optional[str] = None
     created_at: Optional[str] = None
 
 
@@ -123,6 +134,7 @@ class ChatResponse(BaseModel):
     map: MapData = Field(default_factory=MapData)
     action_cards: list[ActionCard] = []
     model_used: Optional[str] = None
+    tools_used: list[str] = Field(default=[], description="Kullanılan MCP tool adları (context indicator)")
     fuel_data: Optional[dict] = None
     weather_warning: Optional[str] = None
 
@@ -199,7 +211,62 @@ class ChatHistoryItem(BaseModel):
     content: str
 
 
+class ChatSessionItem(BaseModel):
+    """Chat geçmişi session listesi."""
+    session_id: str
+    message_count: int
+    last_message: Optional[str] = None
+    last_activity: Optional[str] = None
+
+
 class LocationUpdateRequest(BaseModel):
     lat: float
     lon: float
     session_id: Optional[str] = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ACCOUNT MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════
+
+class AccountExportResponse(BaseModel):
+    """KVKK/GDPR uyumlu veri dışa aktarma."""
+    user: UserPublic
+    vehicle: Optional[VehicleResponse] = None
+    locations: list[LocationResponse] = []
+    preferences: list[PreferenceResponse] = []
+    route_history: list[RouteHistoryItem] = []
+    chat_sessions: list[ChatSessionItem] = []
+    exported_at: str = Field(description="ISO 8601 formatında export zamanı")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MULTI-VEHICLE
+# ═══════════════════════════════════════════════════════════════════════════
+
+class VehicleCreate(BaseModel):
+    """Yeni araç ekleme (garage)."""
+    brand: str = Field(description="Marka")
+    model: str = Field(description="Model")
+    year: int = Field(ge=1990, le=2030, description="Üretim yılı")
+    fuel_type: str = Field(description="gasoline, diesel, lpg, electric")
+    city_consumption: float = Field(ge=0, le=50, description="Şehir içi tüketim L/100km")
+    highway_consumption: float = Field(ge=0, le=50, description="Uzun yol tüketim L/100km")
+    is_primary: bool = Field(default=False, description="Ana araç mı?")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HEALTH / STATUS
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ServiceStatus(BaseModel):
+    name: str
+    status: str = "unknown"   # online, offline, degraded
+    latency_ms: Optional[int] = None
+
+
+class HealthResponse(BaseModel):
+    status: str = "ok"
+    redis: bool = False
+    services: list[ServiceStatus] = []
+    tool_count: int = 0

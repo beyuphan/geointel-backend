@@ -29,7 +29,7 @@ class GeoIntelOrchestrator:
         
         # V2.5: Cache TTLs (seconds)
         self.cache_ttls = {
-            "get_route_data": 600,          # 10 min (traffic changes)
+            "get_route_data": 120,          # 2 min (traffic changes frequently)
             "get_fuel_prices": 3600,        # 60 min
             "get_weather": 900,             # 15 min
             "get_pharmacies": 3600,         # 60 min
@@ -38,14 +38,14 @@ class GeoIntelOrchestrator:
             "get_sports_matches": 3600,     # 60 min
         }
         
-        # LLM Clients
+        # LLM Clients (V2026: Updated to latest stable models)
         self.llm_claude = ChatAnthropic(
-            model="claude-sonnet-4-5-20250929", 
-            temperature=0,
+            model="claude-sonnet-4-6", 
+            # temperature=0,  # V4.x modellerinde opsiyonel veya depreke olabilir
             api_key=settings.ANTHROPIC_API_KEY
         )
         self.llm_gemini = ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash",
+            model="gemini-3-flash-preview",
             temperature=0,
             google_api_key=settings.GOOGLE_API_KEY
         )
@@ -152,6 +152,22 @@ class GeoIntelOrchestrator:
                         destination=kwargs.get("destination"),
                         fuel_type=kwargs.get("fuel_type", "benzin")
                     )
+                if name == "plan_weather_aware_route":
+                    from core.macro_tools import ContextAwarePOIPlanner
+                    return await ContextAwarePOIPlanner(self).evaluate(
+                        current_lat=kwargs.get("current_lat"),
+                        current_lon=kwargs.get("current_lon"),
+                        location_name=kwargs.get("location_name"),
+                        semantic_query=kwargs.get("semantic_query"),
+                        search_radius=kwargs.get("search_radius", 5000)
+                    )
+                if name == "get_environmental_analysis":
+                    from core.macro_tools import EnvironmentalAnalyst
+                    return await EnvironmentalAnalyst(self).evaluate(
+                        lat=kwargs.get("lat"),
+                        lon=kwargs.get("lon"),
+                        analyze_vegetation=kwargs.get("analyze_vegetation", True)
+                    )
                 return await ProfileManager.update_memory(kwargs.get("category"), kwargs.get("value"))
 
             # Rota bazlı araçlar için Redis entegrasyonu
@@ -161,7 +177,8 @@ class GeoIntelOrchestrator:
                 "get_route_radars": "route_polyline",
                 "get_toll_for_route": "route_polyline",
                 "search_hybrid_places": "route_polyline",
-                "evaluate_route_strategy": "route_polyline" # Macro-tool eklendi
+                "evaluate_route_strategy": "route_polyline", # Macro-tool eklendi
+                "plan_weather_aware_route": "route_polyline" # Yeni Macro-tool
             }
             if name in polyline_tools and self.redis_client:
                 poly_param = polyline_tools[name]
@@ -180,6 +197,8 @@ class GeoIntelOrchestrator:
                     try:
                         latest = self.redis_client.get(route_key)
                         if latest:
+                            if isinstance(latest, bytes):
+                                latest = latest.decode('utf-8')
                             kwargs[poly_param] = latest
                             log.info(f"🔄 [Proxy] Sahte polyline algılandı, Redis'ten gerçeğiyle değiştirildi.")
                         else:

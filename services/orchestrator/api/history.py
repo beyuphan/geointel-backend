@@ -11,7 +11,7 @@ from core.db import async_session_maker, User, RouteHistory
 from core.mcp_client import orchestrator
 from api.schemas import (
     ApiResponse, ApiError, ApiMetadata,
-    RouteHistoryItem, ChatHistoryItem,
+    RouteHistoryItem, ChatHistoryItem, ChatSessionItem,
 )
 from api.deps import get_current_user
 from logger import log
@@ -175,5 +175,67 @@ async def clear_chat_history(
         return ApiResponse(
             success=False,
             error=ApiError(code="SERVER_ERROR", message="Sohbet geçmişi temizlenirken hata oluştu."),
+            metadata=ApiMetadata(response_time_ms=_elapsed(t_start)),
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CHAT SESSIONS LIST
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/sessions", response_model=ApiResponse)
+async def get_chat_sessions(
+    user: dict = Depends(get_current_user),
+):
+    """Kullanıcının tüm chat session'larını listeler."""
+    t_start = time.monotonic()
+
+    if not orchestrator.redis_client:
+        return ApiResponse(
+            success=True, data=[],
+            metadata=ApiMetadata(response_time_ms=_elapsed(t_start)),
+        )
+
+    try:
+        sessions = []
+        pattern = f"chat:{user['user_id']}:*"
+
+        for key in orchestrator.redis_client.scan_iter(pattern):
+            key_str = key.decode() if isinstance(key, bytes) else key
+            sid = key_str.split(":")[-1]
+            count = orchestrator.redis_client.llen(key_str)
+
+            # Son mesajı al
+            last_raw = orchestrator.redis_client.lindex(key_str, -1)
+            last_msg = None
+            if last_raw:
+                try:
+                    if isinstance(last_raw, bytes):
+                        last_raw = last_raw.decode("utf-8")
+                    parsed = json.loads(last_raw)
+                    last_msg = parsed.get("content", "")[:100]
+                except Exception:
+                    pass
+
+            sessions.append(ChatSessionItem(
+                session_id=sid,
+                message_count=count,
+                last_message=last_msg,
+            ).model_dump())
+
+        # En çok mesajı olan session'lar önce
+        sessions.sort(key=lambda s: s["message_count"], reverse=True)
+
+        return ApiResponse(
+            success=True,
+            data=sessions,
+            metadata=ApiMetadata(response_time_ms=_elapsed(t_start)),
+        )
+
+    except Exception as e:
+        log.error(f"❌ [History] Session listesi hatası: {e}")
+        return ApiResponse(
+            success=False,
+            error=ApiError(code="SERVER_ERROR", message="Session listesi yüklenirken hata oluştu."),
             metadata=ApiMetadata(response_time_ms=_elapsed(t_start)),
         )

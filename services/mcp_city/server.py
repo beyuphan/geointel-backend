@@ -139,7 +139,7 @@ async def search_places_google(query: str, lat: float = 0.0, lon: float = 0.0, r
 # --- 3. HERE ROTA OLUŞTURMA ---
 @mcp.tool()
 @safe_tool(fallback_message="Route calculation failed.")
-async def get_route_data(origin: str, destination: str) -> str:
+async def get_route_data(origin: str, destination: str, preference: str = "fastest") -> str:
     """
     Calculates route between two locations with real-time traffic, distance and ETA.
     Uses Istanbul local DB for city routes, HERE Maps for intercity.
@@ -147,10 +147,11 @@ async def get_route_data(origin: str, destination: str) -> str:
     Args:
         origin: Start location name or 'lat,lon' coordinates.
         destination: End location name or 'lat,lon' coordinates.
+        preference: 'fastest', 'shortest' or 'safest' (default: fastest).
     """
     try:
-        logger.info(f"🛠️ [Tool: Rota] Hesapla: {origin} -> {destination}")
-        raw_data = await get_route_data_handler(origin, destination)
+        logger.info(f"🛠️ [Tool: Rota] Hesapla: {origin} -> {destination} (Tercih: {preference})")
+        raw_data = await get_route_data_handler(origin, destination, preference=preference)
 
         if "error" in raw_data:
             return ErrorResponse(message=raw_data["error"]).model_dump_json()
@@ -438,18 +439,56 @@ async def search_hybrid_places(query: str, location_name: Optional[str] = None, 
             elif not route_polyline:
                  return json.dumps({"status": "error", "message": "Konum adı (location_name), koordinatlar (lat, lon) veya route_polyline parametrelerinden en az biri gerekli."})
 
-        # 2. Google'dan Ticari Veriyi Çek (route_polyline geçiliyorsa ETA hesabı da aktif)
-        # lat ve lon None olsa bile route_polyline varsa Google Places yine de sonuç bulabilir.
-        google_raw = await search_places_google_handler(query, lat or 0.0, lon or 0.0, route_polyline)
-        if "error" in google_raw:
-            return json.dumps({"status": "error", "message": google_raw["error"]})
-            
-        google_places = google_raw.get("strict_route_places", []) + google_raw.get("relaxed_route_places", [])
+        # 2, 3, 4. VERİ KAYNAKLARINI PARALEL ÇAĞIR (Performans Optimizasyonu)
+        semantic_keywords = ["sessiz", "huzurlu", "lüks", "manzara", "vibe", "kitap", "çalışma", "sessizlik", "konfor", "şık"]
+        is_semantic = any(k in query.lower() for k in semantic_keywords)
         
-        # Eğer kesin koordinat yoksa OSM fusion yapılamaz (Bounding box merkezsiz çizilemez), doğrudan dön!
+        tasks = [
+            search_places_google_handler(query, lat or 0.0, lon or 0.0, route_polyline),
+            search_infrastructure_osm_handler(lat, lon, category, radius=2000) if (lat and lon) else asyncio.sleep(0, result=[])
+        ]
+        if is_semantic:
+            tasks.append(search_spatial_rag(query, lat or 0.0, lon or 0.0, radius_meters=5000, limit=3))
+        
+        # Paralel yürütme
+        results = await asyncio.gather(*tasks)
+        google_raw = results[0]
+        osm_raw = results[1]
+        rag_results = results[2] if is_semantic else []
+
+        # Google Verisi İşleme
+        if isinstance(google_raw, dict) and "error" in google_raw:
+            google_places = []
+        else:
+            google_places = google_raw.get("strict_route_places", []) + google_raw.get("relaxed_route_places", [])
+        
+        # RAG Verisi İşleme
+        rag_places = []
+        for r in rag_results:
+            if isinstance(r, dict) and "error" not in r:
+                r_lat, r_lon = map(float, r["location"].split(","))
+                rag_places.append({
+                    "name": f"⭐ {r['name']}",
+                    "address": r.get("description", "Premium Seçim"),
+                    "rating": 5.0,
+                    "is_open": "Açık (Önerilen)",
+                    "lat": r_lat,
+                    "lon": r_lon,
+                    "semantic_score": r.get("semantic_score", 0.9),
+                    "fusion_status": "RAG Recommended"
+                })
+
+        # OSM Verisi İşleme
+        osm_places = osm_raw if isinstance(osm_raw, list) and len(osm_raw) > 0 and "error" not in osm_raw[0] and "warning" not in osm_raw[0] else []
+
+        # Eğer kesin koordinat yoksa (Bounding box merkezsiz çizilemez), sadece Google ve RAG sonuçlarını dön
         if not lat or not lon:
-            logger.info("ℹ️ Kesin koordinat olmadığı için OSM füzyonu atlanıyor, Google Rota araması sonuçları dönülecek.")
+            logger.info("ℹ️ Kesin koordinat olmadığı için OSM füzyonu atlanıyor, Google ve RAG sonuçları dönülecek.")
             fused_results = []
+            
+            # Smart Search (RAG) sonuçlarını ekle
+            fused_results.extend(rag_places)
+
             for g_place in google_places:
                 try:
                     g_lat, g_lon = map(float, g_place.get("coords", "0,0").split(","))
@@ -468,15 +507,14 @@ async def search_hybrid_places(query: str, location_name: Optional[str] = None, 
             return json.dumps({
                 "places": fused_results,
                 "count": len(fused_results),
-                "data_source": "Google Places API (Route Match)"
+                "data_source": "Google Places API + RAG (No OSM Fusion)"
             }, ensure_ascii=False)
 
-        # Kesin koordinat varsa normal OSM füzyonu devam eder...
-        # 3. OSM'den Fiziksel (Bina/Altyapı) Verisini Çek
-        osm_raw = await search_infrastructure_osm_handler(lat, lon, category)
-        osm_places = osm_raw if isinstance(osm_raw, list) and len(osm_raw) > 0 and "error" not in osm_raw[0] and "warning" not in osm_raw[0] else []
-
         fused_results = []
+        
+        # Smart Search (RAG) sonuçlarını başa ekle
+        fused_results.extend(rag_places)
+
         matched_osm_ids = set()
         
         # 4. Çakıştırma (Füzyon) Algoritması

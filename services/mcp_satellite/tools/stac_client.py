@@ -148,23 +148,30 @@ class SatelliteClient:
         try:
             import stackstac
 
+            # AWS vs Planetary Computer asset naming detection
+            asset_keys = list(item.assets.keys())
+            red_key = "B04" if "B04" in asset_keys else "red"
+            nir_key = "B08" if "B08" in asset_keys else "nir"
+
             stack = stackstac.stack(
-                item,
-                assets=["B04", "B08"],
+                [item],
+                assets=[red_key, nir_key],
                 bounds=bbox,
                 epsg=4326,
-                resolution=60,  # 60m çözünürlük → daha hızlı
+                resolution=60 if red_key == "B04" else 0.0006, # Deg/Pixel for WGS84
             )
 
-            red = stack.sel(band="B04").astype("float32")
-            nir = stack.sel(band="B08").astype("float32")
+            # İlk zaman adımını ve ilgili bandı seç
+            red = stack.sel(band=red_key).isel(time=0).astype("float32")
+            nir = stack.sel(band=nir_key).isel(time=0).astype("float32")
 
             # NDVI formülü: (NIR - Red) / (NIR + Red)
             denominator = nir + red
-            # Sıfıra bölme koruması
-            ndvi_map = np.where(denominator != 0, (nir - red) / denominator, 0)
-
-            avg_ndvi = float(np.nanmean(ndvi_map))
+            # Sıfıra bölme koruması ve NaN yönetimi
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ndvi_map = (nir - red) / denominator
+            
+            avg_ndvi = float(np.nanmean(ndvi_map.values))
             return round(avg_ndvi, 4)
 
         except Exception as e:
@@ -182,22 +189,28 @@ class SatelliteClient:
         try:
             import stackstac
 
+            asset_keys = list(item.assets.keys())
+            blue_key = "B02" if "B02" in asset_keys else "blue"
+            red_key = "B04" if "B04" in asset_keys else "red"
+            nir_key = "B08" if "B08" in asset_keys else "nir"
+
             stack = stackstac.stack(
-                item,
-                assets=["B02", "B04", "B08"],  # Blue, Red, NIR
+                [item],
+                assets=[blue_key, red_key, nir_key],  # Blue, Red, NIR
                 bounds=bbox,
                 epsg=4326,
-                resolution=60,
+                resolution=60 if red_key == "B04" else 0.0006,
             )
 
-            blue = stack.sel(band="B02").astype("float32")
-            red = stack.sel(band="B04").astype("float32")
-            nir = stack.sel(band="B08").astype("float32")
+            blue = stack.sel(band=blue_key).isel(time=0).astype("float32")
+            red = stack.sel(band=red_key).isel(time=0).astype("float32")
+            nir = stack.sel(band=nir_key).isel(time=0).astype("float32")
 
             denominator = nir + 6 * red - 7.5 * blue + 1
-            evi_map = np.where(denominator != 0, 2.5 * (nir - red) / denominator, 0)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                evi_map = 2.5 * (nir - red) / denominator
 
-            avg_evi = float(np.nanmean(evi_map))
+            avg_evi = float(np.nanmean(evi_map.values))
             return round(avg_evi, 4)
 
         except Exception as e:

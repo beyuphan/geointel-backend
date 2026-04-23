@@ -6,10 +6,15 @@ from prompt_manager import get_dynamic_system_prompt, classify_intent_fast
 from core.models import IntentAnalysis, AgentState
 from core.mcp_client import orchestrator
 from core.result_compressor import compress_result
+from profile_manager import ProfileManager
 
 async def intent_node(state: AgentState):
-    """V4.1: Hybrid Intent Router. 
+    """V4.2: Hybrid Intent Router. 
     Basit işlerde Regex hızı, karmaşık işlerde LLM zekası."""
+    # Her yeni istekte harita verilerini sıfırla (Eski pinler temizlensin)
+    state["visual_data"] = {"markers": [], "polyline": None, "geojson_layers": []}
+    state["route_polyline"] = None
+    
     messages = state["messages"]
     msg = messages[-1].content
     intent_data = classify_intent_fast(msg)
@@ -28,11 +33,10 @@ async def intent_node(state: AgentState):
     # Regex'ten gelen ilk tahmini sakla
     category_from_regex = intent_data["category"]
 
-    # [Model Güvenliği] Rota ve şehir verisi HER ZAMAN Claude'a — Gemini Flash başaramaz
-    ALWAYS_CLAUDE_CATEGORIES = {"routing", "city_data", "places"}
-    if intent_data["category"] in ALWAYS_CLAUDE_CATEGORIES:
-        intent_data["complexity"] = "high"
-        log.info(f"🔒 [Model Lock] Kategori {intent_data['category'].upper()} → Claude zorunlu.")
+    # [Hız Optimizasyonu] Eğer Regex net bir kategori bulduysa LLM'e sorma (Lansman hızı için)
+    if intent_data["category"] != "general":
+        intent_data["needs_deep_analysis"] = False
+        log.info(f"⚡ [Intent Speed] Regex '{intent_data['category']}' yakaladı, LLM analizi atlandı.")
 
     if intent_data.get("needs_deep_analysis"):
         log.info(f"🧠 [DeepIntent] Karmaşık cümle algılandı, LLM ile analiz ediliyor...")
@@ -79,98 +83,68 @@ async def intent_node(state: AgentState):
 from langgraph.graph import END
 
 async def agent_node(state: AgentState):
-    from profile_manager import ProfileManager
-    
-    # Defensive: Profile loading failures must not crash the LLM pipeline
-    try:
-        active_profile = await ProfileManager.get_user_context()
-    except Exception as profile_err:
-        log.warning(f"⚠️ [agent_node] Profil yüklenemedi: {profile_err}")
-        active_profile = "Profil verisi alınamadı."
-    
-    try:
-        route_history = await ProfileManager.get_route_history(limit=3)
-    except Exception as hist_err:
-        log.warning(f"⚠️ [agent_node] Rota geçmişi alınamadı: {hist_err}")
-        route_history = []
+    """V6.2: Clean & Fast Agent Node."""
+    session_id = state.get("session_id", "default_session")
 
     # Active route check — safe with or without Redis
     session_id = state.get("session_id", "default_session")
-    has_active_route = False
-    if orchestrator.redis_client:
-        try:
-            active_route_encoded = orchestrator.redis_client.get(f"route:{session_id}")
-            has_active_route = bool(active_route_encoded)
-        except Exception as redis_err:
-            log.warning(f"⚠️ [agent_node] Redis get failed: {redis_err}")
-
-    intent_with_history = state["intent"].copy()
-    intent_with_history["route_history"] = route_history
-    intent_with_history["has_active_route"] = has_active_route
-
-    sys_prompt = get_dynamic_system_prompt(active_profile, intent_with_history)
+    
+    # Sistem Promptu Hazırla
+    user_ctx = await ProfileManager.get_combined_context(session_id)
+    sys_prompt = get_dynamic_system_prompt(user_ctx, state["intent"])
+    
+    # Rota varsa prompt'a ek bilgi enjekte et
+    has_active_route = orchestrator.redis_client and orchestrator.redis_client.exists(f"route:{session_id}")
     if has_active_route:
-        sys_prompt += (
-            "\n[SYSTEM: User has an active route on the map. "
-            "For nearby POI/fuel requests, use LATEST polyline via tools.]"
-        )
+        sys_prompt += "\n[SYSTEM: Kullanıcının aktif bir rotası var. 'LATEST' polyline kullanılabilir.]"
 
     messages = [SystemMessage(content=sys_prompt)] + state["messages"]
 
-    is_high = state["intent"].get("complexity") == "high"
-    primary_model  = orchestrator.llm_claude if is_high else orchestrator.llm_gemini
+    # MODEL SEÇİMİ
+    primary_model  = orchestrator.llm_claude
     fallback_model = orchestrator.llm_gemini
 
-    m_name = getattr(primary_model, "model_name", getattr(primary_model, "model", "Unknown"))
-    log.info(
-        f"🧠 [LLM Router] Session: {session_id[-8:]} | "
-        f"Model: {m_name} (complexity: {state['intent'].get('complexity')})"
-    )
-
-    # ── Retry + Gemini Fallback ────────────────────────────────────────────
-    # Claude 529 (Overloaded) → exponential backoff → Gemini fallback
-    MAX_RETRIES = 3
-    RETRY_DELAYS = [1.0, 3.0, 8.0]   # saniye
+    # RETRY VE MODEL SEÇİMİ
+    MAX_RETRIES = 2
+    RETRY_DELAYS = [0.1, 0.5]
     last_exc = None
 
-    for attempt in range(MAX_RETRIES + 1):      # 0,1,2 = retry; 3 = fallback
-        use_model = primary_model if attempt < MAX_RETRIES else fallback_model
+    # [Hız Optimizasyonu] Eğer bu bir özet aşamasıysa (tool çağrısından dönüldüyse)
+    # veya kategori basitse Gemini kullan. Claude'u sadece ilk analizde/zor işlerde kullan.
+    is_summary_step = state.get("retry_count", 0) > 0
+    use_fast_model = is_summary_step or state["intent"].get("complexity") != "high"
 
-        if attempt == MAX_RETRIES:
-            fb_name = getattr(fallback_model, "model_name",
-                              getattr(fallback_model, "model", "Gemini"))
-            log.warning(
-                f"⚡ [Fallback] Claude {MAX_RETRIES} denemede yanıt vermedi → {fb_name} devreye girdi."
-            )
-
+    for attempt in range(MAX_RETRIES + 1):
+        if use_fast_model:
+            use_model = fallback_model
+        else:
+            use_model = primary_model if attempt == 0 else fallback_model
+        
         try:
+            log.info(f"🧠 [Agent] Çağrılıyor: {getattr(use_model, 'model', 'Claude')} (Deneme {attempt+1})")
             model_with_tools = use_model.bind_tools(orchestrator.runtime_tools)
             response = await model_with_tools.ainvoke(messages)
-            if attempt > 0:
-                log.success(f"✅ [Retry] Deneme {attempt + 1}'de yanıt alındı.")
             return {"messages": [response], "retry_count": 0}
-
+            
         except Exception as exc:
             last_exc = exc
-            exc_str = str(exc)
-            is_retryable = (
-                "529" in exc_str
-                or "overloaded" in exc_str.lower()
-                or "503" in exc_str
-                or "502" in exc_str
-                or "rate_limit" in exc_str.lower()
-            )
-            if is_retryable and attempt < MAX_RETRIES:
+            exc_str = str(exc).lower()
+            
+            # Kota veya erişim hatası varsa beklemeden fallback yap
+            is_immediate_fallback = any(k in exc_str for k in ["429", "resource_exhausted", "403", "quota"])
+            if is_immediate_fallback and attempt < MAX_RETRIES:
+                log.warning(f"⚡ [Model Alert] Hızlı fallback tetiklendi: {exc_str[:50]}")
+                continue
+
+            if attempt < MAX_RETRIES:
                 delay = RETRY_DELAYS[attempt]
-                log.warning(
-                    f"⏳ [Retry {attempt + 1}/{MAX_RETRIES}] "
-                    f"Claude aşırı yüklenmiş (529). {delay}s bekleyip tekrar deneniyor..."
-                )
+                log.warning(f"⏳ [Retry] Hata: {exc_str[:50]}... {delay}s sonra tekrar...")
                 await asyncio.sleep(delay)
                 continue
-            log.error(f"🔥 [LLM] Model yanıt vermedi (deneme {attempt + 1}): {exc_str[:150]}")
+            
+            log.error(f"🔥 [Agent Critical] Başarısız: {exc_str[:150]}")
             raise
-    # ────────────────────────────────────────────────────────────────
+
     raise RuntimeError(f"[agent_node] Tüm denemeler başarısız: {last_exc}")
 
 def should_continue(state: AgentState) -> str:
@@ -194,108 +168,80 @@ def should_continue(state: AgentState) -> str:
 
 async def custom_tool_node(state: AgentState):
     last_msg = state["messages"][-1]
-    msgs = []
     visual_data = state.get("visual_data", {"markers": [], "polyline": None, "geojson_layers": []})
     session_id = state.get("session_id", "default_session")
     route_key = f"route:{session_id}"
     
-    for tc in getattr(last_msg, "tool_calls", []):
+    tool_calls = getattr(last_msg, "tool_calls", [])
+    if not tool_calls:
+        return {"messages": [], "retry_count": state.get("retry_count", 0)}
+
+    # PARALEL ÇALIŞTIRMA BAŞLAT
+    async def _execute_tool(tc):
         t_name = tc["name"]
-        args = tc.get("args", {})
+        args = tc.get("args", {}).copy()
+        args["session_id"] = session_id
         
-        log.info(f"🛠️ [Node: Tools] Çağrılıyor: {t_name}")
-        
+        log.info(f"🛠️ [Parallel Tool] Başlatıldı: {t_name}")
         tool = orchestrator.get_tool_by_name(t_name)
         if not tool:
-            msgs.append(ToolMessage(content=f"Error: Tool {t_name} not found.", tool_call_id=tc["id"]))
-            continue
-            
+            return ToolMessage(content=f"Error: Tool {t_name} not found.", tool_call_id=tc["id"]), None
+
         try:
-            # Otomatik Session Enjeksiyonu
-            args["session_id"] = session_id
-            res = await tool.ainvoke(args)
+            # Kullanıcı uzun beklemeye razı, limiti 5 dakikaya (300s) çıkarıyoruz
+            res = await asyncio.wait_for(tool.ainvoke(args), timeout=300.0)
+        except asyncio.TimeoutError:
+            res = {"status": "error", "message": f"Araç ({t_name}) 5 dakika içinde yanıt vermedi."}
+            log.error(f"⏳ [Timeout] {t_name} 5 dakikayı geçti, zorunlu iptal.")
         except Exception as e:
             res = f"Tool Error: {str(e)}"
-            log.error(f"🔥 [Node: Tools] Hata ({t_name}): {e}")
+            log.error(f"🔥 [Parallel Tool] Hata ({t_name}): {e}")
 
-        # VİZE: Gelen Veriyi Frontend (Harita) İçin Yakalama
+        # Görsel verileri burada yakalayıp asıl ToolMessage ile birlikte döndür
+        local_visual = {"markers": [], "polyline": None}
+        
         if isinstance(res, dict):
-            # Eğer API'den hata döndüyse LLM'e haber ver ama sistemi çökertme
             if res.get("status") == "error":
-                msgs.append(ToolMessage(content=json.dumps(res, ensure_ascii=False), tool_call_id=tc["id"]))
-                continue
+                return ToolMessage(content=json.dumps(res, ensure_ascii=False), tool_call_id=tc["id"]), None
 
-            # Rota Çizgisi Varsa (Polyline)
+            # Rota Polyline Yakalama
             if "polyline" in res or "polyline_encoded" in res:
                 poly_str = res.get("polyline") or res.get("polyline_encoded")
+                is_proxy = not poly_str or any(k in str(poly_str).upper() for k in ["LATEST", "GIZLENDI", "HARITA"]) or len(str(poly_str)) < 100
                 
-                # Broad proxy check for the return value itself
-                is_proxy_return = (
-                    not poly_str or
-                    "LATEST" in poly_str.upper() or
-                    "GİZLENDİ" in poly_str.upper() or
-                    "HARİTA" in poly_str.upper()
-                )
-                
-                if poly_str and not is_proxy_return:
-                    visual_data["polyline"] = poly_str
-                    if orchestrator.redis_client and isinstance(poly_str, str) and len(poly_str) > 100:
-                        try:
-                            orchestrator.redis_client.setex(route_key, 3600, poly_str)
-                        except Exception as e:
-                            log.warning(f"[Visualizer] Redis setex failed: {e}")
-                elif poly_str and is_proxy_return:
-                    latest = None
+                if poly_str and not is_proxy:
+                    local_visual["polyline"] = poly_str
                     if orchestrator.redis_client:
-                        try:
-                            latest = orchestrator.redis_client.get(route_key)
-                        except Exception as e:
-                            log.warning(f"[Visualizer] Redis get failed: {e}")
-                    if latest:
-                        visual_data["polyline"] = latest
-                        log.info("🔄 [Visualizer] Gizlenmiş polyline yakalandı, Redis'ten haritaya aktarıldı.")
-                    else:
-                        visual_data["polyline"] = poly_str
-                        log.warning(f"⚠️ [Visualizer] LATEST algılandı ama Redis '{route_key}' boş!")
-                else:
-                    visual_data["polyline"] = poly_str
-                
-                # LLM'in kafası devasa veriyle karışmasın diye polyline metnini tamamen gizliyoruz!
-                if "polyline" in res: 
-                    res["polyline"] = "[HARİTAYA ÇİZİLDİ - OKUMANA GEREK YOK]"
-                if "polyline_encoded" in res: 
-                    res["polyline_encoded"] = "[HARİTAYA ÇİZİLDİ - OKUMANA GEREK YOK]"
-                
-                if "alternatives" in res and isinstance(res["alternatives"], list):
-                    for alt in res["alternatives"]:
-                        if "polyline_encoded" in alt:
-                            alt["polyline_encoded"] = "[GİZLENDİ]"
-                        if "polyline" in alt:
-                            alt["polyline"] = "[GİZLENDİ]"
-            
-            # Tek bir hedef verildiyse marker ekle
-            if "lat" in res and "lon" in res: 
-                visual_data["markers"].append({"name": "Hedef", "lat": res["lat"], "lon": res["lon"]})
-                
-            # Eğer çoklu sonuç döndüyse (örn. places), marker listesine ekle
-            if "places" in res and isinstance(res["places"], list):
-                for place in res["places"]:
-                    if "lat" in place and "lon" in place:
-                        visual_data["markers"].append({
-                            "name": place.get("name", "Bilinmeyen"),
-                            "lat": place["lat"],
-                            "lon": place["lon"]
-                        })
+                        try: orchestrator.redis_client.setex(route_key, 3600, poly_str)
+                        except: pass
+                elif is_proxy and orchestrator.redis_client:
+                    latest = orchestrator.redis_client.get(route_key)
+                    if latest: local_visual["polyline"] = latest.decode('utf-8') if isinstance(latest, bytes) else latest
 
-        tool_output = res
-        if isinstance(res, list):
-            tool_output = {"results": res}
-        elif not isinstance(res, dict):
-            tool_output = {"result": str(res)}
-        
-        # V2.5: Sonucu sıkıştır — LLM'e giden token miktarını %40-60 azaltır
-        tool_output = compress_result(t_name, tool_output)
-            
-        msgs.append(ToolMessage(content=json.dumps(tool_output, ensure_ascii=False), tool_call_id=tc["id"]))
-        
+                # LLM Token Tasarrufu: Polyline'ı gizle
+                if "polyline" in res: res["polyline"] = "[HARİTAYA ÇİZİLDİ]"
+                if "polyline_encoded" in res: res["polyline_encoded"] = "[HARİTAYA ÇİZİLDİ]"
+
+            # Marker Yakalama
+            if "lat" in res and "lon" in res:
+                local_visual["markers"].append({"name": res.get("name", "Hedef"), "lat": res["lat"], "lon": res["lon"]})
+            if "places" in res and isinstance(res["places"], list):
+                for p in res["places"]:
+                    if "lat" in p and "lon" in p:
+                        local_visual["markers"].append({"name": p.get("name", "Mekan"), "lat": p["lat"], "lon": p["lon"]})
+
+        # Sıkıştırma ve Paketleme
+        tool_output = compress_result(t_name, res)
+        return ToolMessage(content=json.dumps(tool_output, ensure_ascii=False), tool_call_id=tc["id"]), local_visual
+
+    # Tüm araçları aynı anda çalıştır
+    results = await asyncio.gather(*[_execute_tool(tc) for tc in tool_calls])
+    
+    msgs = []
+    for msg, l_visual in results:
+        msgs.append(msg)
+        if l_visual:
+            if l_visual.get("polyline"): visual_data["polyline"] = l_visual["polyline"]
+            visual_data["markers"].extend(l_visual["markers"])
+
     return {"messages": msgs, "visual_data": visual_data, "retry_count": state.get("retry_count", 0) + 1}

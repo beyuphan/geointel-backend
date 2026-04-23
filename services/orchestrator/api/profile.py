@@ -11,7 +11,7 @@ from sqlmodel import select, delete
 from core.db import async_session_maker, User, UserVehicle, SavedLocation, UserPreference
 from api.schemas import (
     ApiResponse, ApiError, ApiMetadata,
-    VehicleUpdate, VehicleResponse,
+    VehicleUpdate, VehicleCreate, VehicleResponse,
     LocationCreate, LocationResponse,
     PreferenceUpdate, PreferenceResponse,
     ProfileResponse, UserPublic,
@@ -341,5 +341,204 @@ async def update_preference(req: PreferenceUpdate, user: dict = Depends(get_curr
         return ApiResponse(
             success=False,
             error=ApiError(code="SERVER_ERROR", message="Tercih güncellenirken hata oluştu."),
+            metadata=ApiMetadata(response_time_ms=_elapsed(t_start)),
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VEHICLE GARAGE (Multi-Vehicle CRUD)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/vehicles", response_model=ApiResponse)
+async def list_vehicles(user: dict = Depends(get_current_user)):
+    """Kullanıcının tüm araçlarını listeler (Garage)."""
+    t_start = time.monotonic()
+
+    try:
+        async with async_session_maker() as session:
+            db_user = await _get_user_by_id(session, user["user_id"])
+            if not db_user:
+                return ApiResponse(success=False, error=ApiError(code="USER_NOT_FOUND", message="Kullanıcı bulunamadı."))
+
+            result = await session.execute(
+                select(UserVehicle).where(UserVehicle.user_id == db_user.id)
+            )
+            vehicles = result.scalars().all()
+
+            return ApiResponse(
+                success=True,
+                data=[
+                    VehicleResponse(
+                        id=v.id, brand=v.brand, model=v.model, year=v.year,
+                        fuel_type=v.fuel_type, city_consumption=v.city_consumption,
+                        highway_consumption=v.highway_consumption,
+                        avg_consumption=v.avg_consumption, is_primary=v.is_primary,
+                    ).model_dump()
+                    for v in vehicles
+                ],
+                metadata=ApiMetadata(response_time_ms=_elapsed(t_start)),
+            )
+
+    except Exception as e:
+        log.error(f"❌ [Profile] Araç listeleme hatası: {e}")
+        return ApiResponse(
+            success=False,
+            error=ApiError(code="SERVER_ERROR", message="Araçlar yüklenirken hata oluştu."),
+            metadata=ApiMetadata(response_time_ms=_elapsed(t_start)),
+        )
+
+
+@router.post("/vehicles", response_model=ApiResponse)
+async def add_vehicle(req: VehicleCreate, user: dict = Depends(get_current_user)):
+    """Garaja yeni araç ekler."""
+    t_start = time.monotonic()
+
+    try:
+        async with async_session_maker() as session:
+            db_user = await _get_user_by_id(session, user["user_id"])
+            if not db_user:
+                return ApiResponse(success=False, error=ApiError(code="USER_NOT_FOUND", message="Kullanıcı bulunamadı."))
+
+            avg_cons = round((req.city_consumption + req.highway_consumption) / 2, 1)
+
+            # Eğer is_primary True ise diğerlerini False yap
+            if req.is_primary:
+                existing = await session.execute(
+                    select(UserVehicle).where(UserVehicle.user_id == db_user.id, UserVehicle.is_primary == True)
+                )
+                for v in existing.scalars().all():
+                    v.is_primary = False
+
+            vehicle = UserVehicle(
+                user_id=db_user.id,
+                vehicle_name=f"{req.brand} {req.model}",
+                brand=req.brand, model=req.model, year=req.year,
+                fuel_type=req.fuel_type,
+                city_consumption=req.city_consumption,
+                highway_consumption=req.highway_consumption,
+                avg_consumption=avg_cons,
+                is_primary=req.is_primary,
+            )
+            session.add(vehicle)
+            await session.commit()
+            await session.refresh(vehicle)
+
+            log.success(f"🚗 [Profile] Araç eklendi: {req.brand} {req.model} ({user['username']})")
+
+            return ApiResponse(
+                success=True,
+                data=VehicleResponse(
+                    id=vehicle.id, brand=vehicle.brand, model=vehicle.model,
+                    year=vehicle.year, fuel_type=vehicle.fuel_type,
+                    city_consumption=vehicle.city_consumption,
+                    highway_consumption=vehicle.highway_consumption,
+                    avg_consumption=vehicle.avg_consumption,
+                    is_primary=vehicle.is_primary,
+                ).model_dump(),
+                metadata=ApiMetadata(response_time_ms=_elapsed(t_start)),
+            )
+
+    except Exception as e:
+        log.error(f"❌ [Profile] Araç ekleme hatası: {e}")
+        return ApiResponse(
+            success=False,
+            error=ApiError(code="SERVER_ERROR", message="Araç eklenirken hata oluştu."),
+            metadata=ApiMetadata(response_time_ms=_elapsed(t_start)),
+        )
+
+
+@router.delete("/vehicles/{vehicle_id}", response_model=ApiResponse)
+async def delete_vehicle(vehicle_id: int, user: dict = Depends(get_current_user)):
+    """Garajdan araç siler."""
+    t_start = time.monotonic()
+
+    try:
+        async with async_session_maker() as session:
+            db_user = await _get_user_by_id(session, user["user_id"])
+            if not db_user:
+                return ApiResponse(success=False, error=ApiError(code="USER_NOT_FOUND", message="Kullanıcı bulunamadı."))
+
+            result = await session.execute(
+                select(UserVehicle).where(
+                    UserVehicle.id == vehicle_id,
+                    UserVehicle.user_id == db_user.id
+                )
+            )
+            vehicle = result.scalars().first()
+            if not vehicle:
+                return ApiResponse(
+                    success=False,
+                    error=ApiError(code="NOT_FOUND", message="Araç bulunamadı."),
+                    metadata=ApiMetadata(response_time_ms=_elapsed(t_start)),
+                )
+
+            name = f"{vehicle.brand} {vehicle.model}"
+            await session.delete(vehicle)
+            await session.commit()
+
+            return ApiResponse(
+                success=True,
+                data={"message": f"'{name}' garajdan kaldırıldı."},
+                metadata=ApiMetadata(response_time_ms=_elapsed(t_start)),
+            )
+
+    except Exception as e:
+        log.error(f"❌ [Profile] Araç silme hatası: {e}")
+        return ApiResponse(
+            success=False,
+            error=ApiError(code="SERVER_ERROR", message="Araç silinirken hata oluştu."),
+            metadata=ApiMetadata(response_time_ms=_elapsed(t_start)),
+        )
+
+
+@router.patch("/vehicles/{vehicle_id}/primary", response_model=ApiResponse)
+async def set_primary_vehicle(vehicle_id: int, user: dict = Depends(get_current_user)):
+    """Belirtilen aracı primary (ana araç) yapar."""
+    t_start = time.monotonic()
+
+    try:
+        async with async_session_maker() as session:
+            db_user = await _get_user_by_id(session, user["user_id"])
+            if not db_user:
+                return ApiResponse(success=False, error=ApiError(code="USER_NOT_FOUND", message="Kullanıcı bulunamadı."))
+
+            # Tüm araçları primary=False yap
+            all_result = await session.execute(
+                select(UserVehicle).where(UserVehicle.user_id == db_user.id)
+            )
+            for v in all_result.scalars().all():
+                v.is_primary = False
+
+            # Seçileni primary yap
+            target_result = await session.execute(
+                select(UserVehicle).where(
+                    UserVehicle.id == vehicle_id,
+                    UserVehicle.user_id == db_user.id
+                )
+            )
+            target = target_result.scalars().first()
+            if not target:
+                return ApiResponse(
+                    success=False,
+                    error=ApiError(code="NOT_FOUND", message="Araç bulunamadı."),
+                    metadata=ApiMetadata(response_time_ms=_elapsed(t_start)),
+                )
+
+            target.is_primary = True
+            await session.commit()
+
+            log.info(f"🚗 [Profile] Primary araç değiştirildi: {target.brand} {target.model} ({user['username']})")
+
+            return ApiResponse(
+                success=True,
+                data={"message": f"{target.brand} {target.model} ana araç olarak ayarlandı."},
+                metadata=ApiMetadata(response_time_ms=_elapsed(t_start)),
+            )
+
+    except Exception as e:
+        log.error(f"❌ [Profile] Primary araç hatası: {e}")
+        return ApiResponse(
+            success=False,
+            error=ApiError(code="SERVER_ERROR", message="Ana araç değiştirilirken hata oluştu."),
             metadata=ApiMetadata(response_time_ms=_elapsed(t_start)),
         )

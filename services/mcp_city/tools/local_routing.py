@@ -66,8 +66,12 @@ async def get_local_route(
                 )
                 return None
 
-            # 2. Dinamik Maliyet — Trafik + yağmur çarpanı birlikte
-            # current_speed varsa actualtime, yoksa şehir içi varsayılan 25 km/s
+            # 2. Dinamik Maliyet ve Bounding Box Filtresi
+            # Rota aramasını hızlandırmak için sadece ilgili bölgedeki yolları yükle (BBOX)
+            bbox_buffer = 0.05 # Yaklaşık 5km buffer
+            min_x, max_x = min(origin_lon, dest_lon) - bbox_buffer, max(origin_lon, dest_lon) + bbox_buffer
+            min_y, max_y = min(origin_lat, dest_lat) - bbox_buffer, max(origin_lat, dest_lat) + bbox_buffer
+
             dynamic_cost = (
                 f"CASE WHEN current_speed IS NOT NULL AND current_speed > 0 "
                 f"THEN (length_m / (current_speed / 3.6)) * {rain_multiplier} "
@@ -83,7 +87,8 @@ async def get_local_route(
             FROM pgr_dijkstra(
                 'SELECT gid AS id, source, target,
                  {dynamic_cost} AS cost,
-                 {dynamic_cost} AS reverse_cost FROM ways',
+                 {dynamic_cost} AS reverse_cost FROM ways 
+                 WHERE the_geom && ST_MakeEnvelope({min_x}, {min_y}, {max_x}, {max_y}, 4326)',
                 $1::bigint, $2::bigint, directed := false
             ) a
             JOIN ways b ON (a.edge = b.gid);

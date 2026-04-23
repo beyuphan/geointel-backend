@@ -59,21 +59,26 @@ async def analyze_route_weather_handler(
     if not polyline:
         return {"error": "Rota verisi (polyline) eksik."}
 
-    checkpoints = sample_route_points(polyline, interval_km=40)
+    # Rota uzunluğuna göre örnekleme aralığını dinamikleştir (Hız Optimizasyonu)
+    # Rota > 400km ise 80km aralıklarla bak, değilse 40km.
+    # Bu, 1000km'lik rotada API çağrı sayısını 25'ten 12'ye indirir.
+    interval = 80 if len(polyline) > 1000 else 40 # Polyline uzunluğu yaklaşık bir göstergedir
+    # Daha garanti bir mesafe tahmini için sample_route_points içinde mesafe kontrolü yapılır.
+    
+    checkpoints = sample_route_points(polyline, interval_km=interval)
     if not checkpoints:
         return {"error": "Rota geometrisi çözülemedi."}
 
-    log.info(f"🛡️ [SHIELD] Hava Kalkanı Devrede: {len(checkpoints)} nokta taranıyor...")
+    log.info(f"🛡️ [SHIELD] Hava Kalkanı Devrede: {len(checkpoints)} nokta taranıyor (Aralık: {interval}km)...")
 
     risks = []
     summary = []
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        tasks = []
-        for point in checkpoints:
-            eta_min = departure_minutes_from_now + (point["km_point"] / avg_speed_kmh) * 60
-            tasks.append(_get_forecast_at_eta(client, point["lat"], point["lon"], eta_min))
-        results = await asyncio.gather(*tasks)
+    tasks = []
+    for point in checkpoints:
+        eta_min = departure_minutes_from_now + (point["km_point"] / avg_speed_kmh) * 60
+        tasks.append(_get_forecast_at_eta(http_client, point["lat"], point["lon"], eta_min))
+    results = await asyncio.gather(*tasks)
 
     for point, forecast in zip(checkpoints, results):
         if not forecast:
@@ -142,59 +147,58 @@ async def get_weather_handler(lat: float, lon: float) -> dict:
             "exclude": "minutely,alerts" # Daily kalsın, belki yarına bakıyordur
         }
         
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(settings.OPENWEATHER_URL, params=params)
-            data = resp.json()
-            
-            if resp.status_code != 200:
-                return {"error": f"Hava durumu alınamadı: {data.get('message')}"}
+        resp = await http_client.get(settings.OPENWEATHER_URL, params=params)
+        data = resp.json()
+        
+        if resp.status_code != 200:
+            return {"error": f"Hava durumu alınamadı: {data.get('message')}"}
 
-            # ZAMAN AYARI (UTC+3 Türkiye Saati varsayımıyla veya timezone offset ile)
-            # OpenWeather 'timezone_offset' saniye cinsinden verir.
-            offset = data.get("timezone_offset", 0)
-            tz = timezone(timedelta(seconds=offset))
+        # ZAMAN AYARI (UTC+3 Türkiye Saati varsayımıyla veya timezone offset ile)
+        # OpenWeather 'timezone_offset' saniye cinsinden verir.
+        offset = data.get("timezone_offset", 0)
+        tz = timezone(timedelta(seconds=offset))
 
-            # ŞU ANKİ DURUM
-            current = data.get("current", {})
-            current_time = datetime.fromtimestamp(current.get("dt"), tz).strftime("%H:%M")
-            
-            current_obj = {
-                "saat": f"ŞU AN ({current_time})", # LLM bunu görünce anlar
-                "sicaklik": f"{current.get('temp')}°C",
-                "hissedilen": f"{current.get('feels_like')}°C",
-                "durum": current.get("weather", [{}])[0].get("description"),
-                "ruzgar": f"{current.get('wind_speed')} m/s"
-            }
+        # ŞU ANKİ DURUM
+        current = data.get("current", {})
+        current_time = datetime.fromtimestamp(current.get("dt"), tz).strftime("%H:%M")
+        
+        current_obj = {
+            "saat": f"ŞU AN ({current_time})", # LLM bunu görünce anlar
+            "sicaklik": f"{current.get('temp')}°C",
+            "hissedilen": f"{current.get('feels_like')}°C",
+            "durum": current.get("weather", [{}])[0].get("description"),
+            "ruzgar": f"{current.get('wind_speed')} m/s"
+        }
 
-            # SAATLİK TAHMİN (Önümüzdeki 5 saat)
-            hourly_summary = []
-            for h in data.get("hourly", [])[:5]:
-                dt_str = datetime.fromtimestamp(h.get("dt"), tz).strftime("%H:%M")
-                hourly_summary.append({
-                    "saat": dt_str,
-                    "tahmin": f"{h.get('temp')}°C (Hissedilen: {h.get('feels_like')}), {h.get('weather', [{}])[0].get('description')}"
-                })
+        # SAATLİK TAHMİN (Önümüzdeki 5 saat)
+        hourly_summary = []
+        for h in data.get("hourly", [])[:5]:
+            dt_str = datetime.fromtimestamp(h.get("dt"), tz).strftime("%H:%M")
+            hourly_summary.append({
+                "saat": dt_str,
+                "tahmin": f"{h.get('temp')}°C (Hissedilen: {h.get('feels_like')}), {h.get('weather', [{}])[0].get('description')}"
+            })
 
-            # GÜNLÜK TAHMİN (Yarın için ipucu)
-            # Eğer kullanıcı "Yarın nasıl?" derse buraya bakmalı
-            daily_summary = []
-            for d in data.get("daily", [])[:2]: # Bugün ve Yarın
-                day_name = datetime.fromtimestamp(d.get("dt"), tz).strftime("%A (Günlük)")
-                daily_summary.append({
-                    "gun": day_name,
-                    "gunduz_max": f"{d.get('temp', {}).get('day')}°C",
-                    "gece_min": f"{d.get('temp', {}).get('night')}°C",
-                    "aciklama": d.get("weather", [{}])[0].get("description")
-                })
+        # GÜNLÜK TAHMİN (Yarın için ipucu)
+        # Eğer kullanıcı "Yarın nasıl?" derse buraya bakmalı
+        daily_summary = []
+        for d in data.get("daily", [])[:2]: # Bugün ve Yarın
+            day_name = datetime.fromtimestamp(d.get("dt"), tz).strftime("%A (Günlük)")
+            daily_summary.append({
+                "gun": day_name,
+                "gunduz_max": f"{d.get('temp', {}).get('day')}°C",
+                "gece_min": f"{d.get('temp', {}).get('night')}°C",
+                "aciklama": d.get("weather", [{}])[0].get("description")
+            })
 
-            return {
-                "lokasyon_koordinat": f"{lat},{lon}",
-                "bolge_saat_dilimi": data.get("timezone"),
-                "ANLIK_DURUM": current_obj,        # Büyük harfle dikkat çekiyoruz
-                "ONUMUZDEKI_SAATLER": hourly_summary,
-                "GENEL_GUNLUK_RAPOR": daily_summary,
-                "uyari": "Verilerdeki 'saat' bilgisini dikkate al. Gündüz sıcaklığı ile geceyi karıştırma."
-            }
+        return {
+            "lokasyon_koordinat": f"{lat},{lon}",
+            "bolge_saat_dilimi": data.get("timezone"),
+            "ANLIK_DURUM": current_obj,        # Büyük harfle dikkat çekiyoruz
+            "ONUMUZDEKI_SAATLER": hourly_summary,
+            "GENEL_GUNLUK_RAPOR": daily_summary,
+            "uyari": "Verilerdeki 'saat' bilgisini dikkate al. Gündüz sıcaklığı ile geceyi karıştırma."
+        }
 
     except Exception as e:
         return {"error": str(e)}

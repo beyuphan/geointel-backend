@@ -1,7 +1,7 @@
 import asyncio
 import json
 from loguru import logger as log
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 class RouteStrategyEvaluator:
     """
@@ -96,4 +96,165 @@ class RouteStrategyEvaluator:
             },
             "regional_fuel_prices": fuel_res.get("data", fuel_res) if fuel_res else "Fiyat verisi alınamadı.",
             "stations_found": len(places),
+        }
+
+class ContextAwarePOIPlanner:
+    """
+    Macro-Tool: Anlamsal (semantic) mekan araması yapar, hava durumunu kontrol eder
+    ve hava durumuna göre (rain_factor) filtrelenmiş bir rota çizer.
+    """
+    def __init__(self, mcp_client):
+        self.mcp = mcp_client
+
+    async def _safe_call(self, service: str, tool_name: str, args: dict) -> dict:
+        try:
+            res = await self.mcp.mcp_rpc_call(service, "tools/call", {"name": tool_name, "arguments": args})
+            if isinstance(res, dict):
+                return res
+            if isinstance(res, str):
+                import json
+                try:
+                    return json.loads(res)
+                except:
+                    return {"status": "success", "data": res}
+            return {"status": "error", "message": f"Beklenmeyen tür: {type(res)}"}
+        except Exception as e:
+            log.error(f"API Error in {tool_name}: {str(e)}")
+            return {"status": "error", "message": str(e)}
+
+    async def evaluate(self, current_lat: float, current_lon: float, semantic_query: str, location_name: Optional[str] = None, search_radius: float = 5000, username: str = "test_pilot") -> Dict[str, Any]:
+        log.info(f"🧠 [Macro-Tool] ContextAwarePOIPlanner: '{semantic_query}' @ {location_name or (str(current_lat)+','+str(current_lon))}")
+        
+        # 1. Kullanıcı tercihlerini al (Kişiselleştirme)
+        pref_res = await self._safe_call("city", "get_pool", {}) # Placeholder for actual pref call if available, or use a default
+        # NOT: Gerçek sistemde bu ProfileManager'dan gelir. Şimdilik manuel sorgu ekliyoruz.
+        
+        # 2. Koordinat Çözümleme
+        search_lat, search_lon = current_lat, current_lon
+        if location_name:
+            geo_res = await self._safe_call("city", "search_hybrid_places", {"query": location_name, "location_name": location_name, "limit": 1})
+            places_data = geo_res.get("places", []) if isinstance(geo_res, dict) else []
+            if places_data:
+                search_lat = float(places_data[0]["lat"])
+                search_lon = float(places_data[0]["lon"])
+
+        # 3. Hava Durumu Analizi
+        weather_res = await self._safe_call("city", "get_weather", {"lat": search_lat, "lon": search_lon})
+        weather_condition = "Açık"
+        is_bad_weather = False
+        
+        if "error" not in weather_res:
+            weather_data = weather_res.get("data", weather_res)
+            if isinstance(weather_data, dict) and "ANLIK_DURUM" in weather_data:
+                condition_raw = weather_data["ANLIK_DURUM"].get("durum", "").lower()
+                weather_condition = condition_raw
+                if any(w in condition_raw for w in ["rain", "drizzle", "thunderstorm", "yağmur", "kar", "snow", "fırtına"]):
+                    is_bad_weather = True
+                    # Hava kötüyse kapalı mekan (indoor) tercihini sorguya ekle
+                    if "kapalı" not in semantic_query.lower() and "iç" not in semantic_query.lower():
+                        semantic_query += " kapalı mekan"
+                    search_radius = 2000 # Hareket kabiliyeti azalır
+        
+        # 4. HİBRİT ARAMA (Google + OSM + RAG)
+        # Artık search_hybrid_places kendi içinde RAG yapıyor!
+        poi_res = await self._safe_call("city", "search_hybrid_places", {
+            "query": semantic_query,
+            "lat": search_lat,
+            "lon": search_lon,
+            "location_name": location_name,
+            "category": "commercial"
+        })
+        
+        places = poi_res.get("places", []) if isinstance(poi_res, dict) else []
+        
+        if not places:
+             return {
+                 "status": "error",
+                 "message": f"Kritere uygun mekan bulunamadı. ({semantic_query})",
+                 "weather_context": weather_condition,
+                 "suggestion": "Daha genel bir arama yapmayı deneyin veya farklı bir bölge seçin."
+             }
+
+        # 5. Sonuçları işle ve en uygun olanı seç
+        best_poi = places[0]
+        route_res = await self._safe_call("city", "get_route_data", {
+            "origin": f"{current_lat},{current_lon}",
+            "destination": f"{best_poi['lat']},{best_poi['lon']}"
+        })
+
+        markers = []
+        for p in places[:5]: # En iyi 5 mekan
+            markers.append({
+                "name": p.get("name"),
+                "lat": p.get("lat"),
+                "lon": p.get("lon"),
+                "description": p.get("address", p.get("fusion_status", "")),
+                "type": "poi"
+            })
+        
+        return {
+            "status": "success",
+            "intent_analyzed": semantic_query,
+            "weather_analysis": {
+                "condition": weather_condition,
+                "is_bad_weather": is_bad_weather,
+                "impact": "Kapalı mekanlar önceliklendirildi." if is_bad_weather else "Normal arama."
+            },
+            "recommendation": {
+                "name": best_poi.get("name"),
+                "address": best_poi.get("address"),
+                "rating": best_poi.get("rating"),
+                "fusion_status": best_poi.get("fusion_status")
+            },
+            "map": {
+                "markers": markers,
+                "polyline": route_res.get("polyline") if isinstance(route_res, dict) else ""
+            },
+            "route_summary": {
+                "distance": route_res.get("mesafe_km"),
+                "duration": route_res.get("sure_dk")
+            },
+            "alternatives": [p.get("name") for p in places[1:4]]
+        }
+
+class EnvironmentalAnalyst:
+    """Satellite data aggregator for environmental health and imagery."""
+    def __init__(self, orchestrator):
+        self.orchestrator = orchestrator
+
+    async def _safe_call(self, service, tool, params):
+        try:
+            return await self.orchestrator.call_tool(service, tool, params)
+        except Exception as e:
+            log.error(f"Satellite Macro Error: {str(e)}")
+            return {"status": "error", "message": str(e)}
+
+    async def evaluate(self, lat: float, lon: float, analyze_vegetation: bool = True) -> Dict[str, Any]:
+        log.info(f"🛰️ [Macro-Tool] EnvironmentalAnalyst: {lat},{lon}")
+        
+        # BBOX hesapla (yaklaşık 2km x 2km)
+        offset = 0.01 
+        bbox = {
+            "min_lon": lon - offset,
+            "min_lat": lat - offset,
+            "max_lon": lon + offset,
+            "max_lat": lat + offset
+        }
+
+        results = {}
+        
+        # 1. Bitki örtüsü raporu (NDVI/EVI)
+        if analyze_vegetation:
+            veg_res = await self._safe_call("satellite", "get_vegetation_report", bbox)
+            results["vegetation"] = veg_res
+
+        # 2. Son görüntüler
+        img_res = await self._safe_call("satellite", "search_satellite_imagery", bbox)
+        results["imagery"] = img_res
+
+        return {
+            "status": "success",
+            "location": f"{lat},{lon}",
+            "analysis": results,
+            "summary": "Uydu verileri üzerinden çevresel analiz tamamlandı."
         }

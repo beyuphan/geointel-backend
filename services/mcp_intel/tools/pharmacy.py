@@ -62,26 +62,40 @@ class PharmacyScraper:
                     log.warning(f"⚠️ [DOM] Tablo bulunamadı! Sayfa yapısı değişmiş olabilir.")
                     return []
 
-                # JS Parsing (Restore deep parsing)
+                # JS Parsing (Robust version)
                 all_pharmacies = await page.evaluate("""() => {
                     const results = [];
+                    // Birden fazla olası tablo yapısı
                     let rows = document.querySelectorAll('div.tab-pane.active tbody tr');
-                    if (rows.length === 0) { rows = document.querySelectorAll('tbody tr'); }
+                    if (rows.length === 0) rows = document.querySelectorAll('tbody tr');
+                    if (rows.length === 0) rows = document.querySelectorAll('.table tr');
                     
                     rows.forEach(row => {
-                        const rowContainer = row.querySelector('.row');
-                        if (!rowContainer) return;
-                        const name = rowContainer.querySelector('span.isim')?.innerText.trim();
-                        const district = rowContainer.querySelector('.bg-info')?.innerText.trim() || "";
-                        const addressDiv = rowContainer.querySelector('.col-lg-6');
+                        // rowContainer kontrolü (bazı siteler .row kullanır, bazıları doğrudan td)
+                        const rowContainer = row.querySelector('.row') || row;
+                        
+                        const nameEl = rowContainer.querySelector('span.isim') || rowContainer.querySelector('.isim') || rowContainer.querySelector('td:first-child');
+                        const name = nameEl?.innerText.trim();
+                        
+                        const districtEl = rowContainer.querySelector('.bg-info') || rowContainer.querySelector('.ilce') || rowContainer.querySelector('.badge');
+                        const district = districtEl?.innerText.trim() || "";
+                        
+                        const addressDiv = rowContainer.querySelector('.col-lg-6') || rowContainer.querySelector('.adres') || rowContainer.querySelector('td:nth-child(2)');
                         let address = "";
                         if (addressDiv) {
                             let rawAddress = addressDiv.innerText.trim();
+                            // İlçeyi adresten temizle (görsel kirliliği engellemek için)
                             address = rawAddress.replace(district, '').trim().replace(/\\s+/g, ' ').trim();
                         }
-                        const phone = rowContainer.querySelector('.col-lg-3.py-lg-2')?.innerText.trim();
-                        const mapLink = rowContainer.querySelector('a[href*="maps"]')?.href;
-                        if (name) { results.push({ name, district, address, phone, mapLink }); }
+                        
+                        const phoneEl = rowContainer.querySelector('.col-lg-3.py-lg-2') || rowContainer.querySelector('.tel') || rowContainer.querySelector('a[href^="tel"]');
+                        const phone = phoneEl?.innerText.trim();
+                        
+                        const mapLink = rowContainer.querySelector('a[href*="maps"]')?.href || rowContainer.querySelector('a[href*="yandex"]')?.href;
+                        
+                        if (name && name.length > 2) { 
+                            results.push({ name, district, address, phone, mapLink }); 
+                        }
                     });
                     return results;
                 }""")

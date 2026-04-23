@@ -116,6 +116,8 @@ class DBHelper:
                     for d in data_list
                 ]
                 await conn.executemany(query, rows)
+                # created_at otomatik default alıyor ama manuel güncelleme gerekirse:
+                # await conn.execute("UPDATE pharmacies SET created_at = NOW() WHERE city = $1", city.lower())
                 logger.success(f"💾 [DB] {city.upper()} için {len(data_list)} eczane güncellendi.")
             except Exception as e:
                 logger.error(f"❌ [DB HATA] Eczane Kaydı: {e}")
@@ -229,6 +231,7 @@ class DBHelper:
                     SELECT name as isim, address as adres, phone as tel, district as ilce, coordinates as koordinat
                     FROM pharmacies 
                     WHERE city = $1 AND district = $2
+                    AND created_at >= NOW() - INTERVAL '12 hours'
                 """
                 rows = await conn.fetch(query, city.lower(), district.lower())
             else:
@@ -236,6 +239,7 @@ class DBHelper:
                     SELECT name as isim, address as adres, phone as tel, district as ilce, coordinates as koordinat
                     FROM pharmacies 
                     WHERE city = $1
+                    AND created_at >= NOW() - INTERVAL '12 hours'
                 """
                 rows = await conn.fetch(query, city.lower())
             return [dict(row) for row in rows]
@@ -251,7 +255,8 @@ class DBHelper:
                        COALESCE(city, 'Bilinmiyor') as sehir, 
                        COALESCE(traffic_impact_level, 1) as traffic_impact_level
                 FROM sports_matches 
-                WHERE match_date >= CURRENT_DATE OR match_date IS NULL
+                WHERE (match_date >= CURRENT_DATE OR match_date IS NULL)
+                AND created_at >= NOW() - INTERVAL '3 days'
                 ORDER BY match_date ASC NULLS LAST
             """
             rows = await conn.fetch(query)
@@ -274,6 +279,7 @@ class DBHelper:
                 SELECT title, venue, event_date as date, category, source_url as link
                 FROM city_events 
                 WHERE city = $1
+                AND created_at >= NOW() - INTERVAL '24 hours'
             """
             rows = await conn.fetch(query, city.lower())
             return [dict(row) for row in rows]

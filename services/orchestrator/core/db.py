@@ -27,6 +27,7 @@ class User(SQLModel, table=True):
     __tablename__ = "users"
     id: uuid.UUID | None = Field(default_factory=uuid.uuid4, primary_key=True)
     username: str = Field(unique=True, index=True)
+    email: Optional[str] = Field(default=None, index=True)
     password_hash: Optional[str] = None
     created_at: Optional[datetime] = Field(default_factory=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 

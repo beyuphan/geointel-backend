@@ -13,6 +13,7 @@ INTERNAL SYSTEM RULES:
 5. For complex route + fuel requests, immediately use the `evaluate_route_strategy`.
 6. For repeat route context, use 'LATEST' as polyline.
 7. Never hallucinate coordinates or places — always resolve via tools.
+8. LOCATION RULE: You are provided with 'ANLIK KONUM KOORDİNATLARI' (lat, lon) in the USER section below. ANY tool requiring location (like places, fuel, pharmacy, events) MUST use these coordinates automatically. ABSOLUTELY NEVER ask the user "konumunu paylaşır mısın" (Can you share your location). You already have it! Use it immediately!
 """
 
 # Keyword-based complexity (replaces the old LLM intent classifier)
@@ -20,7 +21,8 @@ INTERNAL SYSTEM RULES:
 HIGH_KEYWORDS = [
     "rota", "route", "yol", "git", "navigasyon",
     "trafik", "radar", "geçiş ücreti", "toll",
-    "wfs", "ibb", "katman"
+    "wfs", "ibb", "katman",
+    "eczane", "maç", "konser", "etkinlik", "yakıt"
 ]
 
 def classify_intent_fast(message: str) -> dict:
@@ -41,7 +43,7 @@ def classify_intent_fast(message: str) -> dict:
         category = "event"
     elif any(k in msg_lower for k in ["wfs", "ibb", "dataset", "katman", "afet", "ispark"]):
         category = "city_data"
-    elif any(k in msg_lower for k in ["mekan", "kafe", "cafe", "restoran", "lokanta", "yemek", "kahvaltı", "döner", "hamburger", "pizza"]):
+    elif any(k in msg_lower for k in ["mekan", "kafe", "cafe", "restoran", "lokanta", "yemek", "kahvaltı", "döner", "hamburger", "pizza", "kahve", "kahveci", "tatlı", "tatlıcı", "otel", "çorbacı", "starbucks", "market", "avm", "yakınımda", "yakınlar"]):
         category = "places"
     
     # 1b. Multi-intent combo detection → routing'e yükselt
@@ -76,7 +78,7 @@ def classify_intent_fast(message: str) -> dict:
 def get_dynamic_system_prompt(user_context: Union[Dict, str], intent_dict: Union[Dict[str, Any], str]) -> str:
     # 1. Kullanıcı profili
     if isinstance(user_context, dict):
-        user_info = f"Araç: {user_context.get('fuel_type', '?')} | Ev: {user_context.get('home_location', '?')} | Takım: {user_context.get('team', '?')}"
+        user_info = f"Araç: {user_context.get('fuel_type', '?')} | Ev: {user_context.get('home_location', '?')} | Takım: {user_context.get('team', '?')} | ANLIK KONUM KOORDİNATLARI: {user_context.get('current_location', 'Bilinmiyor')}"
     else:
         user_info = str(user_context)
 
@@ -116,6 +118,7 @@ def _get_category_instructions(category: str) -> str:
     if category == "fuel":
         return (
             "Kullanıcının aracına uygun yakıt tipini (Dizelse Motorin, Benzinse Benzin) profilinden kontrol et. "
+            "Sana verilen 'ANLIK KONUM KOORDİNATLARI'nı kullanarak aracı `lat` ve `lon` parametreleriyle çağır! ASLA kullanıcından konum isteme, sistem zaten sana verdi. "
             "Kullanıcı hem 'rota bul' hem de 'yakıt/benzin' istiyorsa MUTLAKA `evaluate_route_strategy` makro aracını kullan — "
             "bu araç rotayı çizer, istasyonları bulur ve yakıt fiyatlarını TEK seferde analiz eder. "
             "Kullanıcı 'yap', 'tamam', 'devam et' gibi bir onay verirse veya önceki mesajda benzin+rota birlikte istenmişse, "
@@ -127,7 +130,8 @@ def _get_category_instructions(category: str) -> str:
         )
     elif category == "pharmacy":
         return (
-            "Eczaneleri `get_pharmacies` ile çek. En yakın ve açık olanı vurgula. "
+            "Eczaneleri `get_pharmacies` ile çek. Parametre olarak her zaman sana sistem tarafından verilen 'ANLIK KONUM KOORDİNATLARI'nı (lat, lon) kullan! ASLA kullanıcından konum sorma! "
+            "En yakın ve açık olanı vurgula. "
             "Adresi LLM olarak sen güzelleştir: 'Hemen Beşiktaş Meydanı'nın arkasında kalıyor' gibi. "
             "Kapanma saati yaklaşıyorsa uyar. 'Çok geçmiş olsun kanki' diyerek kapat."
         )
@@ -140,34 +144,33 @@ def _get_category_instructions(category: str) -> str:
     elif category == "routing":
         return (
             "Bu en karmaşık görev. Adım adım düşün (Chain-of-Thought): "
-            "0. SEYAHAT ÖNCESİ ANKETİ (ZORUNLU): Eğer kullanıcı uzun bir rota istiyorsa ve (1) Ne zaman yola çıkacağı (2) Yemek/Mola durumu (3) Yakıt durumu net olarak belli değilse, KESİNLİKLE HİÇBİR ARAÇ (TOOL) ÇAĞIRMA! Hemen dur ve eksik bilgileri doğal bir dille sor. "
-            "Kullanıcı tüm sorulara cevap verdiğinde (veya kendi baştan hepsini söylediyse) işlemlere başla: "
-            "A. YAKIT/BENZİN İHTİYACI VARSA: "
-            "   Sisteme yakıt fiyatları ve istasyonları hesaplatmak için `evaluate_route_strategy` çağır. (Bu araç otomatik olarak rotayı da çizer). "
-            "B. YEMEK VEYA MOLA İHTİYACI VARSA: "
-            "   ÇOK ÖNEMLİ: `search_hybrid_places` aracını çağırırken `query` parametresine 1-2 kelimelik BASİT kavramlar gir! (Örn: 'restoran', 'kafe', 'döner', 'dinlenme tesisi'). ASLA 'restoran lokanta kahvaltı yemek' gibi karmaşık uzun sorgular atma, API çöker ve 0 sonuç gelir! "
-            "   Eğer arama sonucu 0 mekan dönerse, ASLA lafı geveleme. Kullanıcıya: 'Şu an sistemde bir hata var, o bölgedeki mekanları çekemedim kanki' de. "
-            "C. SADECE ROTA İSTENMİŞSE VE YAKIT/YEMEK YOKSA: "
-            "   Sadece `get_route_data` kullan. "
-            "D. HAVA DURUMU (ETA Bazlı): "
-            "   Kullanıcının çıkış saatine göre `analyze_route_weather` çağır (örneğin 'x saatinde vardığında yağmurlu'). "
-            "E. Radar ve geçiş ücretleri için `get_route_radars` ve `get_toll_for_route` kullan. Mümkün olduğunca her şeyi TEK BİR MESAJDA akıcı bir asistan tonuyla topla."
+            "1. YAKIT/BENZİN İHTİYACI VARSA: Kullanıcı 'yakıt alalım', 'benzin lazım' gibi bir şey dediyse veya uzun bir yola (300km+) çıkıyorsa, "
+            "   MUTLAKA `evaluate_route_strategy` makro aracını çağır. Bu araç rotayı çizer ve istasyonları TEK seferde analiz eder. "
+            "2. YEMEK VEYA MOLA İHTİYACI VARSA: `search_hybrid_places` aracını çağırırken `query` parametresine 1-2 kelimelik BASİT kavramlar gir ('restoran', 'kafe'). "
+            "   Eğer rota üzerindeyse `route_polyline` parametresine 'LATEST' gir. "
+            "3. SADECE ROTA İSTENMİŞSE: `get_route_data` kullan. "
+            "4. ROTA DESTEK ARAÇLARI: Rota oluştuktan sonra radar (`get_route_radars`), hava durumu (`analyze_route_weather`) ve geçiş ücretleri (`get_toll_for_route`) bilgilerini de topla. "
+            "5. ÖZET KART: Tüm veriler toplandıktan sonra `build_route_summary` ile kullanıcıya şık bir Markdown özet sun. "
+            "6. PROAKTİFLİK: Yanıtın sonunda mutlaka kullanıcıya 'Aç mısın?', 'Yakıt durumun nasıl?', 'Kaç mola vermeyi planlıyorsun?' veya 'Yolda bir kahve molası ister misin?' gibi proaktif ve samimi sorular sor. "
+            "7. TON: Profesyonel ve lüks bir yol arkadaşı (concierge) gibi ol. 'Yolun açık olsun' demeyi unutma."
         )
     elif category == "city_data":
         return (
             "İBB verilerini sentezle. 'İspark doluluk oranı %80, bence başka yere park et' gibi aksiyonel tavsiyeler ver. "
-            "Sadece rakam verme, hayat kurtaran yorum yap."
+            "Sadece rakam verme, hayat kurtaran yorum yap. Eğer bir lokasyon ismi geçiyorsa önce `search_hybrid_places` ile koordinat bulup sonra WFS araçlarını (`fetch_ibb_dataset`) kullanabilirsin."
         )
     elif category == "places":
         return (
-            "Mekan arama görevi (Rota Yok). Kullanıcının aradığı mekanı (kafe, restoran vb.) `search_hybrid_places` aracıyla bul. "
-            "Sadece genel bir bölge adı varsa (örn: 'Rize Merkez', 'Kadıköy'), araca `location_name` parametresi olarak o bölgeyi ver. "
-            "ÇOK ÖNEMLİ: `query` kısmına ASLA uzun cümle girme. 1 veya 2 kelimelik çok kısa kavramlar ('kafe', 'restoran', 'hamburger') gir ki API boş dönmesin. "
-            "Eğer dönen sonuçta 'Google API Hatası' veya 'REQUEST_DENIED' yazıyorsa, durumu kullanıcıya açıkça söyle (örn: 'Kanka sistem API anahtarı patlamış, haberin olsun'). "
-            "Eğer API hata vermeden sadece 0 mekan dönerse, lafı geveleme ve 'Şu an bulunamadı, mekanları çekemedim kanki' de."
+            "Mekan arama görevi. ÇOK ÖNEMLİ KURALLAR: "
+            "1. ANLAMSAL ARAMA: Kullanıcı 'sessiz', 'manzaralı', 'huzurlu' gibi kavramlar kullanıyorsa `plan_weather_aware_route` aracını kullan. "
+            "2. DOĞA/UYDU: Doğa, bitki örtüsü veya bölgenin uydu görüntüsüyle ilgili bir soru varsa `get_environmental_analysis` aracını çağır. "
+            "3. TİCARİ ARAMA: Sıradan kafe/restoran aramalarında `search_hybrid_places` kullan. "
+            "4. PARAMETRELER: `query` her zaman kısa (1-2 kelime) olmalı. 'LATEST' polyline desteğini unutma. "
+            "5. KONUM: Kullanıcı bölge belirtmediyse sana verilen 'ANLIK KONUM KOORDİNATLARI'nı kullan, ASLA sorma."
         )
     else:
         return (
             "Genel bir sohbet veya karma bir istek. GeoIntel personasını (samimi, zeki, proaktif) koru. "
+            "Eğer kullanıcı güncel bir bilgi (haber, döviz, genel şehir bilgisi) soruyorsa `search_web_intel` aracını kullanabilirsin. "
             "Kullanıcıya 'Sana nasıl yardımcı olabilirim hocam?' diyerek seçenek sun."
         )
