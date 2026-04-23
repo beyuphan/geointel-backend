@@ -65,12 +65,15 @@ async def search_satellite_imagery(
 
         results = []
         for item in items[:5]:
+            asset = item.assets.get("visual") or item.assets.get("rendered_preview")
+            thumbnail = asset.href if asset else "N/A"
+            
             results.append({
                 "id": item.id,
                 "date": item.datetime.isoformat() if getattr(item, "datetime", None) else "?",
                 "cloud_cover_pct": item.properties.get("eo:cloud_cover", "?"),
                 "platform": item.properties.get("platform", "Sentinel-2"),
-                "thumbnail": item.assets.get("visual", item.assets.get("rendered_preview", {})).get("href", "N/A"),
+                "thumbnail": thumbnail,
             })
 
         return json.dumps({

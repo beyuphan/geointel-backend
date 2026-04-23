@@ -1,4 +1,5 @@
 import httpx
+import json
 from loguru import logger
 from .config import settings, http_client
 from .geometry import sample_route_points
@@ -72,6 +73,7 @@ async def get_toll_for_route_handler(route_polyline: str) -> dict:
             }
 
         data = resp.json()
+        logger.debug(f"💰 [HERE Toll Raw] {json.dumps(data, indent=2)}")
         routes = data.get("routes", [])
 
         if not routes:
@@ -104,10 +106,18 @@ async def get_toll_for_route_handler(route_polyline: str) -> dict:
             for fare in total_fares:
                 if not isinstance(fare, dict):
                     continue
-                if fare.get("currency") == "TRY":
-                    total_cost_try += float(fare.get("price", 0))
+                
+                # Önce TRY ara, yoksa ilk bulduğun geçerli ücreti al
+                price = float(fare.get("price", 0))
+                currency = fare.get("currency", "TRY")
+                
+                if currency == "TRY":
+                    total_cost_try += price
                 elif isinstance(fare.get("convertedPrice"), dict):
                     total_cost_try += float(fare["convertedPrice"].get("price", 0))
+                elif price > 0:
+                    # Kur dönüşümü yapılamadıysa bile (örn. USD) ekle, LLM'e not düşeriz
+                    total_cost_try += price 
 
         if tolls_on_route:
             summary = (

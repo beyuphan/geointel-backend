@@ -224,6 +224,81 @@ async def get_sports_events() -> str:
         await DBHelper.save_matches(live_data)
         
     return create_response(live_data, Match)
+    
+@mcp.tool()
+async def search_web_intel(query: str) -> str:
+    """
+    PERFORMS LIVE WEB SEARCH: Use this for real-time news, current events, 
+    traffic updates not in DB, or finding specific information from the web.
+    Uses a headless browser to fetch top results.
+    """
+    logger.info(f"🌐 [WEB SEARCH] Query: {query}")
+    try:
+        from playwright.async_api import async_playwright
+        results = []
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            # DuckDuckGo is faster and easier to scrape than Google
+            search_url = f"https://duckduckgo.com/html/?q={query.replace(' ', '+')}"
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=15000)
+            
+            results = await page.evaluate("""() => {
+                const items = [];
+                document.querySelectorAll('.result').forEach((el, i) => {
+                    if (i < 5) {
+                        const title = el.querySelector('.result__title')?.innerText.trim();
+                        const snippet = el.querySelector('.result__snippet')?.innerText.trim();
+                        const link = el.querySelector('.result__url')?.href;
+                        if (title) items.push({title, snippet, link});
+                    }
+                });
+                return items;
+            }""")
+            await browser.close()
+            
+        if not results:
+            return json.dumps({"status": "no_results", "message": "İnternette güncel bilgi bulunamadı."}, ensure_ascii=False)
+            
+        return json.dumps({"status": "success", "data": results}, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Web Search Error: {e}")
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+@mcp.tool()
+async def force_refresh_intel_data(city: str, district: str = "") -> str:
+    """
+    MANUAL REFRESH: Forces the system to re-scrape latest data for a city/district.
+    Use this if the user says 'veriler eski' or 'güncelle'.
+    """
+    logger.info(f"🔄 [REFRESH] Zorunlu güncelleme: {city}/{district}")
+    
+    tasks = []
+    tasks.append(get_pharmacies_handler(city, district))
+    if district:
+        tasks.append(get_fuel_prices_handler(city, district))
+    tasks.append(get_events_handler(city))
+    
+    results = await asyncio.gather(*tasks)
+    
+    # Kayıt işlemleri
+    if results[0] and "error" not in results[0][0]:
+        await DBHelper.save_pharmacies(results[0], city)
+    
+    if len(results) > 1 and results[1] and "error" not in results[1][0]:
+        await DBHelper.save_fuel_prices(results[1], city)
+        
+    if results[-1] and "error" not in results[-1][0]:
+        await DBHelper.save_events(results[-1], city)
+
+    return json.dumps({
+        "status": "success", 
+        "message": f"{city.upper()} için tüm veriler zorunlu olarak tazelendi.",
+        "details": {
+            "pharmacies": len(results[0]) if not isinstance(results[0][0], dict) or "error" not in results[0][0] else 0,
+            "events": len(results[-1]) if not isinstance(results[-1][0], dict) or "error" not in results[-1][0] else 0
+        }
+    }, ensure_ascii=False)
 
 if __name__ == "__main__":
     logger.info("🚀 [SYSTEM] Intel Ajanı (Hibrit + JSON Mod) Başlatılıyor...")

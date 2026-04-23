@@ -11,6 +11,8 @@ Senaryo örnekleri:
 """
 import asyncio
 from typing import Optional
+from sqlmodel import select
+from core.db import async_session_maker, UserPreference
 from logger import log
 
 # Firebase Admin SDK opsiyonel — olmasa bile sistem çalışmaya devam eder
@@ -133,6 +135,27 @@ async def push_if_needed(
         if not fcm_token:
             log.debug(f"[FCM] Session {session_id} için FCM token bulunamadı.")
             return False
+
+        # Eğer session_id user_id içeriyorsa (user_id:session_id), tercihleri kontrol et
+        if ":" in session_id:
+            user_id = session_id.split(":")[0]
+            try:
+                from uuid import UUID
+                uid = UUID(user_id)
+                async with async_session_maker() as session:
+                    pref_result = await session.execute(
+                        select(UserPreference).where(
+                            UserPreference.user_id == uid,
+                            UserPreference.key == f"notify_{category}"
+                        )
+                    )
+                    pref = pref_result.scalars().first()
+                    # Tercih "false" olarak ayarlanmışsa bildirimi atla
+                    if pref and pref.value.lower() in ("false", "0", "no"):
+                        log.info(f"[FCM] Kullanıcı '{category}' bildirimlerini kapatmış. Atlanıyor.")
+                        return False
+            except Exception as e:
+                log.warning(f"[FCM] Tercih kontrolü başarısız (görmezden geliniyor): {e}")
 
         payload = {"category": category, "session_id": session_id, **(data or {})}
         return await send_push(fcm_token=fcm_token, title=title, body=body, data=payload)

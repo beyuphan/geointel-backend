@@ -7,6 +7,38 @@ from sqlalchemy.dialects.postgresql import insert
 
 class ProfileManager:
     @staticmethod
+    async def get_combined_context(session_id: str) -> str:
+        """
+        Kullanıcı profili, anlık konumu ve rota geçmişini tek bir context'te birleştirir.
+        Hız için optimize edilmiştir.
+        """
+        # 1. Temel Profil Bilgileri
+        profile = await ProfileManager.get_user_context()
+        
+        # 2. Anlık Konum (Redis)
+        from core.mcp_client import orchestrator
+        current_loc = "Bilinmiyor"
+        if orchestrator.redis_client:
+            try:
+                loc_data = orchestrator.redis_client.get(f"loc:{session_id}")
+                if loc_data:
+                    current_loc = loc_data.decode("utf-8") if isinstance(loc_data, bytes) else loc_data
+            except: pass
+            
+        # 3. Rota Geçmişi
+        history = await ProfileManager.get_route_history(limit=3)
+        history_str = ""
+        if history:
+            lines = [f"  - {r['origin']} -> {r['destination']} ({r['distance_km']}km)" for r in history]
+            history_str = "\nROTA GEÇMİŞİ:\n" + "\n".join(lines)
+
+        return (
+            f"{profile}\n"
+            f"ANLIK KONUM KOORDİNATLARI: {current_loc}\n"
+            f"{history_str}"
+        )
+
+    @staticmethod
     async def get_user_context(username: str = "test_pilot") -> str:
         """
         LLM için kullanıcının özet profilini oluşturur (SQLModel ile refactor edildi).

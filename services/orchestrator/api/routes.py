@@ -237,6 +237,34 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
                 if response_text:
                     _save_history(session_id, message, response_text)
 
+                # 🔥 BULLETPROOF POLYLINE SİSTEMİ (WebSocket)
+                raw_poly = final_visual.get("polyline")
+                if not raw_poly or len(str(raw_poly)) < 50:
+                    try:
+                        cached = orchestrator.redis_client.get(f"route:{session_id}")
+                        if cached: raw_poly = cached if isinstance(cached, str) else cached.decode('utf-8')
+                    except: pass
+                
+                new_polyline = ""
+                if raw_poly:
+                    try:
+                        import flexpolyline
+                        import polyline as google_polyline
+                        if isinstance(raw_poly, list):
+                            new_polyline = google_polyline.encode([p[:2] for p in raw_poly])
+                        elif isinstance(raw_poly, str):
+                            if raw_poly.startswith('[') or raw_poly.startswith('{'):
+                                import json
+                                pts = json.loads(raw_poly)
+                                if isinstance(pts, list): new_polyline = google_polyline.encode([p[:2] for p in pts])
+                            elif raw_poly.startswith('v'):
+                                decoded = flexpolyline.decode(raw_poly)
+                                new_polyline = google_polyline.encode([p[:2] for p in decoded])
+                            else:
+                                new_polyline = raw_poly
+                        final_visual["polyline"] = new_polyline
+                    except: pass
+
                 # Tamamlama mesajı
                 await websocket.send_json({
                     "type": "done",
@@ -309,6 +337,15 @@ async def _run_chat(message: str, session_id: str, current_lat=None, current_lon
     model_used = "claude" if intent.get("complexity") == "high" else "gemini"
     action_cards = _build_action_cards(response_text, visual_data)
 
+    # Kullanılan tool adlarını çıkar (Context Indicator için)
+    tools_used = []
+    for msg in final_state.get("messages", []):
+        if hasattr(msg, "tool_calls"):
+            for tc in (msg.tool_calls or []):
+                name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
+                if name and name not in tools_used:
+                    tools_used.append(name)
+
     return {
         "response_text": response_text,
         "visual_data": visual_data,
@@ -316,6 +353,7 @@ async def _run_chat(message: str, session_id: str, current_lat=None, current_lon
         "intent": intent,
         "model_used": model_used,
         "action_cards": action_cards,
+        "tools_used": tools_used,
         "retry_count": final_state.get("retry_count", 0),
     }
 
@@ -370,7 +408,56 @@ async def chat_v1(request: ChatRequestV1, user: dict = Depends(get_optional_user
                 style="primary" if i == 0 else "secondary",
             ))
 
-        polyline = result["route_polyline"] or result["visual_data"].get("polyline")
+        # 🔥 BULLETPROOF POLYLINE SİSTEMİ (v2.1)
+        # 1. Ham veriyi bul (State -> Redis -> VisualData)
+        raw_polyline = result.get("route_polyline")
+        
+        if not raw_polyline or len(str(raw_polyline)) < 50:
+            try:
+                cached = orchestrator.redis_client.get(f"route:{session_id}")
+                if cached: 
+                    raw_polyline = cached if isinstance(cached, str) else cached.decode('utf-8')
+            except: pass
+
+        if not raw_polyline:
+            raw_polyline = result["visual_data"].get("polyline")
+
+        # 2. Formatı Algıla ve Dönüştür
+        polyline = ""
+        if raw_polyline:
+            import flexpolyline
+            import polyline as google_polyline
+            
+            try:
+                # Durum A: Liste formatında ham koordinatlar [(lat,lon), ...]
+                if isinstance(raw_polyline, list):
+                    polyline = google_polyline.encode([p[:2] for p in raw_polyline])
+                    log.success(f"✅ [Polyline] List -> Google v5 (Points: {len(raw_polyline)})")
+                
+                # Durum B: String formatı
+                elif isinstance(raw_polyline, str):
+                    if raw_polyline.startswith('[') or raw_polyline.startswith('{'):
+                        # JSON string ise listeye çevirip encode et
+                        try:
+                            pts = json.loads(raw_polyline)
+                            if isinstance(pts, list):
+                                polyline = google_polyline.encode([p[:2] for p in pts])
+                                log.success(f"✅ [Polyline] JSON String -> Google v5")
+                        except: pass
+                    elif raw_polyline.startswith('v'):
+                        # FlexPolyline (v6) -> Google v5
+                        decoded = flexpolyline.decode(raw_polyline)
+                        polyline = google_polyline.encode([p[:2] for p in decoded])
+                        log.success(f"✅ [Polyline] Flex v6 -> Google v5")
+                    else:
+                        # Zaten v5 olabilir veya bilinmeyen format, dokunma
+                        polyline = raw_polyline
+            except Exception as e:
+                log.error(f"❌ Polyline dönüştürme hatası: {e}")
+                polyline = str(raw_polyline)
+        
+        if polyline:
+            log.info(f"📤 [Final Polyline] Start: {polyline[:50]}... (Len: {len(polyline)})")
 
         return ApiEnvelope(
             success=True,
@@ -384,6 +471,7 @@ async def chat_v1(request: ChatRequestV1, user: dict = Depends(get_optional_user
                 ),
                 action_cards=cards,
                 model_used=result["model_used"],
+                tools_used=result.get("tools_used", []),
             ).model_dump(),
             metadata=ApiMetadata(
                 response_time_ms=elapsed_ms,
@@ -402,15 +490,18 @@ async def chat_v1(request: ChatRequestV1, user: dict = Depends(get_optional_user
 
 
 @router.post("/api/v1/location/update", response_model=ApiEnvelope, tags=["Location v1"])
-async def update_location_v1(req: LocUpdateV1, user: dict = Depends(get_current_user)):
-    """📱 Auth'lu konum güncelleme."""
+async def update_location_v1(req: LocUpdateV1, user: dict = Depends(get_optional_user)):
+    """📱 Opsiyonel Auth'lu konum güncelleme."""
     t_start = time.monotonic()
-    session_id = req.session_id or f"{user['user_id']}:default"
+    
+    # Kullanıcı giriş yapmamışsa bile anonim session id ile kaydet
+    user_prefix = user['user_id'] if user else "anonymous"
+    session_id = req.session_id or f"{user_prefix}:default"
 
     if orchestrator.redis_client:
         loc_str = f"{req.lat},{req.lon}"
         orchestrator.redis_client.setex(f"loc:{session_id}", 3600, loc_str)
-        log.info(f"📍 [v1/Location] {user['username']} → {loc_str}")
+        log.info(f"📍 [v1/Location] {user_prefix} → {loc_str}")
         return ApiEnvelope(
             success=True,
             data={"location": loc_str, "session_id": session_id},
@@ -422,3 +513,57 @@ async def update_location_v1(req: LocUpdateV1, user: dict = Depends(get_current_
         error=ApiError(code="REDIS_UNAVAILABLE", message="Konum kaydedilemedi."),
         metadata=ApiMetadata(response_time_ms=int((time.monotonic() - t_start) * 1000)),
     )
+
+
+# ===========================================================================
+# HEALTH — Detaylı Servis Durumu (MCP Status Panel)
+# ===========================================================================
+
+@router.get("/api/v1/health", tags=["System"])
+async def health_v1():
+    """
+    📱 Detaylı sistem sağlık kontrolü.
+    Her MCP servisinin ayrı ayrı durumunu raporlar.
+    """
+    import time as _time
+
+    redis_ok = False
+    if orchestrator.redis_client:
+        try:
+            orchestrator.redis_client.ping()
+            redis_ok = True
+        except Exception:
+            pass
+
+    # Her bağlı MCP agent'ın durumunu kontrol et
+    services = []
+    known_services = ["mcp_city", "mcp_intel", "mcp_satellite"]
+
+    connected_agents = list(orchestrator.sessions.keys())
+
+    for svc in known_services:
+        if svc in connected_agents:
+            # Bağlı — tool sayısını bul
+            tool_count = sum(
+                1 for t in orchestrator.runtime_tools
+                if hasattr(t, 'name') and svc.replace('mcp_', '') in getattr(t, 'description', '').lower()
+            )
+            services.append({
+                "name": svc,
+                "status": "online",
+                "tools": tool_count,
+            })
+        else:
+            services.append({
+                "name": svc,
+                "status": "offline",
+                "tools": 0,
+            })
+
+    return {
+        "status": "ok",
+        "redis": redis_ok,
+        "services": services,
+        "agents_connected": connected_agents,
+        "tool_count": len(orchestrator.runtime_tools),
+    }

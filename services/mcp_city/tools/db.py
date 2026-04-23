@@ -63,7 +63,7 @@ async def _get_embedding(text: str, max_retries: int = 2) -> list[float]:
     for attempt in range(max_retries + 1):
         try:
             response = generate_embeddings(
-                model="models/text-embedding-004",
+                model="models/gemini-embedding-001",
                 content=text,
             )
             return response["embedding"]

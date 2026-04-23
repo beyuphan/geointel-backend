@@ -39,16 +39,17 @@ app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
 # CORS — Mobil uygulama ve local development için izin verilen origin'ler
 # Production'da bu listeyi kendi domain'inize göre güncelleyin
 ALLOWED_ORIGINS = [
+    "*",
     "http://localhost:3000",       # React Native Metro
     "http://localhost:8501",       # Streamlit Dashboard
     "http://localhost:19006",      # Expo Dev
     "http://geo_dashboard:8501",   # Docker internal
-    # "https://your-mobile-app.com",  # Production domain (uncomment & update)
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1):\d+",
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],

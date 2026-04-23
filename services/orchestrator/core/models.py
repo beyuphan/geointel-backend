@@ -19,3 +19,4 @@ class AgentState(TypedDict):
     retry_count: int
     session_id: str 
     visual_data: Dict[str, Any]
+    route_polyline: Optional[str]

@@ -28,6 +28,34 @@ MANUAL_TOOLS = [
             },
             "required": ["origin", "destination"]
         }
+    },
+    {
+        "name": "plan_weather_aware_route",
+        "description": "Kullanıcı anlamsal bir mekan aradığında ('sessiz bir yer bul', 'manzaralı kafe') ve oraya rota istediğinde TEK SEFERDE mekanı bulur, hava durumunu kontrol eder ve hava şartlarına uygun rota çizer.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "current_lat": {"type": "number", "description": "Kullanıcının anlık enlemi"},
+                "current_lon": {"type": "number", "description": "Kullanıcının anlık boylamı"},
+                "location_name": {"type": "string", "description": "Aranacak bölge adı (örn: 'Kadıköy'). Boşsa anlık konum kullanılır."},
+                "semantic_query": {"type": "string", "description": "Kullanıcının aradığı mekan türü (örn: sessiz kütüphane)"},
+                "search_radius": {"type": "number", "description": "Arama çapı metre cinsinden, varsayılan 5000"}
+            },
+            "required": ["current_lat", "current_lon", "semantic_query"]
+        }
+    },
+    {
+        "name": "get_environmental_analysis",
+        "description": "Satellite based environmental analysis (vegetation health, latest imagery). Use for nature, agriculture or urban green queries.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "lat": {"type": "number", "description": "Merkez enlem"},
+                "lon": {"type": "number", "description": "Merkez boylam"},
+                "analyze_vegetation": {"type": "boolean", "description": "Bitki örtüsü analizi yapılsın mı?", "default": True}
+            },
+            "required": ["lat", "lon"]
+        }
     }
 ]
 

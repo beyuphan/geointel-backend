@@ -54,27 +54,53 @@ async def _resolve_coordinates(location: str, session_id: str = "test_pilot") ->
     if saved_coord:
         return saved_coord
 
-    # 2. A PLANI: GOOGLE MAPS API
+    # Mevcut konumu bias (ipucu) olarak kullanmak için Redis'ten al
+    current_loc_bias = None
+    if redis_store.client:
+        try:
+            loc_data = redis_store.client.get(f"loc:{session_id}")
+            if loc_data:
+                current_loc_bias = loc_data.decode("utf-8") if isinstance(loc_data, bytes) else loc_data
+        except: pass
+
+    # 2. A PLANI: GOOGLE MAPS API (Geocoding)
     if settings.GOOGLE_MAPS_API_KEY:
-        log.info(f"🌍 [Google] Geocoding yapılıyor: {location}")
+        log.info(f"🌍 [Google Geocode] Deneniyor: {location}")
         try:
             url = "https://maps.googleapis.com/maps/api/geocode/json"
-            params = {
-                "address": location,
-                "key": settings.GOOGLE_MAPS_API_KEY,
-                "language": "tr",
-                "region": "tr"
-            }
+            params = {"address": location, "key": settings.GOOGLE_MAPS_API_KEY, "language": "tr", "region": "tr"}
+            if current_loc_bias:
+                params["location"] = current_loc_bias
+                params["radius"] = "50000" # 50km bias
+            
             resp = await http_client.get(url, params=params, timeout=10.0)
             data = resp.json()
-            
             if data.get("status") == "OK" and data.get("results"):
                 loc = data["results"][0]["geometry"]["location"]
-                lat, lon = loc["lat"], loc["lng"]
-                log.success(f"✅ [Google] Bulundu: {location} -> {lat},{lon}")
-                return f"{lat},{lon}"
+                log.success(f"✅ [Google Geocode] Bulundu: {location} -> {loc['lat']},{loc['lng']}")
+                return f"{loc['lat']},{loc['lng']}"
         except Exception as e:
             log.error(f"Google Geocoding Hatası: {e}")
+
+    # 2.5. A2 PLANI: GOOGLE PLACES (POI Search Fallback)
+    if settings.GOOGLE_MAPS_API_KEY:
+        log.info(f"🔍 [Google Places Search] POI olarak aranıyor: {location}")
+        try:
+            from .google import search_places_google_handler
+            # Bias koordinatlarını ayır
+            b_lat, b_lon = 0.0, 0.0
+            if current_loc_bias and "," in current_loc_bias:
+                b_lat, b_lon = map(float, current_loc_bias.split(","))
+
+            places_res = await search_places_google_handler(location, lat=b_lat, lon=b_lon)
+            all_found = places_res.get("strict_route_places", []) + places_res.get("relaxed_route_places", [])
+            if all_found:
+                coords = all_found[0].get("coords")
+                if coords:
+                    log.success(f"✅ [Google Places] Mekan bulundu: {all_found[0]['name']} -> {coords}")
+                    return coords
+        except Exception as e:
+            log.error(f"Google Places Resolution Hatası: {e}")
 
     # 3. B PLANI: OSM NOMINATIM
     log.info(f"🌍 [OSM] Geocoding deneniyor (Yedek): {location}")
@@ -137,7 +163,7 @@ async def get_location_name(lat, lon):
     return "Bilinmeyen Konum"
 
 # --- 3. ANA ROTA HANDLER (HİBRİT YAPININ KALBİ) ---
-async def get_route_data_handler(origin: str, destination: str, waypoints: list[str] | None = None, session_id: str = "test_pilot") -> dict:
+async def get_route_data_handler(origin: str, destination: str, waypoints: list[str] | None = None, preference: str = "fastest", session_id: str = "test_pilot") -> dict:
     try:
         # A. Koordinat Çözümleme
         origin_coord = await _resolve_coordinates(origin, session_id)
@@ -197,7 +223,7 @@ async def get_route_data_handler(origin: str, destination: str, waypoints: list[
                 log.warning(f"⚠️ [WeatherCost] Hava durumu alınamadı: {we}")
 
             # PostGIS Sorgusu
-            local_result = await get_local_route(lat1, lon1, lat2, lon2, preference="fastest", rain_factor=rain_factor)
+            local_result = await get_local_route(lat1, lon1, lat2, lon2, preference=preference, rain_factor=rain_factor)
             
             if local_result:
                 # 🔥🔥🔥 FİNAL DÜZELTME: MULTILINESTRING DESTEĞİ 🔥🔥🔥
@@ -257,6 +283,7 @@ async def get_route_data_handler(origin: str, destination: str, waypoints: list[
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         params = {
             "transportMode": "car",
+            "routingMode": "fast" if preference != "shortest" else "short",
             "origin": req.origin,
             "destination": req.destination,
             "return": "summary,polyline",
@@ -264,6 +291,11 @@ async def get_route_data_handler(origin: str, destination: str, waypoints: list[
             "departureTime": now_utc,  # 🚦 Canlı trafik dahil ETA
             "apiKey": settings.HERE_API_KEY
         }
+        
+        # 'Safest' için ek kısıtlamalar
+        if preference == "safest":
+            params["avoid[features]"] = "unpavedRoads" # Toprak yollardan kaçın
+            params["routingMode"] = "fast" # Güvenli yol genelde ana yollardır (hızlı olanlar)
         # Waypoint'leri ekle (via parametreleri)
         for i, via in enumerate(via_coords):
             params[f"via[{i}]"] = via
