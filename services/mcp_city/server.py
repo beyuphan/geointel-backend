@@ -634,10 +634,20 @@ async def build_route_summary(
     """
     try:
         import json as _json
-        rd = _json.loads(route_data) if route_data else {}
-        rr = _json.loads(radar_data) if radar_data else None
-        td = _json.loads(toll_data) if toll_data else None
-        wd = _json.loads(weather_data) if weather_data else None
+        def _ensure_dict(val):
+            if val is None: return None
+            if isinstance(val, (dict, list)): return val
+            if isinstance(val, str):
+                if val.strip() == "" or val.strip() == "None": return None
+                try: return _json.loads(val)
+                except: return {"text": val}
+            return val
+
+        rd = _ensure_dict(route_data) or {}
+        rr = _ensure_dict(radar_data)
+        td = _ensure_dict(toll_data)
+        wd = _ensure_dict(weather_data)
+        
         result = build_route_summary_handler(rd, rr, td, wd)
         return _json.dumps(result, ensure_ascii=False)
     except Exception as e:

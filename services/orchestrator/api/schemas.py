@@ -115,6 +115,7 @@ class MapBounds(BaseModel):
 class MapData(BaseModel):
     markers: list[MapMarker] = []
     polyline: Optional[str] = None
+    alternatives: list[str] = [] # 🗺️ Alternatif rotalar için
     bounds: Optional[MapBounds] = None
     center: Optional[dict] = None  # {"lat": float, "lon": float}
     geojson_layers: list[dict] = []

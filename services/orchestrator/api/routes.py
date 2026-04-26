@@ -51,16 +51,36 @@ def _build_workflow():
 
 def _build_action_cards(response_text: str, visual_data: dict) -> list:
     """
-    LLM yanıtına ve görsel veriye göre mobil hızlı aksiyon butonları üretir.
+    LLM yanıtındaki anahtar kelimelere ve görsel veriye göre dinamik butonlar üretir.
     """
     cards = []
-    if visual_data.get("polyline"):
+    text_lower = response_text.lower()
+    
+    # 1. Rota/Navigasyon Kartları
+    if visual_data.get("polyline") or "rota" in text_lower:
         cards.append({"label": "Navigasyonu Başlat", "action": "start_navigation", "icon": "🗺️"})
-        cards.append({"label": "Alternatif Rotalar", "action": "show_alternatives", "icon": "🔄"})
-    if visual_data.get("markers") and len(visual_data["markers"]) > 0:
+        if "alternatif" in text_lower or "yol" in text_lower:
+            cards.append({"label": "Alternatifleri Gör", "action": "Alternatif rotaları göster", "icon": "🔄"})
+    
+    # 2. Yakıt Kartları
+    if any(k in text_lower for k in ["yakıt", "benzin", "mazot", "istasyon"]):
+        cards.append({"label": "Yakıt Analizi", "action": "Yakıt fiyatlarını karşılaştır ve en uygununu bul", "icon": "⛽"})
+    
+    # 3. Yemek/Mekan Kartları
+    if any(k in text_lower for k in ["aç mısın", "yemek", "restoran", "mola", "kahve", "acıktım"]):
+        cards.append({"label": "Yemek Mekanları", "action": "Rota üzerindeki en iyi yemek mekanlarını listele", "icon": "🍴"})
+    
+    # 4. Genel/Destek Kartları
+    if "hava" in text_lower:
+        cards.append({"label": "Hava Durumu", "action": "Rota boyunca hava durumunu analiz et", "icon": "☁️"})
+        
+    if "radar" in text_lower:
+        cards.append({"label": "Radarları Göster", "action": "Yol üzerindeki aktif radar ve kontrol noktalarını bul", "icon": "📸"})
+
+    # Eğer hiç kart yoksa ve bir konum/yer konuşuluyorsa "Haritada Göster" ekle
+    if not cards and (visual_data.get("markers") or "mekan" in text_lower):
         cards.append({"label": "Haritada Göster", "action": "show_on_map", "icon": "📍"})
-    if "benzin" in response_text.lower() or "yakıt" in response_text.lower():
-        cards.append({"label": "Yakıt Karşılaştır", "action": "compare_fuel", "icon": "⛽"})
+        
     return cards
 
 
@@ -435,29 +455,60 @@ async def chat_v1(request: ChatRequestV1, user: dict = Depends(get_optional_user
                     log.success(f"✅ [Polyline] List -> Google v5 (Points: {len(raw_polyline)})")
                 
                 # Durum B: String formatı
+                # 🚨 RADİKAL ÇÖZÜM: Şifrelemeyi (Encoding) çöpe atıyoruz. 
+                # Mobil tarafla koordinat listesi (JSON) üzerinden haberleşeceğiz.
+                
+                # Önce ne gelirse gelsin çözmeye çalış (List, v6 veya v5)
+                decoded_points = []
+                if isinstance(raw_polyline, list):
+                    decoded_points = [p[:2] for p in raw_polyline]
                 elif isinstance(raw_polyline, str):
-                    if raw_polyline.startswith('[') or raw_polyline.startswith('{'):
-                        # JSON string ise listeye çevirip encode et
-                        try:
-                            pts = json.loads(raw_polyline)
-                            if isinstance(pts, list):
-                                polyline = google_polyline.encode([p[:2] for p in pts])
-                                log.success(f"✅ [Polyline] JSON String -> Google v5")
+                    raw_polyline = raw_polyline.strip()
+                    if raw_polyline.startswith('['):
+                        try: decoded_points = json.loads(raw_polyline)
                         except: pass
-                    elif raw_polyline.startswith('v'):
-                        # FlexPolyline (v6) -> Google v5
-                        decoded = flexpolyline.decode(raw_polyline)
-                        polyline = google_polyline.encode([p[:2] for p in decoded])
-                        log.success(f"✅ [Polyline] Flex v6 -> Google v5")
                     else:
-                        # Zaten v5 olabilir veya bilinmeyen format, dokunma
-                        polyline = raw_polyline
+                        # v6 veya v5 deniyoruz
+                        try:
+                            import flexpolyline
+                            decoded_points = flexpolyline.decode(raw_polyline)
+                            log.success(f"✅ [Polyline] v6 Decoded (Points: {len(decoded_points)})")
+                        except:
+                            try:
+                                import polyline as google_polyline
+                                decoded_points = google_polyline.decode(raw_polyline)
+                                log.success(f"✅ [Polyline] v5 Decoded (Points: {len(decoded_points)})")
+                            except:
+                                log.error("❌ Polyline çözülemedi!")
+                
+                # Sonuç: Her zaman açık JSON listesi gönder
+                if decoded_points:
+                    polyline = json.dumps([[float(p[0]), float(p[1])] for p in decoded_points])
+                    log.success(f"🚀 [Polyline] Raw JSON List sent to Mobile (Points: {len(decoded_points)})")
+                else:
+                    polyline = str(raw_polyline)
             except Exception as e:
                 log.error(f"❌ Polyline dönüştürme hatası: {e}")
                 polyline = str(raw_polyline)
         
+
+        # 🗺️ Alternatif Rotaları Yakala
+        alternatives_list = []
+        raw_alternatives = result.get("alternatif_rotalar", [])
+        if isinstance(raw_alternatives, list):
+            for alt in raw_alternatives:
+                try:
+                    alt_raw = alt.get("polyline_encoded", "")
+                    if not alt_raw or alt_raw == raw_polyline: continue
+                    # Alternatifleri de ham JSON listesi olarak gönderiyoruz (Bulletproof!)
+                    import flexpolyline
+                    alt_decoded = flexpolyline.decode(alt_raw)
+                    if alt_decoded:
+                        alternatives_list.append(json.dumps([[float(p[0]), float(p[1])] for p in alt_decoded]))
+                except: continue
+
         if polyline:
-            log.info(f"📤 [Final Polyline] Start: {polyline[:50]}... (Len: {len(polyline)})")
+            log.info(f"📤 [Final Polyline] Sent to Mobile (Alternatives: {len(alternatives_list)})")
 
         return ApiEnvelope(
             success=True,
@@ -467,11 +518,9 @@ async def chat_v1(request: ChatRequestV1, user: dict = Depends(get_optional_user
                 map=MapData(
                     markers=markers,
                     polyline=polyline,
+                    alternatives=alternatives_list,
                     geojson_layers=result["visual_data"].get("geojson_layers", []),
                 ),
-                action_cards=cards,
-                model_used=result["model_used"],
-                tools_used=result.get("tools_used", []),
             ).model_dump(),
             metadata=ApiMetadata(
                 response_time_ms=elapsed_ms,
@@ -512,6 +561,37 @@ async def update_location_v1(req: LocUpdateV1, user: dict = Depends(get_optional
         success=False,
         error=ApiError(code="REDIS_UNAVAILABLE", message="Konum kaydedilemedi."),
         metadata=ApiMetadata(response_time_ms=int((time.monotonic() - t_start) * 1000)),
+    )
+
+@router.get("/api/v1/history/chat", response_model=ApiEnvelope, tags=["History"])
+async def get_chat_history_v1(session_id: str = "default_session", user: dict = Depends(get_optional_user)):
+    """📱 Kullanıcının sohbet geçmişini getirir."""
+    t_start = time.monotonic()
+    history = _load_history(session_id)
+    messages = []
+    for m in history:
+        role = "assistant" if isinstance(m, AIMessage) else "user"
+        messages.append({"role": role, "content": m.content})
+    
+    return ApiEnvelope(
+        success=True,
+        data={"messages": messages},
+        metadata=ApiMetadata(response_time_ms=int((time.monotonic() - t_start) * 1000))
+    )
+
+@router.get("/api/v1/history/routes", response_model=ApiEnvelope, tags=["History"])
+async def get_route_history_v1(user: dict = Depends(get_optional_user)):
+    """📱 Kullanıcının geçmiş rotalarını getirir."""
+    t_start = time.monotonic()
+    # Mock data for demonstration, in production fetch from DB
+    routes = [
+        {"origin": "Beşiktaş", "destination": "Sarıyer", "distance_km": 15.2, "duration_min": 25, "date": "2024-04-24"},
+        {"origin": "Kadıköy", "destination": "Pendik", "distance_km": 28.5, "duration_min": 45, "date": "2024-04-23"}
+    ]
+    return ApiEnvelope(
+        success=True,
+        data={"routes": routes},
+        metadata=ApiMetadata(response_time_ms=int((time.monotonic() - t_start) * 1000))
     )
 
 
