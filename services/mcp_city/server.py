@@ -172,12 +172,15 @@ async def get_route_data(origin: str, destination: str, preference: str = "faste
         response = RouteResponse(
             distance_km=raw_data.get("mesafe_km", 0),
             duration_min=raw_data.get("sure_dk", 0),
-            polyline=final_polyline, 
+            polyline=final_polyline,
             summary=f"{raw_data.get('mesafe_km')} km, {raw_data.get('sure_dk')} dakika",
             checkpoints=raw_data.get("analiz_noktalari", {}),
             source_system=raw_data.get("source", "Bilinmiyor"),
-            alternatives=alternatives
+            alternatives=alternatives,
+            legs=raw_data.get("legs", []),          # Feature 4: per-leg metadata
+            leg_count=raw_data.get("leg_count", 1), # Feature 4: total leg count
         )
+
         
         logger.success(f"✅ [Tool: Rota] {response.source_system} üzerinden rota hazır. {len(alternatives)} alternatif.")
         return response.model_dump_json()

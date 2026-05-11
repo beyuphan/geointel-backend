@@ -1,8 +1,9 @@
 import flexpolyline
 import math
-from shapely.geometry import Point, LineString
+from shapely.geometry import Point, LineString, mapping
 from shapely.ops import transform
 import pyproj
+from typing import Optional
 from loguru import logger as log
 
 # --- PROJEKSİYON AYARLARI ---
@@ -227,6 +228,89 @@ def filter_places_by_polyline(places: list, encoded_polyline: str = None, geojso
         log.error(f"Geometri Hatası (filter_places_by_polyline): {e}")
         return places # Hata durumunda filtreleme yapmadan ham listeyi dön
     
+
+
+def get_route_midpoint(
+    encoded_polyline: str = None,
+    geojson_geometry: dict = None,
+    fraction: float = 0.5
+) -> Optional[dict]:
+    """
+    Rota polyline'ı üzerindeki belirtilen kesirsel noktanın koordinatını döner.
+    fraction=0.5 → yolun tam ortası (midpoint)
+    fraction=0.25 → yolun ilk çeyreği vb.
+    
+    Returns:
+        {"lat": float, "lon": float, "distance_from_start_km": float} veya None (hata)
+    """
+    try:
+        line_coords = _get_line_coords(encoded_polyline, geojson_geometry)
+        if not line_coords or len(line_coords) < 2:
+            return None
+
+        route_line = LineString(line_coords)
+        route_line_m = transform(project_to_meters, route_line)
+        total_length_m = route_line_m.length
+
+        if total_length_m <= 0 or math.isnan(total_length_m):
+            return None
+
+        target_dist_m = total_length_m * max(0.0, min(1.0, fraction))
+        point_m = route_line_m.interpolate(target_dist_m)
+        point_gps = transform(project_to_gps, point_m)
+
+        log.info(
+            f"📍 [GEO] Route midpoint @ fraction={fraction:.2f}: "
+            f"lat={point_gps.y:.5f}, lon={point_gps.x:.5f} "
+            f"(+{target_dist_m/1000:.1f} km)"
+        )
+        return {
+            "lat": point_gps.y,
+            "lon": point_gps.x,
+            "distance_from_start_km": round(target_dist_m / 1000, 2)
+        }
+    except Exception as e:
+        log.error(f"❌ Geometri Hatası (get_route_midpoint): {e}")
+        return None
+
+
+def get_route_buffer_polygon(
+    encoded_polyline: str = None,
+    geojson_geometry: dict = None,
+    buffer_meters: float = 5000.0
+) -> Optional[dict]:
+    """
+    Rota polyline'ı etrafında 'buffer_meters' yarıçaplı bir GeoJSON Polygon döner.
+    OSM/Google sorgularını 'başlangıç noktası' yerine 'tüm rota boyunca' yapmak için
+    bu poligonun bbox'ını veya WKT'sini kullanabilirsiniz.
+
+    Returns:
+        GeoJSON Polygon dict (type + coordinates) veya None (hata)
+    """
+    try:
+        line_coords = _get_line_coords(encoded_polyline, geojson_geometry)
+        if not line_coords or len(line_coords) < 2:
+            return None
+
+        route_line = LineString(line_coords)
+        route_line_m = transform(project_to_meters, route_line)
+
+        # Metre uzayında buffer oluştur
+        buffer_m = route_line_m.buffer(buffer_meters)
+
+        # GPS'e geri çevir
+        buffer_gps = transform(project_to_gps, buffer_m)
+
+        # Shapely Polygon → GeoJSON dict
+        geojson = mapping(buffer_gps)
+        log.info(
+            f"🗺️ [GEO] Route buffer oluşturuldu: {buffer_meters}m — "
+            f"bbox {buffer_gps.bounds}"
+        )
+        return geojson
+    except Exception as e:
+        log.error(f"❌ Geometri Hatası (get_route_buffer_polygon): {e}")
+        return None
 
 
 def calculate_distance_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:

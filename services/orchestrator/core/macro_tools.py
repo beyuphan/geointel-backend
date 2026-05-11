@@ -3,13 +3,18 @@ import json
 from loguru import logger as log
 from typing import Dict, Any, List, Optional
 
+
 class RouteStrategyEvaluator:
     """
     Kullanıcının rotasını hesaplayıp, o rota üzerindeki şehirlerde yakıt fiyatlarını
     sorgulayan ve fiyat/performans (eta/sapma) analizi yapan Macro-Tool yöneticisi.
     Bu sınıf Orchestrator'da barındırılır çünkü hem 'mcp_city' hem 'mcp_intel' ile konuşur.
+
+    Feature 1: Rota polyline'ı oluşturulduktan sonra midpoint üzerinden benzinlik arar.
+    Feature 3: mcp_intel pipeline — her istasyona gerçek akaryakıt fiyatı inject eder,
+               sonuçları ucuzdan pahalıya sıralar.
     """
-    
+
     def __init__(self, mcp_client):
         self.mcp = mcp_client
 
@@ -25,50 +30,71 @@ class RouteStrategyEvaluator:
             log.error(msg)
             return {"status": "error", "message": msg}
 
-    async def evaluate(self, origin: str, destination: str, fuel_type: str = "benzin", fuel_range: Optional[float] = None) -> Dict[str, Any]:
+    async def evaluate(
+        self,
+        origin: str,
+        destination: str,
+        fuel_type: str = "benzin",
+        fuel_range: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """Ana Macro-Tool metodu. Rota çıkarır, şehirleri bulur, fiyatı basar."""
         log.info(f"🧠 [Macro-Tool] Rota Stratejisi Başlatıldı: {origin} -> {destination}")
-        
-        # 1. Rotayı Çiz
-        route_res = await self._safe_call("city", "get_route_data", {"origin": origin, "destination": destination})
+
+        # ─── 1. BASE ROUTE (Feature 1: Önce polyline oluştur) ────────────────
+        route_res = await self._safe_call(
+            "city", "get_route_data", {"origin": origin, "destination": destination}
+        )
         if "error" in route_res or route_res.get("status") == "error":
-             return {"status": "error", "message": f"Rota oluşturulamadı: {route_res.get('message', route_res.get('error', 'Bilinmeyen hata'))}"}
+            return {
+                "status": "error",
+                "message": f"Rota oluşturulamadı: {route_res.get('message', route_res.get('error', 'Bilinmeyen hata'))}",
+            }
 
         polyline = route_res.get("polyline") or route_res.get("polyline_encoded", "")
         if not polyline or "GİZLENDİ" in str(polyline) or "HARİTA" in str(polyline):
-             return {"status": "error", "message": "Geçerli bir polyline bulunamadı."}
+            return {"status": "error", "message": "Geçerli bir polyline bulunamadı."}
 
         safe_route_summary = {
             "distance_km": route_res.get("mesafe_km") or route_res.get("distance_km"),
             "duration_min": route_res.get("sure_dk") or route_res.get("duration_min"),
             "polyline": polyline,
-            "status": "success"
+            "status": "success",
         }
 
-        # 2. Rota üstü yakıt istasyonlarını bul
-        places_res = await self._safe_call("city", "search_hybrid_places", {
-            "query": f"{fuel_type} istasyonu",
-            "route_polyline": polyline
-        })
-        
-        if "error" in places_res or places_res.get("status") == "error":
-            return {"status": "partial_success", "route": safe_route_summary, "warning": "Akaryakıt istasyonları bulunamadı."}
+        # ─── 2. MIDPOINT-BASED BENZINLIK ARAMASI ─────────────────────────────
+        # search_hybrid_places, route_polyline aldığında Google/OSM tarafında
+        # midpoint mantığını (fraction=0.5) otomatik uygular (Feature 1 entegrasyon).
+        places_res = await self._safe_call(
+            "city",
+            "search_hybrid_places",
+            {"query": f"{fuel_type} istasyonu", "route_polyline": polyline},
+        )
 
-        # V2: Support both old format (strict/relaxed) and new format ({places: [...]})
-        places = []
+        if "error" in places_res or places_res.get("status") == "error":
+            return {
+                "status": "partial_success",
+                "route": safe_route_summary,
+                "warning": "Akaryakıt istasyonları bulunamadı.",
+            }
+
+        # Eski ve yeni format desteği
+        places: List[dict] = []
         if isinstance(places_res, list):
             places = places_res
         elif isinstance(places_res, dict):
             places = places_res.get("places", [])
             if not places:
-                # Fallback to old format
-                places = places_res.get("strict_route_places", []) + places_res.get("relaxed_route_places", [])
-        
+                places = (
+                    places_res.get("strict_route_places", [])
+                    + places_res.get("relaxed_route_places", [])
+                )
+
+        # ─── 3. MENZILE GÖRE FİLTRELEME ──────────────────────────────────────
         if fuel_range:
             total_dist_raw = route_res.get("mesafe_km", 0) or route_res.get("distance_km", 0)
             try:
                 total_dist = float(total_dist_raw)
-            except:
+            except Exception:
                 total_dist = 500.0
 
             target_distances = []
@@ -76,7 +102,7 @@ class RouteStrategyEvaluator:
             while curr < total_dist:
                 target_distances.append(curr)
                 curr += fuel_range * 0.8
-            
+
             selected_places = []
             for target in target_distances:
                 best_match = None
@@ -89,82 +115,141 @@ class RouteStrategyEvaluator:
                         best_diff = diff
                 if best_match and best_match not in selected_places:
                     selected_places.append(best_match)
-            
+
             if selected_places:
                 places = selected_places
             else:
                 filtered_places = [p for p in places if p.get("distance_along_route_km", 0) <= fuel_range]
                 if filtered_places:
                     places = filtered_places
-                    places.sort(key=lambda p: abs(fuel_range * 0.8 - p.get("distance_along_route_km", 0)))
+                    places.sort(
+                        key=lambda p: abs(fuel_range * 0.8 - p.get("distance_along_route_km", 0))
+                    )
 
         if not places:
-             return {
-                 "status": "success", 
-                 "route": safe_route_summary,
-                 "analysis": "Rota üzerinde uygun istasyon bulunamadı."
-             }
+            return {
+                "status": "success",
+                "route": safe_route_summary,
+                "analysis": "Rota üzerinde uygun istasyon bulunamadı.",
+            }
 
-        # 3. Rota üzerindeki şehirleri ve fiyatları karşılaştır
-        city_prices = {}
-        processed_cities = set()
-        
-        best_station = places[0]
-        best_address_parts = str(best_station.get("address", "")).split(",")
-        predicted_city = best_address_parts[-1].strip().split(" ")[-1] if len(best_address_parts) > 0 else "Bilinmiyor"
-        
-        # En iyi 8 istasyonu incele (farklı şehirleri yakalamak için)
-        for station in places[:8]:
+        # ─── 4. FEATURE 3: mcp_intel PIPELINE — Fiyat Inject & Sıralama ──────
+        log.info(f"⛽ [Fuel Pipeline] {len(places)} istasyon için mcp_intel'den fiyat çekiliyor...")
+
+        city_price_cache: Dict[str, list] = {}  # "city|district" -> FuelPrice listesi
+
+        async def _enrich_station(station: dict) -> dict:
+            """Tek bir istasyona mcp_intel'den gerçek akaryakıt fiyatı inject et."""
             address = str(station.get("address", ""))
-            # Basit şehir tahmini (virgülden sonraki son parça genellikle şehir/ilçe)
             parts = address.split(",")
-            if len(parts) >= 2:
-                city = parts[-1].strip().split(" ")[-1]
-                if city and city not in processed_cities:
-                    fuel_data = await self._safe_call("intel", "get_fuel_prices", {"city": city, "district": "merkez"})
-                    if fuel_data and "error" not in fuel_data:
-                        prices = fuel_data.get("data", fuel_data)
-                        if isinstance(prices, list) and len(prices) > 0:
-                            # Şehirdeki en ucuz fiyatı bul
-                            cheapest_in_city = min([p.get(fuel_type, 999) for p in prices])
-                            city_prices[city] = cheapest_in_city
-                    processed_cities.add(city)
+            city_guess = parts[-1].strip().split(" ")[-1] if parts else ""
+            district_guess = parts[-2].strip().split(" ")[-1] if len(parts) >= 2 else "merkez"
 
-        # 4. En ucuz şehri belirle
-        cheapest_city = None
-        if city_prices:
-            cheapest_city = min(city_prices, key=city_prices.get)
+            if not city_guess:
+                station["fuel_price_enriched"] = False
+                return station
+
+            ck = f"{city_guess}|{district_guess}".lower()
+
+            if ck not in city_price_cache:
+                fuel_res = await self._safe_call(
+                    "intel",
+                    "get_fuel_prices",
+                    {"city": city_guess, "district": district_guess},
+                )
+                city_price_cache[ck] = fuel_res.get("data", []) if isinstance(fuel_res, dict) else []
+
+            price_list = city_price_cache[ck]
+
+            if price_list:
+                type_key_map = {
+                    "benzin": "gasoline",
+                    "motorin": "diesel",
+                    "dizel": "diesel",
+                    "lpg": "lpg",
+                }
+                price_key = type_key_map.get(fuel_type.lower(), "gasoline")
+                valid = [
+                    p for p in price_list
+                    if isinstance(p.get(price_key), (int, float)) and p.get(price_key, 0) > 5
+                ]
+
+                if valid:
+                    cheapest = min(valid, key=lambda p: p.get(price_key, 9999))
+                    station["fuel_price"] = {
+                        "price_per_liter": cheapest.get(price_key),
+                        "company": cheapest.get("company"),
+                        "fuel_type": fuel_type,
+                        "city": city_guess,
+                        "district": district_guess,
+                    }
+                    station["fuel_price_enriched"] = True
+                    log.info(
+                        f"💰 [{station.get('name', '?')}] "
+                        f"{cheapest.get(price_key)} TL/{fuel_type} ({cheapest.get('company')})"
+                    )
+                    return station
+
+            station["fuel_price_enriched"] = False
+            return station
+
+        # Paralel fiyat sorgulama (en fazla 8 istasyon)
+        enriched_places: List[dict] = list(
+            await asyncio.gather(*[_enrich_station(p) for p in places[:8]])
+        )
+
+        # Ucuzdan pahalıya sırala; fiyat bilinmeyenler en sona
+        def _sort_key(p):
+            fp = p.get("fuel_price") or {}
+            price = fp.get("price_per_liter")
+            has_price = isinstance(price, (int, float))
+            dev = p.get("deviation_meters", p.get("mesafe_raw", 99999))
+            return (0 if has_price else 1, price if has_price else 9999, dev)
+
+        enriched_places.sort(key=_sort_key)
+
+        best_station = enriched_places[0] if enriched_places else {}
+        all_cities: Dict[str, float] = {
+            p["fuel_price"]["city"]: p["fuel_price"]["price_per_liter"]
+            for p in enriched_places
+            if p.get("fuel_price_enriched") and p.get("fuel_price", {}).get("city")
+        }
+        cheapest_city = min(all_cities, key=lambda c: all_cities[c]) if all_cities else None
 
         return {
             "status": "success",
             "route_summary": {
-                 "distance": safe_route_summary["distance_km"],
-                 "duration": safe_route_summary["duration_min"]
+                "distance": safe_route_summary["distance_km"],
+                "duration": safe_route_summary["duration_min"],
             },
             "polyline": polyline,
             "cheapest_fuel_city": {
                 "city": cheapest_city,
-                "price": city_prices.get(cheapest_city) if cheapest_city else None
+                "price": all_cities.get(cheapest_city) if cheapest_city else None,
             },
             "best_station_recommendation": {
-                 "name": best_station.get("name"),
-                 "address": best_station.get("address"),
-                 "open_now": best_station.get("is_open", best_station.get("open_now")),
-                 "rating": best_station.get("rating"),
-                 "lat": best_station.get("lat"),
-                 "lon": best_station.get("lon"),
-                 "estimated_price": city_prices.get(predicted_city)
+                "name": best_station.get("name"),
+                "address": best_station.get("address"),
+                "open_now": best_station.get("is_open", best_station.get("open_now")),
+                "open_at_arrival": best_station.get("open_at_arrival"),
+                "rating": best_station.get("rating"),
+                "lat": best_station.get("lat"),
+                "lon": best_station.get("lon"),
+                "fuel_price": best_station.get("fuel_price"),
             },
-            "all_analyzed_cities": city_prices,
-            "stations_found": len(places),
-            "places": places[:5], # Return top 5 places to be used as markers
+            "all_analyzed_cities": all_cities,
+            "stations_found": len(enriched_places),
+            # Fiyat inject edilmiş, ucuzdan pahalıya sıralı liste (Feature 3)
+            "places": enriched_places[:5],
         }
+
 
 class ContextAwarePOIPlanner:
     """
     Macro-Tool: Anlamsal (semantic) mekan araması yapar, hava durumunu kontrol eder
     ve hava durumuna göre (rain_factor) filtrelenmiş bir rota çizer.
     """
+
     def __init__(self, mcp_client):
         self.mcp = mcp_client
 
@@ -174,37 +259,47 @@ class ContextAwarePOIPlanner:
             if isinstance(res, dict):
                 return res
             if isinstance(res, str):
-                import json
                 try:
                     return json.loads(res)
-                except:
+                except Exception:
                     return {"status": "success", "data": res}
             return {"status": "error", "message": f"Beklenmeyen tür: {type(res)}"}
         except Exception as e:
             log.error(f"API Error in {tool_name}: {str(e)}")
             return {"status": "error", "message": str(e)}
 
-    async def evaluate(self, current_lat: float, current_lon: float, semantic_query: str, location_name: Optional[str] = None, search_radius: float = 5000, username: str = "test_pilot") -> Dict[str, Any]:
-        log.info(f"🧠 [Macro-Tool] ContextAwarePOIPlanner: '{semantic_query}' @ {location_name or (str(current_lat)+','+str(current_lon))}")
-        
-        # 1. Kullanıcı tercihlerini al (Kişiselleştirme)
-        pref_res = await self._safe_call("city", "get_pool", {}) # Placeholder for actual pref call if available, or use a default
-        # NOT: Gerçek sistemde bu ProfileManager'dan gelir. Şimdilik manuel sorgu ekliyoruz.
-        
-        # 2. Koordinat Çözümleme
+    async def evaluate(
+        self,
+        current_lat: float,
+        current_lon: float,
+        semantic_query: str,
+        location_name: Optional[str] = None,
+        search_radius: float = 5000,
+        username: str = "test_pilot",
+    ) -> Dict[str, Any]:
+        log.info(
+            f"🧠 [Macro-Tool] ContextAwarePOIPlanner: '{semantic_query}' @ "
+            f"{location_name or (str(current_lat) + ',' + str(current_lon))}"
+        )
+
+        # 1. Koordinat Çözümleme
         search_lat, search_lon = current_lat, current_lon
         if location_name:
-            geo_res = await self._safe_call("city", "search_hybrid_places", {"query": location_name, "location_name": location_name, "limit": 1})
+            geo_res = await self._safe_call(
+                "city",
+                "search_hybrid_places",
+                {"query": location_name, "location_name": location_name, "limit": 1},
+            )
             places_data = geo_res.get("places", []) if isinstance(geo_res, dict) else []
             if places_data:
                 search_lat = float(places_data[0]["lat"])
                 search_lon = float(places_data[0]["lon"])
 
-        # 3. Hava Durumu Analizi
+        # 2. Hava Durumu Analizi
         weather_res = await self._safe_call("city", "get_weather", {"lat": search_lat, "lon": search_lon})
         weather_condition = "Açık"
         is_bad_weather = False
-        
+
         if "error" not in weather_res:
             weather_data = weather_res.get("data", weather_res)
             if isinstance(weather_data, dict) and "ANLIK_DURUM" in weather_data:
@@ -212,75 +307,84 @@ class ContextAwarePOIPlanner:
                 weather_condition = condition_raw
                 if any(w in condition_raw for w in ["rain", "drizzle", "thunderstorm", "yağmur", "kar", "snow", "fırtına"]):
                     is_bad_weather = True
-                    # Hava kötüyse kapalı mekan (indoor) tercihini sorguya ekle
                     if "kapalı" not in semantic_query.lower() and "iç" not in semantic_query.lower():
                         semantic_query += " kapalı mekan"
-                    search_radius = 2000 # Hareket kabiliyeti azalır
-        
-        # 4. HİBRİT ARAMA (Google + OSM + RAG)
-        # Artık search_hybrid_places kendi içinde RAG yapıyor!
-        poi_res = await self._safe_call("city", "search_hybrid_places", {
-            "query": semantic_query,
-            "lat": search_lat,
-            "lon": search_lon,
-            "location_name": location_name,
-            "category": "commercial"
-        })
-        
+                    search_radius = 2000
+
+        # 3. HİBRİT ARAMA (Google + OSM + RAG)
+        poi_res = await self._safe_call(
+            "city",
+            "search_hybrid_places",
+            {
+                "query": semantic_query,
+                "lat": search_lat,
+                "lon": search_lon,
+                "location_name": location_name,
+                "category": "commercial",
+            },
+        )
+
         places = poi_res.get("places", []) if isinstance(poi_res, dict) else []
-        
+
         if not places:
-             return {
-                 "status": "error",
-                 "message": f"Kritere uygun mekan bulunamadı. ({semantic_query})",
-                 "weather_context": weather_condition,
-                 "suggestion": "Daha genel bir arama yapmayı deneyin veya farklı bir bölge seçin."
-             }
+            return {
+                "status": "error",
+                "message": f"Kritere uygun mekan bulunamadı. ({semantic_query})",
+                "weather_context": weather_condition,
+                "suggestion": "Daha genel bir arama yapmayı deneyin veya farklı bir bölge seçin.",
+            }
 
-        # 5. Sonuçları işle ve en uygun olanı seç
+        # 4. En uygun olanı seç ve rota çiz
         best_poi = places[0]
-        route_res = await self._safe_call("city", "get_route_data", {
-            "origin": f"{current_lat},{current_lon}",
-            "destination": f"{best_poi['lat']},{best_poi['lon']}"
-        })
+        route_res = await self._safe_call(
+            "city",
+            "get_route_data",
+            {
+                "origin": f"{current_lat},{current_lon}",
+                "destination": f"{best_poi['lat']},{best_poi['lon']}",
+            },
+        )
 
-        markers = []
-        for p in places[:5]: # En iyi 5 mekan
-            markers.append({
+        markers = [
+            {
                 "name": p.get("name"),
                 "lat": p.get("lat"),
                 "lon": p.get("lon"),
                 "description": p.get("address", p.get("fusion_status", "")),
-                "type": "poi"
-            })
-        
+                "type": "poi",
+            }
+            for p in places[:5]
+        ]
+
         return {
             "status": "success",
             "intent_analyzed": semantic_query,
             "weather_analysis": {
                 "condition": weather_condition,
                 "is_bad_weather": is_bad_weather,
-                "impact": "Kapalı mekanlar önceliklendirildi." if is_bad_weather else "Normal arama."
+                "impact": "Kapalı mekanlar önceliklendirildi." if is_bad_weather else "Normal arama.",
             },
             "recommendation": {
                 "name": best_poi.get("name"),
                 "address": best_poi.get("address"),
                 "rating": best_poi.get("rating"),
-                "fusion_status": best_poi.get("fusion_status")
+                "fusion_status": best_poi.get("fusion_status"),
             },
             "map": {
                 "markers": markers,
-                "polyline": route_res.get("polyline") if isinstance(route_res, dict) else ""
+                "polyline": route_res.get("polyline") if isinstance(route_res, dict) else "",
             },
             "route_summary": {
                 "distance": route_res.get("mesafe_km"),
-                "duration": route_res.get("sure_dk")
+                "duration": route_res.get("sure_dk"),
             },
-            "alternatives": [p.get("name") for p in places[1:4]]
+            "alternatives": [p.get("name") for p in places[1:4]],
         }
+
 
 class EnvironmentalAnalyst:
     """Satellite data aggregator for environmental health and imagery."""
+
     def __init__(self, orchestrator):
         self.orchestrator = orchestrator
 
@@ -293,24 +397,21 @@ class EnvironmentalAnalyst:
 
     async def evaluate(self, lat: float, lon: float, analyze_vegetation: bool = True) -> Dict[str, Any]:
         log.info(f"🛰️ [Macro-Tool] EnvironmentalAnalyst: {lat},{lon}")
-        
-        # BBOX hesapla (yaklaşık 2km x 2km)
-        offset = 0.01 
+
+        offset = 0.01
         bbox = {
             "min_lon": lon - offset,
             "min_lat": lat - offset,
             "max_lon": lon + offset,
-            "max_lat": lat + offset
+            "max_lat": lat + offset,
         }
 
         results = {}
-        
-        # 1. Bitki örtüsü raporu (NDVI/EVI)
+
         if analyze_vegetation:
             veg_res = await self._safe_call("satellite", "get_vegetation_report", bbox)
             results["vegetation"] = veg_res
 
-        # 2. Son görüntüler
         img_res = await self._safe_call("satellite", "search_satellite_imagery", bbox)
         results["imagery"] = img_res
 
@@ -318,5 +419,5 @@ class EnvironmentalAnalyst:
             "status": "success",
             "location": f"{lat},{lon}",
             "analysis": results,
-            "summary": "Uydu verileri üzerinden çevresel analiz tamamlandı."
+            "summary": "Uydu verileri üzerinden çevresel analiz tamamlandı.",
         }
