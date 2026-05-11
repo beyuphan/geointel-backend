@@ -1,177 +1,296 @@
+"""
+prompt_manager.py — v5.0 (Temiz Yeniden Yazım)
+
+Felsefe:
+  - LLM SADECE tool çağırır ve bir veya iki cümle yazar.
+  - Action card'ları, overlay'leri ve harita verisini SERVER üretir.
+  - LLM asla soru sormaz — UI zaten butonları basacak.
+  - Kategori başına ayrı, net kurallar. Faz mantığı YOK.
+"""
 from typing import Dict, Any, Union
 
-BASE_SYSTEM_PROMPT = """
-You are GeoIntel, a highly intelligent and proactive travel companion. 
-Your goal is to make the user's journey as smooth, safe, and enjoyable as possible.
 
-CRITICAL RULES FOR COMMUNICATION:
-1. NEVER expose internal systems: DO NOT mention tool names, API functions, or system logic.
-2. Be human and conversational: Use "Kanka", "Dostum", "Hocam" naturally in Turkish.
-3. SMART PROACTIVITY: When a user plans a trip, DO NOT autonomously search for fuel, food, or POIs unless explicitly asked. Instead, generate the basic route first and ask the user engaging questions (e.g., "Aç mısın?", "Yakıt durumun nasıl?") so the UI can present Action Cards. Let the user guide the next steps!
-4. ANALYTICAL THINKING: Compare routes not just by distance, but by character (scenic vs. fast vs. fuel-efficient).
+# ─────────────────────────────────────────────────────────────────────────────
+# TEMEL KİŞİLİK & EVRENSEL KURALLAR
+# ─────────────────────────────────────────────────────────────────────────────
 
-INTERNAL SYSTEM RULES:
-5. ABSOLUTE PROHIBITION ON DELAYING ACTIONS: CALL THE TOOL IMMEDIATELY in your very first response if a specific task is requested (like drawing a route or finding a place).
-6. LOCATION RULE: You ALWAYS have the user's 'ANLIK KONUM KOORDİNATLARI'. Use them immediately without asking.
-7. TONE AND FINALIZATION: DO NOT use words like "Navigasyon", "Navigasyonu başlat" or "Yolun açık olsun" unless the user explicitly confirms they are ready to start the journey, as these words automatically trigger the final navigation UI.
+BASE_IDENTITY = """Sen GeoIntel'sin — Türkiye'nin en akıllı seyahat asistanı.
+Samimi, hızlı ve işe odaklısın. Kullanıcıya "kanka", "hocam", "dostum" gibi
+hitaplar kullanırsın ama bunları aşırıya kaçmadan kullanırsın.
+
+━━━ EVRENSEL KURALLAR (İstisna Yok) ━━━
+
+1. TOOL ÖNCE, YORUM SONRA
+   Kullanıcı spesifik bir şey istiyorsa (rota, mekan, eczane, yakıt, etkinlik)
+   ÇEK → SONUÇ OLUNCA YAZ. Asla önce "araştırayım" deme, direkt tool çağır.
+
+2. KISA YAZ
+   Yanıt metni maksimum 2-3 cümle. Listeleme, madde işareti, uzun açıklama yok.
+   Detaylar zaten kartlara ve haritaya yansıyacak.
+
+3. SORU SORMA
+   Kullanıcıya seçenek veya soru sunma. Sistem zaten action card'ları basacak.
+   "İster misin?", "Ne düşünüyorsun?", "Ekleyeyim mi?" — kesinlikle yazma.
+
+4. İÇ SİSTEMİ GİZLE
+   Tool adları, API, sistem logu, debug bilgisi — hiçbirini yazma.
+
+5. KOORDİNAT HER ZAMAN VAR
+   ANLIK_KONUM zaten sana verildi. "Konum belirtmediniz" deme, direkt kullan.
 """
 
-# Keyword-based complexity (replaces the old LLM intent classifier)
-# Only genuinely complex/geospatial tasks go to Claude
-HIGH_KEYWORDS = [
-    "rota", "route", "yol", "git", "navigasyon",
-    "trafik", "radar", "geçiş ücreti", "toll",
-    "wfs", "ibb", "katman",
-    "eczane", "maç", "konser", "etkinlik", "yakıt"
-]
+# ─────────────────────────────────────────────────────────────────────────────
+# KATEGORİ BAZLI TALİMATLAR
+# ─────────────────────────────────────────────────────────────────────────────
 
-def classify_intent_fast(message: str) -> dict:
-    """LLM çağrısı yapmadan, keyword regex ile intent belirle. 
-    Eğer cümle karmaşıksa 'high' döner ve LLM Router'ı tetikler."""
-    msg_lower = message.lower()
-    words = message.split()
-    
-    # 1. Kategori tespiti (Regex/Keyword)
+INSTRUCTIONS = {
+
+    "routing": """━━━ ROTA MODU ━━━
+Kullanıcı bir yere gitmek istiyor veya rotayla ilgili bir şey soruyor.
+
+ADIM 1 — Temel Rotayı Çiz:
+  `get_route_data(origin="CURRENT_LOCATION", destination="[HEDEF]")` çağır.
+  Yanıt: "Rotan hazır kanka! [X] km, yaklaşık [Y] saat [Z] dk."
+  BAŞKA BİR ŞEY YAZMA. Sistem action card'ları ekleyecek.
+
+ADIM 2 — Kullanıcı Yemek/Yakıt/Mola İsterse (action card'a bastıysa):
+  Yemek için: `search_hybrid_places(query="restoran", route_polyline="LATEST")`
+  Yakıt için: `evaluate_route_strategy(origin="CURRENT_LOCATION", destination="[HEDEF]", fuel_type="[ARAÇ_YAKIT_TIPI]")`
+  Radar için: `get_route_radars(route_polyline="LATEST")`
+  Hava için: `analyze_route_weather(polyline="LATEST")`
+
+ADIM 3 — Kullanıcı Durak Eklemek İsterse:
+  Kullanıcının aktif bir rotası (hedefi) varsa, hedefini KESİNLİKLE DEĞİŞTİRME. 
+  `get_route_data(origin="CURRENT_LOCATION", destination="[MEVCUT_HEDEF]", waypoints="[YENİ_DURAĞIN_KOORDİNATLARI]")` çağır.
+  Mevcut hedefini koru ve yeni eklenen yeri sadece waypoint olarak ver.
+  Önceki waypoint'leri UNUTMA, "|" ile birleştir: "41.1,28.4|41.2,28.5"
+  waypoints'e ASLA mekan adı yazma, sadece koordinat.
+
+ROTA BOYUNCA DURAKLAR (Samsun-Rize, İstanbul-Ankara gibi uzun rotalar):
+  Kullanıcı "her şehirde yemek yiyelim" veya "duraklı gidelim" diyorsa:
+  `search_hybrid_places(query="restoran", route_polyline="LATEST")` çağır,
+  güzergah üstünde büyük şehirlerdeki mekanları listele.
+
+POLYLINE KURALLAR:
+  - Elindeki polyline'ı LLM olarak yazma. "LATEST" yaz, sistem Redis'ten okur.
+  - Hesaplanan polyline'ı asla kullanıcıya gösterme.
+""",
+
+    "fuel": """━━━ YAKIT MODU ━━━
+Kullanıcı yakıt fiyatı veya benzin istasyonu soruyor.
+
+- Aktif rota VARSA → `evaluate_route_strategy` kullan (rota üstü analiz).
+  fuel_type'ı kullanıcı profilinden al: gasoline→"benzin", diesel→"motorin", lpg→"lpg"
+- Sadece fiyat soruyorsa → `get_fuel_prices(city="[ŞEHİR]", district="[İLÇE]")` kullan.
+  Koordinat verme! Şehir ve ilçeyi tahmin et.
+- Benzin istasyonu bulmak istiyorsa → `search_hybrid_places(query="benzin istasyonu", lat=..., lon=...)` kullan.
+
+Yanıt: "[Şehir]'de en ucuz [yakıt]: [fiyat] TL/L. Rotandaki en iyi nokta [yer]."
+""",
+
+    "pharmacy": """━━━ ECZANE MODU ━━━
+Kullanıcı nöbetçi eczane veya ilaç soruyor.
+
+`get_pharmacies(city="[ŞEHİR]", district="[İLÇE]")` çağır.
+  - Koordinat GÖNDERME, sadece şehir/ilçe yaz.
+  - İlçe bilinmiyorsa kullanıcının anlık konumuna en yakın tahmini ilçeyi kullan.
+
+Yanıt: "Sana en yakın nöbetçi eczane [Ad] — [Adres]. Birazdan oraya yönlendiriyorum."
+Kapanma saati yakınsa uyar. Samimi ol: "Geçmiş olsun hocam!"
+""",
+
+    "event": """━━━ ETKİNLİK MODU ━━━
+Kullanıcı konser, maç, festival veya etkinlik soruyor.
+
+- Spor için: `get_sports_matches()` çağır, kullanıcının tuttuğu takımı öncekilendir.
+- Konser/festival için: `get_events()` çağır.
+- Etkinlik sonrası navigasyon için: `get_route_data` kullan.
+
+Yanıt: "[Takım] maçı [Tarih] saat [Saat]'te [Stadyum]'da. Harika bir atmosfer seni bekliyor!"
+Trafik uyarısı ekle: "Maç öncesi trafik yoğunlaşabilir, 1 saat erken çık."
+""",
+
+    "city_data": """━━━ ŞEHİR VERİSİ MODU ━━━
+Kullanıcı İBB, ISPARK, afet veya şehir altyapısı soruyor.
+
+`fetch_ibb_dataset(dataset_name="[VERİ_TÜRÜ]")` kullan.
+ISPARK için ayrıca `search_hybrid_places` ile konum bul, sonra WFS ile birleştir.
+
+Yanıt: Sadece aksiyonel bilgi ver. "İSPARK doluluk %80, X metre ötede park yeri var."
+""",
+
+    "places": """━━━ MEKAN ARAMA MODU ━━━
+Kullanıcı kafe, restoran, turistik yer veya herhangi bir mekan arıyor.
+
+- Standart arama: `search_hybrid_places(query="[NE ARIYOR]", lat=[ANLIK_LAT], lon=[ANLIK_LON])`
+- Doğa/sessiz/manzaralı gibi anlamsal arama: `plan_weather_aware_route` kullan.
+- Aktif rota VARSA ve "yolda" veya "güzergahta" geçiyorsa: route_polyline="LATEST" ekle.
+
+Yanıt: "Sana yakın [X] tane [mekan türü] buldum, kartlarda detayları var."
+""",
+
+    "day_plan": """━━━ GÜN PLANLAMA MODU ━━━
+Kullanıcı günününü planlamak istiyor veya "ne yapayım" gibi genel bir istek var.
+
+1. Kullanıcının anlık konumunu ve profilini dikkate al.
+2. Hava durumunu kontrol et: `get_weather(lat=[ANLIK_LAT], lon=[ANLIK_LON])`
+3. Yakındaki seçenekler için: `search_hybrid_places` kullan (kafe, park, müze vb.)
+4. Varsa etkinlikler: `get_events()` veya `get_sports_matches()` çağır.
+
+Yanıt: Hava durumuna göre 2-3 somut öneri sun.
+Örn: "Hava güzel kanka! Önce X'e uğra, öğleden sonra Y'ye git, akşam Z güzel olur."
+""",
+
+    "general": """━━━ GENEL SOHBET MODU ━━━
+Kullanıcı serbest konuşuyor veya kategoriye girmeyen bir şey soruyor.
+
+- Güncel bilgi gerekiyorsa: `search_web_intel(query="[KONU]")` kullan.
+- Kısa, samimi cevap ver.
+- GeoIntel kişiliğini koru: akıllı, dost canlısı, proaktif.
+- Kullanıcıya yardımcı olabileceğin konulara hafifçe değin.
+""",
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTENT CLASSIFIER (Keyword-based, LLM fallback yok — hız öncelikli)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def classify_intent(message: str) -> dict:
+    """
+    Kullanıcı mesajını analiz ederek intent dict döner.
+    LLM çağrısı yapmaz — keyword tabanlı, deterministik.
+    """
+    msg = message.lower().strip()
+    words = msg.split()
+
+    # ── Kategori tespiti ───────────────────────────────────────────────────
     category = "general"
-    if any(k in msg_lower for k in ["rota", "route", "yol", "git", "navigasyon", "mesafe", "süre", "seyahat"]):
-        category = "routing"
-    elif any(k in msg_lower for k in ["benzin", "yakıt", "fuel", "motorin", "lpg", "akaryakıt", "mazot"]):
-        category = "fuel"
-    elif any(k in msg_lower for k in ["eczane", "pharmacy", "ilaç", "nöbetçi"]):
-        category = "pharmacy"
-    elif any(k in msg_lower for k in ["etkinlik", "konser", "festival", "event", "maç", "derbi"]):
-        category = "event"
-    elif any(k in msg_lower for k in ["wfs", "ibb", "dataset", "katman", "afet", "ispark"]):
-        category = "city_data"
-    elif any(k in msg_lower for k in ["mekan", "kafe", "cafe", "restoran", "lokanta", "yemek", "kahvaltı", "döner", "hamburger", "pizza", "kahve", "kahveci", "tatlı", "tatlıcı", "otel", "çorbacı", "starbucks", "market", "avm", "yakınımda", "yakınlar"]):
-        category = "places"
-    
-    # 1b. Multi-intent combo detection → routing'e yükselt
-    # "İstanbul'a giderken yemek yiyelim" → routing (çünkü rota + places birlikte)
-    has_route_keyword = any(k in msg_lower for k in ["rota", "route", "yol", "git", "giderken", "yolda", "yolculuk"])
-    has_fuel_keyword = any(k in msg_lower for k in ["benzin", "yakıt", "motorin", "mazot"])
-    if has_route_keyword and (category == "places" or has_fuel_keyword):
+
+    # Gün planlama — routing'den önce kontrol et
+    if any(k in msg for k in [
+        "günümü planla", "bugün ne yapayım", "ne yapabilirim", "gün planla",
+        "plan yap", "günüm nasıl geçsin", "bana bir şeyler öner"
+    ]):
+        category = "day_plan"
+
+    # Rota / navigasyon
+    elif any(k in msg for k in [
+        "rota", "route", "yol tarifi", "navigasyon", "git", "gidelim",
+        "mesafe", "süre", "ne kadar sürer", "kaç km", "yolculuk", "seyahat",
+        "giderken", "gidiyorum", "geçeceğim", "durak", "waypoint", "mola",
+        "her şehirde", "arası", "dan ", " a git", " e git",
+    ]):
         category = "routing"
 
-    # 2. Karmaşıklık (Hibrit Karar)
-    # Kural A: Özel anahtar kelimeler
-    is_high = any(k in msg_lower for k in HIGH_KEYWORDS)
-    # Kural B: Cümle uzunluğu (Kullanıcının önerisi: >10 kelime zeka gerektirir)
-    if len(words) > 10:
-        is_high = True
-    
-    # 3. Aciliyet
-    urgency = any(k in msg_lower for k in ["acil", "hemen", "şimdi", "urgent", "ambulans"])
-    
-    # 4. Odak noktaları
-    focus = [k for k in HIGH_KEYWORDS if k in msg_lower][:3]
-    
+    # Yakıt
+    elif any(k in msg for k in [
+        "benzin", "motorin", "yakıt", "mazot", "lpg", "akaryakıt",
+        "istasyon", "doldur", "şarj", "elektrikli", "fuel"
+    ]):
+        category = "fuel"
+
+    # Eczane
+    elif any(k in msg for k in [
+        "eczane", "nöbetçi", "ilaç", "pharmacy", "hap", "reçete"
+    ]):
+        category = "pharmacy"
+
+    # Etkinlik
+    elif any(k in msg for k in [
+        "maç", "konser", "festival", "etkinlik", "bilet", "derbi",
+        "stadyum", "tiyatro", "sinema", "gösteri", "event"
+    ]):
+        category = "event"
+
+    # Şehir verisi
+    elif any(k in msg for k in [
+        "ispark", "ibb", "wfs", "katman", "afet", "toplanma", "dataset",
+        "belediye", "altyapı"
+    ]):
+        category = "city_data"
+
+    # Mekan arama
+    elif any(k in msg for k in [
+        "mekan", "kafe", "cafe", "restoran", "lokanta", "yemek", "kahvaltı",
+        "döner", "hamburger", "pizza", "kahve", "tatlı", "otel", "market",
+        "avm", "yakınımda", "yakınlarda", "nerede", "bul", "öner",
+        "manzaralı", "sessiz", "huzurlu", "park", "müze", "tarihi",
+    ]):
+        category = "places"
+
+    # Multi-intent: rota + mekan → routing
+    has_route = any(k in msg for k in ["rota", "giderken", "yolculuk", "seyahat", "yolda"])
+    if has_route and category in ("places", "fuel"):
+        category = "routing"
+
+    # ── Karmaşıklık tespiti ────────────────────────────────────────────────
+    HIGH_COMPLEXITY_SIGNALS = [
+        "her şehirde", "güzergah boyunca", "alternatifleri karşılaştır",
+        "en ucuz", "analiz", "stratejik", "rota üstünde", "hem hem",
+        "hem yakıt hem", "hem yemek hem"
+    ]
+    is_high = (
+        any(k in msg for k in HIGH_COMPLEXITY_SIGNALS)
+        or len(words) > 12
+        or category in ("day_plan", "routing")
+    )
+
+    # ── Aciliyet ──────────────────────────────────────────────────────────
+    urgency = any(k in msg for k in ["acil", "hemen", "şimdi", "ambulans", "urgent"])
+
     return {
         "category": category,
         "complexity": "high" if is_high else "low",
         "urgency": urgency,
-        "focus_points": focus,
-        "needs_deep_analysis": is_high and len(words) > 8 # Ekstra zeka katmanı için ipucu
+        "focus_points": [w for w in words if len(w) > 3][:5],
     }
 
 
-def get_dynamic_system_prompt(user_context: Union[Dict, str], intent_dict: Union[Dict[str, Any], str]) -> str:
-    # 1. Kullanıcı profili
-    if isinstance(user_context, dict):
-        user_info = f"Araç: {user_context.get('fuel_type', '?')} | Ev: {user_context.get('home_location', '?')} | Takım: {user_context.get('team', '?')} | ANLIK KONUM KOORDİNATLARI: {user_context.get('current_location', 'Bilinmiyor')}"
-    else:
-        user_info = str(user_context)
+# Geriye uyumluluk alias'ı (graph.py hâlâ bu isimle import ediyor)
+classify_intent_fast = classify_intent
 
-    # 2. Intent parsing
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DYNAMIC SYSTEM PROMPT BUILDER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_dynamic_system_prompt(user_context: Union[Dict, str], intent_dict: Union[Dict, str]) -> str:
+    """
+    Kullanıcı profiline ve intent'e göre tam system prompt oluşturur.
+    LLM'in ne yapması gerektiğini net talimatlarla anlatır.
+    """
+    # ── Kullanıcı profili ─────────────────────────────────────────────────
+    if isinstance(user_context, dict):
+        fuel_type = user_context.get("fuel_type", "benzin")
+        location  = user_context.get("current_location", "Bilinmiyor")
+        home      = user_context.get("home_location", "?")
+        team      = user_context.get("team", "?")
+        user_line = (
+            f"Araç yakıt tipi: {fuel_type} | "
+            f"ANLIK_KONUM: {location} | "
+            f"Ev: {home} | Takım: {team}"
+        )
+    else:
+        user_line = str(user_context)
+
+    # ── Intent parsing ────────────────────────────────────────────────────
     if isinstance(intent_dict, dict):
         category = intent_dict.get("category", "general")
-        focus_points = intent_dict.get("focus_points", [])
-        urgency = intent_dict.get("urgency", False)
+        urgency  = intent_dict.get("urgency", False)
     else:
         category = str(intent_dict)
-        focus_points = []
-        urgency = False
+        urgency  = False
 
-    focus_str = ", ".join(focus_points) if focus_points else "General"
+    # ── Kategori talimatları ──────────────────────────────────────────────
+    instructions = INSTRUCTIONS.get(category, INSTRUCTIONS["general"])
 
-    # 3. Category-specific instructions
-    instructions = _get_category_instructions(category)
+    # ── Aciliyet ──────────────────────────────────────────────────────────
+    urgency_block = "\n⚠️ ACİL: Kısa, direkt, aksiyonel yanıt ver!\n" if urgency else ""
 
-    # 4. Urgency note
-    urgency_note = "\n⚠️ URGENT: Short, direct, action-focused response!" if urgency else ""
+    return f"""{BASE_IDENTITY}
 
-    # 5. Route history injection removed completely!
-    route_history_str = ""
-
-    return f"""{BASE_SYSTEM_PROMPT}
-👤 USER: {user_info}{route_history_str}
-🎯 TASK: {category.upper()} | Focus: {focus_str}{urgency_note}
-📋 INSTRUCTIONS: {instructions}"""
-
-
-def _get_category_instructions(category: str) -> str:
-    if category == "fuel":
-        return (
-            "Kullanıcının aracına uygun yakıt tipini (Dizelse Motorin, Benzinse Benzin) profilinden kontrol et. "
-            "Yakıt fiyatlarını bulmak için `get_fuel_prices` aracını kullan. Bu araç SADECE `city` (İl) ve `district` (İlçe) parametreleri bekler. Asla lat/lon gönderme! "
-            "Eğer kullanıcı konum belirtmediyse koordinata en yakın şehri/ilçeyi tahmin ederek gönder. "
-            "Kullanıcı hem 'rota bul' hem de 'yakıt/benzin' istiyorsa MUTLAKA `evaluate_route_strategy` makro aracını kullan. "
-            "Sadece benzin istasyonu soruyorsa `search_hybrid_places` (koordinat ile) bul ve `get_fuel_prices` (şehir/ilçe ile) fiyat kıyasla."
-        )
-    elif category == "pharmacy":
-        return (
-            "Eczaneleri `get_pharmacies` ile çek. Bu araç SADECE `city` (İl) ve `district` (İlçe) parametrelerini kabul eder (örn: city='İstanbul', district='Kadıköy'). "
-            "Asla lat/lon gönderme! Eğer ilçe belirtilmemişse kullanıcının profil konumundan tahmin et. En yakın ve açık olanı vurgula. "
-            "Adresi LLM olarak sen güzelleştir: 'Hemen Beşiktaş Meydanı'nın arkasında kalıyor' gibi. "
-            "Kapanma saati yaklaşıyorsa uyar. 'Çok geçmiş olsun kanki' diyerek kapat."
-        )
-    elif category == "event":
-        return (
-            "Playwright ile güncel çekilen `get_events` veya `get_sports_matches` sonuçlarını analiz et. "
-            "Kullanıcının tuttuğu takımın (varsa) maçlarını önceliklendir. "
-            "Etkinlik saati trafik yoğunluğu uyarısını yap. 'İnanılmaz bir atmosfer seni bekliyor' gibi samimi yorumlar ekle."
-        )
-    elif category == "city_data":
-        return (
-            "İBB verilerini sentezle. 'İspark doluluk oranı %80, bence başka yere park et' gibi aksiyonel tavsiyeler ver. "
-            "Sadece rakam verme, hayat kurtaran yorum yap. Eğer bir lokasyon ismi geçiyorsa önce `search_hybrid_places` ile koordinat bulup sonra WFS araçlarını (`fetch_ibb_dataset`) kullanabilirsin."
-        )
-    elif category == "places":
-        return (
-            "Mekan arama görevi. ÇOK ÖNEMLİ KURALLAR: "
-            "1. ANLAMSAL ARAMA: Kullanıcı 'sessiz', 'manzaralı', 'huzurlu' gibi kavramlar kullanıyorsa `plan_weather_aware_route` aracını kullan. "
-            "2. DOĞA/UYDU: Doğa, bitki örtüsü veya bölgenin uydu görüntüsüyle ilgili bir soru varsa `get_environmental_analysis` aracını çağır. "
-            "3. TİCARİ ARAMA: Sıradan kafe/restoran aramalarında `search_hybrid_places` kullan. "
-            "━━━ FAZ 3: SEÇİM / GÜNCELLEME ━━━\n"
-            "Kullanıcı kart seçti ('Rotama Ekle') veya numara söyledi ya da doğal dille bir yer istedi (örn: 'Yason burnuna da gidelim'):\n"
-            "  1. Eğer kullanıcının mesajı 'Rotama X ekle (koordinatlar: LAT,LON)' formatındaysa → direkt bu koordinatları kullan.\n"
-            "  2. Eğer kullanıcı sadece mekan adı verdiyse ('Yason burnunu görelim', '1. mekanı ekle') → ÖNCE `search_hybrid_places` ile arama yapıp koordinatlarını (lat,lon) bul!\n"
-            "  3. Koordinatları elde ettikten sonra `get_route_data(origin='CURRENT_LOCATION', destination='[HEDEF]', waypoints='[lat,lon]')` çağır!\n"
-            "     - DİKKAT: waypoints parametresine ASLA mekan adı GİRME. SADECE virgüllü koordinatlar gir!\n"
-            "  4. Ek süre/mesafeyi hesapla: EK = yeni - eski\n"
-            "  5. 'Süper! [Mekan Adı] durağın rotana eklendi ✅ +[N]dk ek yol. Radar ve hava durumunu ekleyeyim mi?' de."
-        )
-    elif category == "routing":
-        return (
-            "Kullanıcı bir rota, hedef veya yön soruyor.\n"
-            "━━━ FAZ 1: İLK ROTA İSTEĞİ ━━━\n"
-            "Kullanıcı sadece bir yere gitmek istiyorsa ('Rizeye rota oluştur'):\n"
-            "1. SADECE `get_route_data` aracıyla origin='CURRENT_LOCATION' ve destination='[HEDEF]' diyerek ana rotayı çizdir.\n"
-            "2. ASLA yakıt, yemek, radar veya hava durumunu kendi kendine arama! Sadece temel rotayı (mesafe, süre) sun.\n"
-            "3. Rota çizildikten sonra kullanıcıya proaktif sorular sorarak Action Card'ları tetikle: 'Yolculuk uzun, yakıt durumunu kontrol edelim mi?', 'Yolda bir şeyler yemek ister misin?', 'Radarlara veya hava durumuna bakalım mı?'.\n\n"
-            "━━━ FAZ 3: SEÇİM / GÜNCELLEME ━━━\n"
-            "Kullanıcı 'rotama şu durağı ekle' veya 'X e gidelim' derse:\n"
-            "1. `get_route_data(origin='CURRENT_LOCATION', destination='[HEDEF]', waypoints='[lat,lon]')` çağır!\n"
-            "2. Rota geçmişindeki ÖNCEKİ WAYPOINT'leri unutma! Yeni durağı '|' ile ekle (örn: '41.1,28.4|41.2,28.5').\n"
-            "3. waypoints parametresine ASLA mekan adı GİRME. SADECE virgüllü koordinatlar gir!\n\n"
-            "━━━ FAZ 4: FİNAL ÖZET ━━━\n"
-            "Kullanıcı 'Hadi gidelim', 'Hava ve radar ekle' derse:\n"
-            "1. `analyze_route_weather` ve `get_route_radars` araçlarını (polyline='LATEST' ile) çağır.\n"
-            "2. Sonuçları `build_route_summary` gibi şık bir Markdown ile sun ve 'İyi yolculuklar kanka, navigasyonu başlatıyorum' de."
-        )
-    else:
-        return (
-            "Genel bir sohbet veya karma bir istek. GeoIntel personasını (samimi, zeki, proaktif) koru. "
-            "Eğer kullanıcı güncel bir bilgi (haber, döviz, genel şehir bilgisi) soruyorsa `search_web_intel` aracını kullanabilirsin. "
-            "Kullanıcıya 'Sana nasıl yardımcı olabilirim hocam?' diyerek seçenek sun."
-        )
+👤 KULLANICI PROFİLİ: {user_line}
+🎯 GÖREV KATEGORİSİ: {category.upper()}
+{urgency_block}
+{instructions}"""

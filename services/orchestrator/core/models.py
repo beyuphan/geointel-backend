@@ -1,26 +1,31 @@
 import operator
 from typing import Literal, List, Dict, Any, Union, Annotated, TypedDict, Optional
-from pydantic import BaseModel, create_model, Field
+from pydantic import BaseModel, Field
+
 
 class IntentAnalysis(BaseModel):
-    category: Literal["fuel", "pharmacy", "event", "routing", "city_data", "places", "general"] = Field(
-        description="Kullanıcının isteğinin ana kategorisi"
-    )
-    urgency: bool = Field(description="İşlem acil mi?")
-    focus_points: List[str] = Field(description="Anahtar kelimeler")
+    category: Literal[
+        "routing",      # Rota, navigasyon, yol tarifi
+        "fuel",         # Yakıt fiyatı, benzin istasyonu
+        "pharmacy",     # Nöbetçi eczane, ilaç
+        "event",        # Konser, maç, etkinlik
+        "city_data",    # İBB WFS, ISPARK, afet
+        "places",       # Kafe, restoran, mekan arama
+        "day_plan",     # Gün planlama ("günümü planla", "bugün ne yapayım")
+        "general",      # Serbest sohbet
+    ] = Field(description="Kullanıcı isteğinin kategorisi")
+    urgency: bool = Field(default=False, description="Acil mi?")
+    focus_points: List[str] = Field(default=[], description="Anahtar kelimeler")
     complexity: Literal["low", "high"] = Field(
-        description="Basit bilgi çekme ve arama (Örn: Eczane nerede, fiyatlar nedir) için 'low'. "
-                    "Çoklu adım, analiz, rota kıyaslaması ve çevresel faktör sentezi için 'high'."
+        default="low",
+        description="Tek adımlı: 'low'. Çok adımlı analiz/sentez: 'high'."
     )
+
 
 class AgentState(TypedDict):
     messages: Annotated[List[Any], operator.add]
-    intent: Dict[str, Any]
+    intent: Dict[str, Any]           # classify_intent'ten gelen sonuç
     retry_count: int
-    session_id: str 
-    visual_data: Dict[str, Any]
-    route_polyline: Optional[str]
-    # Phase 1=İlk rota | 2=POI önerisi (yemek/mola/yakıt) | 3=Seçim yapıldı | 4=Final onay
-    routing_phase: Optional[int]
-    # Son POI aramasından gelen mekanlar (overlay kart sistemi için)
-    poi_suggestions: Optional[List[Dict[str, Any]]]
+    session_id: str
+    visual_data: Dict[str, Any]      # markers, polyline, geojson
+    route_polyline: Optional[str]    # Redis'teki polyline kopyası
