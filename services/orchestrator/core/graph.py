@@ -14,10 +14,43 @@ async def intent_node(state: AgentState):
     # Her yeni istekte harita verilerini sıfırla (Eski pinler temizlensin)
     state["visual_data"] = {"markers": [], "polyline": None, "geojson_layers": []}
     state["route_polyline"] = None
-    
+
+    # Routing phase tespiti: kullanıcı cevabı mı, yoksa ilk istek mi?
+    # Phase 1: İlk rota isteği  |  Phase 2: POI önerisi (yemek/mola/yakıt sorusu)
+    # Phase 3: Seçim yapıldı (kart tıklandı / numara söylendi)  |  Phase 4: Final onay (radar+hava+özet)
     messages = state["messages"]
+    current_phase = state.get("routing_phase", 1)
+    if orchestrator.redis_client:
+        try:
+            has_route = orchestrator.redis_client.exists(f"route:{state.get('session_id', 'default')}")
+            if has_route:
+                last_msg = messages[-1].content if messages else ""
+                last_lower = last_msg.lower()
+
+                # Phase 4: Kullanıcı final onayı verdi (radar+hava+özet tetiklenecek)
+                phase4_triggers = ["hazırım", "gidelim", "tamam gidelim", "başlat", "navigasyon başlat",
+                                    "radar ekle", "hava ekle", "evet hazırım", "her şey tamam"]
+                if any(t in last_lower for t in phase4_triggers):
+                    current_phase = 4
+
+                # Phase 3: Kullanıcı kart seçti veya durak belirledi
+                elif any(t in last_lower for t in ["rotama ekle", "koordinatlar:", "seçiyorum",
+                                                    "oraya gidelim", "onu seç", "tamam orası",
+                                                    "1.", "2.", "3.", "onu istiyorum", "o olsun"]):
+                    current_phase = 3
+
+                # Phase 2: Kullanıcı yemek/yakıt/mola cevabı verdi
+                elif any(t in last_lower for t in ["evet", "yemek", "restoran", "kafe", "yiyeceğim",
+                                                     "acıktım", "yakıt", "benzin", "mola", "dur",
+                                                     "evet dur", "hangisini", "öner", "nereden",
+                                                     "bir şey ye", "duralım", "molalı"]):
+                    current_phase = 2
+        except:
+            pass
+    
     msg = messages[-1].content
     intent_data = classify_intent_fast(msg)
+    intent_data["routing_phase"] = current_phase
     
     # [Hafıza Entegrasyonu] Kısa veya genel mesajlarda geçmişe bak
     if (intent_data["category"] == "general" or len(msg.split()) < 3) and len(messages) > 1:
@@ -77,8 +110,8 @@ async def intent_node(state: AgentState):
         except Exception as e:
             log.warning(f"⚠️ [DeepIntent] LLM hatası, Regex'e dönülüyor: {e}")
 
-    log.success(f"🎯 [Intent] Kategori: {intent_data['category'].upper()} | Karmaşıklık: {intent_data['complexity'].upper()}")
-    return {"intent": intent_data}
+    log.success(f"🎯 [Intent] Kategori: {intent_data['category'].upper()} | Karmaşıklık: {intent_data['complexity'].upper()} | Rota Aşaması: Phase {current_phase}")
+    return {"intent": intent_data, "routing_phase": current_phase}
 
 from langgraph.graph import END
 
@@ -200,6 +233,13 @@ async def custom_tool_node(state: AgentState):
         # Görsel verileri burada yakalayıp asıl ToolMessage ile birlikte döndür
         local_visual = {"markers": [], "polyline": None}
         
+        # MCP tool'ları JSON string döndürüyor — parse et
+        if isinstance(res, str):
+            try:
+                res = json.loads(res)
+            except (json.JSONDecodeError, TypeError):
+                pass  # Parse edilemiyorsa string kalır
+        
         if isinstance(res, dict):
             if res.get("status") == "error":
                 return ToolMessage(content=json.dumps(res, ensure_ascii=False), tool_call_id=tc["id"]), None
@@ -222,13 +262,83 @@ async def custom_tool_node(state: AgentState):
                 if "polyline" in res: res["polyline"] = "[HARİTAYA ÇİZİLDİ]"
                 if "polyline_encoded" in res: res["polyline_encoded"] = "[HARİTAYA ÇİZİLDİ]"
 
-            # Marker Yakalama
-            if "lat" in res and "lon" in res:
-                local_visual["markers"].append({"name": res.get("name", "Hedef"), "lat": res["lat"], "lon": res["lon"]})
-            if "places" in res and isinstance(res["places"], list):
-                for p in res["places"]:
-                    if "lat" in p and "lon" in p:
-                        local_visual["markers"].append({"name": p.get("name", "Mekan"), "lat": p["lat"], "lon": p["lon"]})
+            # Marker Yakalama — SADECE mekan/POI araçlarından gelen pinleri ekle
+            # Rota araçları (get_route_data, evaluate_route_strategy) marker oluşturmamalı
+            POI_TOOLS = {"search_hybrid_places", "get_pharmacies", "get_events",
+                         "search_web_intel", "get_sports_matches", "find_ev_charging"}
+            if t_name in POI_TOOLS:
+                if "lat" in res and "lon" in res:
+                    local_visual["markers"].append({
+                        "name": res.get("name", "Nokta"),
+                        "lat": res["lat"], "lon": res["lon"],
+                        "type": "poi"
+                    })
+                # search_hybrid_places: strict + relaxed listelerini işle
+                if "strict_route_places" in res or "relaxed_route_places" in res:
+                    all_places = res.get("strict_route_places", []) + res.get("relaxed_route_places", [])
+                    for p in all_places:
+                        if "lat" in p and "lon" in p:
+                            local_visual["markers"].append({
+                                # Temel alanlar
+                                "name": p.get("name", "Mekan"),
+                                "title": p.get("name", "Mekan"),
+                                "lat": p["lat"], "lon": p["lon"],
+                                "type": "fuel_station" if any(
+                                    k in (p.get("name", "") + str(res)).lower()
+                                    for k in ["benzin", "shell", "opet", "bp", "petrol", "total", "akaryak"]
+                                ) else "poi",
+                                "snippet": p.get("address", ""),
+                                # ★ Zengin POI kart alanları (tamamini aktar)
+                                "on_route_side": p.get("on_route_side", "unknown"),
+                                "opening_hours": p.get("opening_hours", []),
+                                "open_now": p.get("open_now"),
+                                "eta": p.get("eta"),
+                                "deviation_meters": p.get("deviation_meters", 0),
+                                "distance_along_route_km": p.get("distance_along_route_km"),
+                                "rating": p.get("rating"),
+                                "review_count": p.get("review_count"),
+                                "price_level": p.get("price_level"),
+                                "phone": p.get("phone"),
+                                "address": p.get("address", ""),
+                            })
+                elif "places" in res and isinstance(res["places"], list):
+                    # Eski format (list of places)
+                    for p in res["places"]:
+                        if "lat" in p and "lon" in p:
+                            local_visual["markers"].append({
+                                "name": p.get("name", "Mekan"),
+                                "title": p.get("name", "Mekan"),
+                                "lat": p["lat"], "lon": p["lon"],
+                                "type": "poi",
+                                "snippet": p.get("address") or p.get("description") or "",
+                                "on_route_side": p.get("on_route_side", "unknown"),
+                                "opening_hours": p.get("opening_hours", []),
+                                "open_now": p.get("open_now"),
+                                "rating": p.get("rating"),
+                                "deviation_meters": p.get("deviation_meters", 0),
+                            })
+                # Eczane için type düzenle
+                if t_name == "get_pharmacies":
+                    for m in local_visual["markers"]:
+                        m["type"] = "pharmacy"
+                            
+            # 🔥 YENİ: get_route_data çağrılırken waypoint varsa onları haritaya PIN olarak ekle
+            if t_name == "get_route_data" and args.get("waypoints"):
+                wps = args["waypoints"].split("|")
+                for i, w in enumerate(wps):
+                    w = w.strip()
+                    if "," in w:
+                        try:
+                            lat, lon = map(float, w.split(","))
+                            local_visual["markers"].append({
+                                "name": f"Durak {i+1}",
+                                "lat": lat, "lon": lon,
+                                "type": "poi",
+                                "snippet": "Seçilen Ara Durak"
+                            })
+                            log.info(f"📍 [Waypoint Marker] Haritaya eklendi: {lat},{lon}")
+                        except: pass
+
 
         # Sıkıştırma ve Paketleme
         tool_output = compress_result(t_name, res)

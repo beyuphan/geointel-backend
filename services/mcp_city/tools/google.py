@@ -4,7 +4,8 @@ import json
 import hashlib
 import asyncio
 from loguru import logger
-from .geometry import get_distance_from_route, sample_route_points
+from .geometry import get_distance_from_route, sample_route_points, get_place_route_side
+
 from .cache import redis_store
 
 # Ortam değişkenlerinden API anahtarını al
@@ -107,8 +108,9 @@ async def search_places_google_handler(query: str, lat: float = None, lon: float
             # Rota hız tahmini
             avg_speed_kmh = 80.0
             
-            from datetime import datetime, timedelta
-            now = datetime.now()
+            from datetime import datetime, timedelta, timezone
+            # Türkiye saati (UTC+3)
+            now = datetime.now(timezone.utc) + timedelta(hours=3)
             
             for place in all_raw_results:
                 geom = place.get("geometry", {}).get("location")
@@ -122,10 +124,15 @@ async def search_places_google_handler(query: str, lat: float = None, lon: float
                     "address": place.get("formatted_address"),
                     "rating": rating,
                     "review_count": review_count,
-                    "score": rating * review_count, # Yeni puanlama algoritması
+                    "score": rating * review_count,
                     "coords": f"{geom['lat']},{geom['lng']}",
-                    "open_now": place.get("opening_hours", {}).get("open_now", "Bilinmiyor")
+                    "open_now": place.get("opening_hours", {}).get("open_now", "Bilinmiyor"),
+                    "opening_hours": place.get("opening_hours", {}).get("weekday_text", []),
+                    "price_level": place.get("price_level"),  # 0-4 arası fiyat seviyesi
+                    "phone": place.get("formatted_phone_number"),
+                    "website": place.get("website"),
                 }
+
 
                 # Rota üzerindeyse mesafe ve ZAMAN (ETA) analizi yap
                 if should_calc_distance:
@@ -165,8 +172,16 @@ async def search_places_google_handler(query: str, lat: float = None, lon: float
                         
                         # KRİTERLER: 400m (Yol üstü), 5000m (Kısa sapma)
                         if place_obj["deviation_meters"] <= 400:
+                            # Yön tespiti: Sağ taraf mı, sol taraf mı?
+                            place_obj["on_route_side"] = get_place_route_side(
+                                geom['lat'], geom['lng'], route_polyline
+                            )
                             on_route_list.append(place_obj)
                         elif place_obj["deviation_meters"] <= 5000:
+                            # Sapmalı mekanlar için de yön tespiti yap
+                            place_obj["on_route_side"] = get_place_route_side(
+                                geom['lat'], geom['lng'], route_polyline
+                            )
                             detour_list.append(place_obj)
                 else:
                     # Rota yoksa tüm sonuçları ana listeye ekle

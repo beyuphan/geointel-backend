@@ -25,8 +25,15 @@ COMPRESSION_RULES = {
         "keep_place_fields": ["name", "address", "rating", "types", "description", "coords", "open_now", "eta_from_route_min", "user_ratings_total"]
     },
     "search_hybrid_places": {
-        "max_results": 8,
-        "keep_place_fields": ["name", "address", "rating", "types", "description", "lat", "lon", "fusion_status", "is_open", "user_ratings_total"]
+        "max_results": 6,
+        "keep_place_fields": [
+            "name", "address", "rating", "review_count", "lat", "lon",
+            "fusion_status", "is_open", "open_now",
+            "deviation_meters", "distance_along_route_km", "eta", "score",
+            "on_route_side",  # ★ Sağ/sol taraf tespiti (kritik!)
+            "price_level",    # Fiyat seviyesi
+            "phone",          # Telefon
+        ]
     },
     "get_fuel_prices": {
         "max_results": 10,

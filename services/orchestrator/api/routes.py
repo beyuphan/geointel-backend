@@ -24,6 +24,7 @@ from api.schemas import (
     ApiResponse as ApiEnvelope, ApiError, ApiMetadata,
     ChatResponse, MapData, MapMarker, ActionCard,
     ChatRequest as ChatRequestV1, LocationUpdateRequest as LocUpdateV1,
+    PoiOverlay, PoiOverlayCard, RoutingPhaseInfo,
 )
 from api.deps import get_current_user, get_optional_user
 
@@ -49,39 +50,322 @@ def _build_workflow():
     return workflow.compile()
 
 
-def _build_action_cards(response_text: str, visual_data: dict) -> list:
+def _build_action_cards(response_text: str, visual_data: dict, routing_phase: int = 1) -> list:
     """
-    LLM yanıtındaki anahtar kelimelere ve görsel veriye göre dinamik butonlar üretir.
+    LLM yanıtındaki anahtar kelimelere, görsel veriye ve routing fazına göre
+    dinamik action butonları üretir.
+
+    action alanı iki türde olabilir:
+      - "ui:<action>"   → Mobil uygulama direkt handle eder, AI'a GÖNDERİLMEZ
+      - "<metin>"       → Kullanıcı adına AI'a gönderilecek mesaj
     """
     cards = []
     text_lower = response_text.lower()
-    
-    # 1. Rota/Navigasyon Kartları
-    if visual_data.get("polyline") or "rota" in text_lower:
-        cards.append({"label": "Navigasyonu Başlat", "action": "start_navigation", "icon": "🗺️"})
-        if "alternatif" in text_lower or "yol" in text_lower:
-            cards.append({"label": "Alternatifleri Gör", "action": "Alternatif rotaları göster", "icon": "🔄"})
-    
-    # 2. Yakıt Kartları
-    if any(k in text_lower for k in ["yakıt", "benzin", "mazot", "istasyon"]):
-        cards.append({"label": "Yakıt Analizi", "action": "Yakıt fiyatlarını karşılaştır ve en uygununu bul", "icon": "⛽"})
-    
-    # 3. Yemek/Mekan Kartları
-    if any(k in text_lower for k in ["aç mısın", "yemek", "restoran", "mola", "kahve", "acıktım"]):
-        cards.append({"label": "Yemek Mekanları", "action": "Rota üzerindeki en iyi yemek mekanlarını listele", "icon": "🍴"})
-    
-    # 4. Genel/Destek Kartları
-    if "hava" in text_lower:
-        cards.append({"label": "Hava Durumu", "action": "Rota boyunca hava durumunu analiz et", "icon": "☁️"})
-        
-    if "radar" in text_lower:
-        cards.append({"label": "Radarları Göster", "action": "Yol üzerindeki aktif radar ve kontrol noktalarını bul", "icon": "📸"})
+    has_polyline = bool(visual_data.get("polyline"))
+    has_markers = bool(visual_data.get("markers"))
 
-    # Eğer hiç kart yoksa ve bir konum/yer konuşuluyorsa "Haritada Göster" ekle
-    if not cards and (visual_data.get("markers") or "mekan" in text_lower):
-        cards.append({"label": "Haritada Göster", "action": "show_on_map", "icon": "📍"})
+    food_keywords = ["yemek", "restoran", "kafe", "mola", "aç mısın", "acıktım", "yiyelim", "kahvaltı", "mekan"]
+    fuel_keywords = ["yakıt", "benzin", "mazot", "istasyon", "dolduralım", "şarj"]
+    weather_keywords = ["hava", "yağmur", "kar", "fırtına"]
+    radar_keywords = ["radar", "kontrol noktası", "jandarma"]
+    nav_keywords = ["navigasyon başlat", "yolun açık", "hazırım", "gidelim"]
+
+    # ── FAZ 4: Final özet — sadece navigasyon başlatma kartı ─────────────────
+    if routing_phase == 4 or any(k in text_lower for k in nav_keywords):
+        cards.append({
+            "label": "Navigasyonu Başlat",
+            "action": "ui:start_navigation",
+            "icon": "🗺️",
+            "style": "primary"
+        })
+        if has_polyline:
+            cards.append({
+                "label": "Rotayı Paylaş",
+                "action": "ui:share_route",
+                "icon": "📤",
+                "style": "secondary"
+            })
+        return cards[:3]
+
+    # ── FAZ 3: Seçim yapıldı, rota güncellendi ──────────────────────────────
+    if routing_phase == 3 and has_polyline:
+        cards.append({
+            "label": "Radar ve Hava Durumu Ekle",
+            "action": "Evet, radar ve hava durumunu da ekle, yolculuk özetini hazırla",
+            "icon": "📸",
+            "style": "primary"
+        })
+        cards.append({
+            "label": "Navigasyonu Başlat",
+            "action": "ui:start_navigation",
+            "icon": "🗺️",
+            "style": "primary"
+        })
+        cards.append({
+            "label": "Yolda Yemek mi Yiyeceksin?",
+            "action": "Evet yolda yemek yemek istiyorum, güzergahımın ortasında uygun restoranları öner",
+            "icon": "🍽️",
+            "style": "secondary"
+        })
+        cards.append({
+            "label": "Yakıt Durumumu Analiz Et",
+            "action": "ui:fuel_range_prompt",
+            "action_template": "Yakıt analizimi yap, {range_km} km menzilim var, güzergahtaki en uygun durak noktalarini ve her birinde alternatif istasyonlari goster",
+            "icon": "⛽",
+            "style": "secondary"
+        })
+        return cards[:4]
+
+    # ── FAZ 2: POI önerisi — overlay zaten açık, minimum kart ───────────────
+    if routing_phase == 2 and has_markers:
+        # Overlay varken "Bu Mekanı Rotama Ekle" gereksiz (kart üzerinde zaten var)
+        # Sadece farklı öneri ve atla kartları yeterli
+        cards.append({
+            "label": "Yolda Yemek mi Yiyeceksin?",
+            "action": "Evet yolda yemek yemek istiyorum, güzergahımın ortasında uygun restoranları öner",
+            "icon": "🍽️",
+            "style": "secondary"
+        })
+        cards.append({
+            "label": "Yakıt Durumumu Analiz Et",
+            "action": "ui:fuel_range_prompt",
+            "action_template": "Yakıt analizimi yap, {range_km} km menzilim var, güzergahtaki en uygun durak noktalarini ve her birinde alternatif istasyonlari goster",
+            "icon": "⛽",
+            "style": "secondary"
+        })
+        return cards[:4]
+
+    # ── FAZ 1: Yeni rota çizildi → proaktif soru kartları ───────────────────
+    if has_polyline:
+        cards.append({
+            "label": "Navigasyonu Başlat",
+            "action": "ui:start_navigation",
+            "icon": "🗺️",
+            "style": "primary"
+        })
+        # Alternatif rotalar — UI-only (AI'a gönderilmez, harita katmanını toggle eder)
+        cards.append({
+            "label": "Alternatifleri Gör",
+            "action": "ui:show_alternatives",
+            "icon": "🔄",
+            "style": "secondary"
+        })
+        # Yemek sorusu — güzergah bilgisiyle zenginleştirilmiş mesaj
+        cards.append({
+            "label": "Yolda Yemek mi Yiyeceksin?",
+            "action": "Evet yolda yemek yemek istiyorum, güzergahımın ortasında uygun restoranları öner",
+            "icon": "🍽️",
+            "style": "secondary"
+        })
+        # Yakıt kartı — UI önce menzil sorar, sonra AI'a detaylı mesaj gönderir
+        cards.append({
+            "label": "Yakıt Durumumu Analiz Et",
+            "action": "ui:fuel_range_prompt",
+            # Mobil bu template'i kullanır: "Yakıt analizimi yap, {range_km} km menzilim var, güzergahtaki en uygun durak ilçelerini ve istasyonları bul"
+            "action_template": "Yakıt analizimi yap, {range_km} km menzilim var, güzergahtaki en uygun durak noktalarini ve her birinde alternatif istasyonlari goster",
+            "icon": "⛽",
+            "style": "secondary"
+        })
+        # Radar — çalışan action
+        cards.append({
+            "label": "Radar Kontrolü",
+            "action": "Yol üzerindeki aktif radar ve kontrol noktalarını göster",
+            "icon": "📸",
+            "style": "secondary"
+        })
+        # Yeni nesil Premium Action
+        cards.append({
+            "label": "Manzaralı / Kaliteli Molalar",
+            "action": "Yol üzerindeki en iyi manzaralı, kaliteli ve premium mola mekanlarını (kahve/dinlenme) göster",
+            "icon": "☕",
+            "style": "secondary"
+        })
         
-    return cards
+        return cards[:5]
+
+    # ── Mekan önerildi ama polyline yok (standalone POI sorgusu) ─────────────
+    if has_markers and not has_polyline:
+        cards.append({
+            "label": "Haritada Göster",
+            "action": "ui:show_on_map",
+            "icon": "📍",
+            "style": "primary"
+        })
+        cards.append({
+            "label": "Rotama Ekle",
+            "action": "Bu mekanı rotama ekle ve güzergahı güncelle",
+            "icon": "➕",
+            "style": "secondary"
+        })
+        cards.append({
+            "label": "Farklı Mekan Öner",
+            "action": "Başka alternatifleri öner",
+            "icon": "🔍",
+            "style": "secondary"
+        })
+        return cards[:3]
+
+    # ── Bağımsız yakıt/hava/radar kartları ──────────────────────────────────
+    if any(k in text_lower for k in fuel_keywords) and not has_polyline:
+        cards.append({
+            "label": "Yakıt Analizi",
+            "action": "Yakıt fiyatlarını karşılaştır ve en uygununu bul",
+            "icon": "⛽",
+            "style": "primary"
+        })
+    if any(k in text_lower for k in weather_keywords):
+        cards.append({
+            "label": "Hava Durumu Detayı",
+            "action": "Rota boyunca hava durumunu detaylı analiz et",
+            "icon": "☁️",
+            "style": "secondary"
+        })
+    if any(k in text_lower for k in radar_keywords) and not has_polyline:
+        cards.append({
+            "label": "Radarları Göster",
+            "action": "Yol üzerindeki aktif radar ve kontrol noktalarını bul",
+            "icon": "📸",
+            "style": "secondary"
+        })
+
+    # Maksimum 5 kart — UI taşmasın
+    return cards[:5]
+
+
+def _build_poi_overlay(markers: list, response_text: str) -> PoiOverlay | None:
+    """
+    Marker listesinden mobil tam ekran swipe overlay nesnesi oluşturur.
+    Sadece mekan önerisi varken (markers > 0, polyline yok veya POI fazı) çağrılır.
+    """
+    if not markers:
+        return None
+
+    text_lower = response_text.lower()
+    is_fuel = any(k in text_lower for k in ["benzin", "yakıt", "istasyon", "petrol", "opet", "shell", "bp"])
+    is_food = any(k in text_lower for k in ["restoran", "yemek", "kafe", "lokanta", "kahvaltı", "döner"])
+    is_market = any(k in text_lower for k in ["market", "avm", "alışveriş"])
+
+    if is_fuel:
+        title = "⛽ Yol Üzerindeki Yakıt İstasyonları"
+        category = "benzin_istasyonu"
+    elif is_food:
+        title = "🍽️ Yol Üzerindeki Yemek Mekanları"
+        category = "restoran"
+    elif is_market:
+        title = "🛒 Yakındaki Marketler"
+        category = "market"
+    else:
+        title = "📍 Yakındaki Mekanlar"
+        category = "poi"
+
+    cards = []
+    best_idx = 0  # En iyi kartı belirle (en düşük sapma + en yüksek puan)
+    best_score = -1
+
+    for i, m in enumerate(markers):
+        poi_card = m.poi_card or {}
+        deviation = poi_card.get("deviation_meters", 9999) or 9999
+        rating = poi_card.get("rating") or 0
+        # Sapma azlığı + puan = skorlama
+        score = (1 / (deviation + 1)) * 1000 + rating
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+        # Sapma etiketi
+        if deviation <= 400:
+            deviation_label = "Yol üstü ✅"
+        elif deviation <= 2000:
+            deviation_label = f"{deviation}m sapma ⚠️"
+        else:
+            deviation_label = f"{deviation/1000:.1f}km uzatır ❌"
+
+        # Ek süre etiketi (yaklaşık: deviation_meters / 500 m/dk ≈ dk)
+        extra_min = round(deviation / 500) if deviation > 400 else 0
+        if extra_min == 0:
+            route_impact_label = "Sıfır ek süre"
+        else:
+            route_impact_label = f"+{extra_min} dk"
+
+        place_id = f"poi_{i}_{m.lat}_{m.lon}".replace(".", "_")
+
+        cards.append(PoiOverlayCard(
+            id=place_id,
+            name=m.title or m.snippet or "Mekan",
+            address=poi_card.get("address") or m.snippet,
+            category=category,
+            lat=m.lat,
+            lon=m.lon,
+            deviation_meters=deviation if deviation < 9999 else None,
+            distance_along_route_km=poi_card.get("distance_along_route_km"),
+            extra_time_min=extra_min if deviation > 400 else 0,
+            eta=poi_card.get("eta"),
+            on_route_side=poi_card.get("on_route_side"),
+            rating=poi_card.get("rating"),
+            review_count=poi_card.get("review_count"),
+            price_level=poi_card.get("price_level"),
+            is_open=poi_card.get("is_open") or poi_card.get("open_now"),
+            open_now=poi_card.get("open_now"),
+            opening_hours=poi_card.get("opening_hours"),
+            phone=poi_card.get("phone"),
+            deviation_label=deviation_label,
+            route_impact_label=route_impact_label,
+            is_recommended=False,  # Sonradan best_idx ile set edilecek
+            recommendation_reason=None,
+        ))
+
+    # En iyi kartı işaretle
+    if cards:
+        best_card = cards[best_idx]
+        cards[best_idx] = best_card.model_copy(update={
+            "is_recommended": True,
+            "recommendation_reason": "En iyi konum ve puan kombinasyonu",
+        })
+
+    # Önce önerilen kart, sonra yol üstündekiler, sonra sapmaya göre sırala
+    def _sort_key(c: PoiOverlayCard):
+        return (
+            0 if c.is_recommended else 1,
+            0 if c.on_route_side == "right" else 1,
+            c.deviation_meters or 9999,
+        )
+    cards.sort(key=_sort_key)
+
+    subtitle = f"{len(cards)} mekan bulundu · Kaydırarak incele"
+
+    return PoiOverlay(
+        mode="poi_selection",
+        title=title,
+        subtitle=subtitle,
+        cards=cards,
+        primary_action="Rotama Ekle",
+        secondary_action="Farklı Mekan Öner",
+    )
+
+
+def _build_routing_phase_info(
+    phase: int,
+    visual_data: dict,
+    session_id: str,
+    destination: str | None = None,
+    waypoints_count: int = 0,
+) -> RoutingPhaseInfo:
+    """Mevcut routing fazını ve harita durumunu mobil için paketler."""
+    phase_labels = {
+        1: "Rota Hazır",
+        2: "Mekan Seçimi",
+        3: "Rota Güncellendi",
+        4: "Yolculuk Özeti",
+    }
+    has_polyline = bool(visual_data.get("polyline"))
+    return RoutingPhaseInfo(
+        phase=phase,
+        phase_label=phase_labels.get(phase, "Rota Hazır"),
+        has_active_route=has_polyline,
+        active_destination=destination,
+        waypoints_count=waypoints_count,
+    )
+
 
 
 def _load_history(session_id: str) -> list:
@@ -334,6 +618,9 @@ async def _run_chat(message: str, session_id: str, current_lat=None, current_lon
         "retry_count": 0,
         "session_id": session_id,
         "visual_data": {"markers": [], "polyline": None, "geojson_layers": []},
+        "routing_phase": 1,
+        "route_polyline": None,
+        "poi_suggestions": None,
     })
 
     # Yanıt metni çıkar
@@ -354,8 +641,9 @@ async def _run_chat(message: str, session_id: str, current_lat=None, current_lon
 
     visual_data = final_state.get("visual_data", {})
     intent = final_state.get("intent", {})
+    routing_phase = intent.get("routing_phase", 1)
     model_used = "claude" if intent.get("complexity") == "high" else "gemini"
-    action_cards = _build_action_cards(response_text, visual_data)
+    action_cards = _build_action_cards(response_text, visual_data, routing_phase=routing_phase)
 
     # Kullanılan tool adlarını çıkar (Context Indicator için)
     tools_used = []
@@ -410,22 +698,61 @@ async def chat_v1(request: ChatRequestV1, user: dict = Depends(get_optional_user
         markers = []
         for m in raw_markers:
             if isinstance(m, dict) and "lat" in m:
+                # Zengin POI kart metadata'sı
+                on_route_side = m.get("on_route_side", "unknown")
+                poi_card = {
+                    "on_route_side": on_route_side,
+                    # Sağ/sol taraf görseli için etiket
+                    "side_label": (
+                        "✅ Sağ taraf (U-dönüşü gerekmez)" if on_route_side == "right"
+                        else "⚠️ Sol taraf (Karşı şerit)" if on_route_side == "left"
+                        else None
+                    ),
+                    "opening_hours": m.get("opening_hours", []),
+                    "open_now": m.get("open_now"),
+                    "eta": m.get("eta"),
+                    "deviation_meters": m.get("deviation_meters", 0),
+                    "distance_along_route_km": m.get("distance_along_route_km"),
+                    "rating": m.get("rating"),
+                    "review_count": m.get("review_count"),
+                    "price_level": m.get("price_level"),  # 0-4 arası
+                    "phone": m.get("phone"),
+                    "address": m.get("snippet") or m.get("address") or m.get("description"),
+                    "type": m.get("type", "poi"),
+                }
                 markers.append(MapMarker(
                     lat=m["lat"], lon=m.get("lon", m.get("lng", 0)),
                     title=m.get("title", m.get("name")),
-                    type=m.get("type"),
+                    type=m.get("type", "poi"),
                     icon=m.get("icon"),
+                    snippet=m.get("snippet") or m.get("address") or m.get("description"),
+                    poi_card=poi_card,
                 ))
+        # ★ POI kartlarını mantıklı sırala: Önce sapması düşük olanlar (deviation_meters), sonra rating.
+        # Note: Eğer deviation bilgisi yoksa arkaya at.
+        def _sort_marker(m):
+            card = getattr(m, "poi_card", {}) or getattr(m, "poi_card") or {}
+            if isinstance(card, dict):
+                dev = card.get("deviation_meters")
+                if dev is not None:
+                    return dev
+            return 99999
+        
+        markers.sort(key=_sort_marker)
 
         # Action cardsı ActionCard formatına
         cards = []
         for i, c in enumerate(result["action_cards"]):
+            action_str = c["action"]
+            is_ui_only = action_str.startswith("ui:")
             cards.append(ActionCard(
                 id=c.get("action", f"action_{i}"),
                 label=c["label"],
-                action=c["action"],
+                action=action_str,
                 icon=c.get("icon", ""),
-                style="primary" if i == 0 else "secondary",
+                style=c.get("style", "primary" if i == 0 else "secondary"),
+                action_template=c.get("action_template"),
+                is_ui_only=is_ui_only,
             ))
 
         # 🔥 BULLETPROOF POLYLINE SİSTEMİ (v2.1)
@@ -510,6 +837,36 @@ async def chat_v1(request: ChatRequestV1, user: dict = Depends(get_optional_user
         if polyline:
             log.info(f"📤 [Final Polyline] Sent to Mobile (Alternatives: {len(alternatives_list)})")
 
+        # ★ POI OVERLAY: Mekan önerisi fazındaysa (markers var, polyline YOK veya phase==2)
+        # AI yemek/yakıt/mola önerisi yapıyorsa mobil tam ekran kart arayüzünü açsın
+        current_phase = result.get("intent", {}).get("routing_phase", 1)
+        has_poi_markers = len(markers) > 0
+        has_route_polyline = bool(polyline)
+        # Phase 2: sadece POI önerisi yapılan tur → overlay aç
+        # Phase 1 + markers: rota çizildi VE aynı anda POI önerildi → overlay aç
+        should_show_overlay = has_poi_markers and (
+            current_phase == 2
+            or (current_phase == 1 and not has_route_polyline)
+        )
+        poi_overlay = _build_poi_overlay(markers, result["response_text"]) if should_show_overlay else None
+
+        # ★ ROUTING PHASE INFO
+        # Aktif destinasyonu rota geçmişinden tahmin et
+        active_dest = None
+        route_history = result.get("intent", {}).get("route_history", [])
+        if route_history:
+            active_dest = route_history[-1].get("destination")
+        waypoints_count = sum(
+            1 for m in markers if (m.poi_card or {}).get("type") == "waypoint"
+        )
+        routing_phase_info = _build_routing_phase_info(
+            phase=current_phase,
+            visual_data=result["visual_data"],
+            session_id=session_id,
+            destination=active_dest,
+            waypoints_count=waypoints_count,
+        ) if result.get("intent", {}).get("category") == "routing" else None
+
         return ApiEnvelope(
             success=True,
             data=ChatResponse(
@@ -521,6 +878,10 @@ async def chat_v1(request: ChatRequestV1, user: dict = Depends(get_optional_user
                     alternatives=alternatives_list,
                     geojson_layers=result["visual_data"].get("geojson_layers", []),
                 ),
+                action_cards=cards,
+                tools_used=result.get("tools_used", []),
+                poi_overlay=poi_overlay,
+                routing_phase=routing_phase_info,
             ).model_dump(),
             metadata=ApiMetadata(
                 response_time_ms=elapsed_ms,

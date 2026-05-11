@@ -240,3 +240,73 @@ def calculate_distance_meters(lat1: float, lon1: float, lat2: float, lon2: float
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     
     return R * c
+
+
+def get_place_route_side(p_lat: float, p_lon: float, encoded_polyline: str) -> str:
+    """
+    Bir mekanın seyahat yönüne göre sağ mı sol mu tarafta olduğunu belirler.
+    Cross-product (çapraz çarpım) yöntemi kullanır.
+    
+    Dönüş değerleri:
+        'right'   → Seyahat yönüne göre SAĞ taraf (ideal — U-dönüşü gerekmez)
+        'left'    → Seyahat yönüne göre SOL taraf (yolun karşısı — tehlikeli)
+        'unknown' → Hesaplanamadı
+    """
+    try:
+        if not encoded_polyline or len(encoded_polyline) < 5:
+            return 'unknown'
+        
+        # Polyline'ı decode et
+        try:
+            decoded = flexpolyline.decode(encoded_polyline)
+            if len(decoded) < 2:
+                return 'unknown'
+            line_coords = [(lat, lon) for lat, lon in decoded]
+        except Exception:
+            return 'unknown'
+        
+        # Mekana en yakın rota segmentini bul
+        min_dist = float('inf')
+        closest_seg_start = None
+        closest_seg_end = None
+        
+        for i in range(len(line_coords) - 1):
+            a_lat, a_lon = line_coords[i]
+            b_lat, b_lon = line_coords[i + 1]
+            
+            # Segmente olan mesafeyi hesapla (basit öklid)
+            # Orta noktaya olan mesafeyi kullan
+            mid_lat = (a_lat + b_lat) / 2
+            mid_lon = (a_lon + b_lon) / 2
+            dist = (p_lat - mid_lat) ** 2 + (p_lon - mid_lon) ** 2
+            
+            if dist < min_dist:
+                min_dist = dist
+                closest_seg_start = (a_lat, a_lon)
+                closest_seg_end = (b_lat, b_lon)
+        
+        if not closest_seg_start or not closest_seg_end:
+            return 'unknown'
+        
+        # Çapraz çarpım ile yön tespiti
+        # Vektör AB: seyahat yönü
+        # Vektör AP: segment başından mekana olan yön
+        ax, ay = closest_seg_start[1], closest_seg_start[0]  # lon, lat
+        bx, by = closest_seg_end[1], closest_seg_end[0]
+        px, py = p_lon, p_lat
+        
+        # Cross product z-bileşeni
+        cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+        
+        # Cross product > 0 → P, AB'nin solunda
+        # Cross product < 0 → P, AB'nin sağında
+        # (Kuzey-doğu koordinat sisteminde sağ taraf negatif cross product)
+        if cross < 0:
+            return 'right'
+        elif cross > 0:
+            return 'left'
+        else:
+            return 'right'  # Tam üzerinde → sağ kabul et
+    except Exception as e:
+        log.warning(f"⚠️ Yön tespiti hatası: {e}")
+        return 'unknown'

@@ -20,3 +20,7 @@ class AgentState(TypedDict):
     session_id: str 
     visual_data: Dict[str, Any]
     route_polyline: Optional[str]
+    # Phase 1=İlk rota | 2=POI önerisi (yemek/mola/yakıt) | 3=Seçim yapıldı | 4=Final onay
+    routing_phase: Optional[int]
+    # Son POI aramasından gelen mekanlar (overlay kart sistemi için)
+    poi_suggestions: Optional[List[Dict[str, Any]]]

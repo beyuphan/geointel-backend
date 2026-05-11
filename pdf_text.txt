@@ -1,0 +1,212 @@
+PROJE SUNUMU
+G E O IN T E L
+MCP SERVER 
+EYÜPHAN BİNİCİ
+MURAT GÜMÜŞ
+DR. OGR. ÜYESİ
+OĞUZ EMRE KURAL
+Problem 
+Literatür Taraması 
+Mevcut Çözümler
+İÇİNDEKİLER
+03
+04
+Çözüm: MCP
+05
+Veri Kaynakları:
+Rotalama ve Trafik
+06
+Meteorolojik Zekâ &
+Akıllı Mekan Keşfi
+07
+Uydu Görüntüleri &
+API'siz Veriler
+Sistem Mimarisi:
+Akıllı Karar Mekanizması
+08
+09
+MCP Katmanları
+10
+Algoritmalar
+11
+Mobil Mimari
+Tercihi
+12
+Kullanıcı Senaryosu
+13
+Başarı Kriterleri
+14
+İş Zaman Kriterleri
+Kaynakça
+1516
+Navigasyonun Tem el SorunuVeriler birbiriyle konuşm uyor.
+Bu yüzden sistem  karar
+verem iyor.
+Sistem  sadece "En kısa yol?"
+sorusuna cevap verebiliyor
+"En güvenli/m antıklı yol?"
+sorusu cevapsız kalıyor
+03
+ VERİTABANI
+Tam Kontrol 
+Çok Güçlü Analiz
+Çok Karmaşık
+Uzmanlık Gereksinimi
+TİCARİ API
+Güvenilir & Güncel
+Kullanımı Kolay
+Kapalı Kutu (Esnek Değil)
+Pahalı & Bağımlılık
+AÇIK KAYNAK
+Esnek & Ücretsiz
+Topluluk Desteği
+Derin Analiz Yok
+Sadece Görsel
+04
+Hedefimiz, hem açık kaynağın esnekliğini, hem ticari çözümlerin
+gücünü birleştirmek.
+Literatür - Mevcut
+Çözümler
+ÇÖZÜM:  MCP  
+MODEL CONTEXT PROTOCOLLLM, doğal dili
+anlar. Karar verir ve
+plan yapar. Fakat
+dış verilere
+doğrudan
+bağlanamaz
+05
+MCP, evrensel çevirmen rolündedir. Standart bir iletişim
+protokolüdür. LLM ile dış dünya bağlantısı sağlar.Farklı diller konuşur.
+(API, DB, Web)
+Her biri farklı
+protokol kullanır.
+LLM ile iletişim
+kuramaz.
+Rotalam a ve TrafikSensör Tabanlı Veri: Sadece GPS
+değil; Silecek, ABS ve Tekerlek hızı
+verisi.
+Endüstriyel Standart: Otomotiv
+sektörünün güvenilir trafik verisi.
+Ölçeklenebilirlik: Tüm dünyada
+anlık trafik yoğunluğu.
+06KÜRESEL ÖLÇEK 
+Here Maps API v8 YEREL KONTROL
+PostGIS + pgRouting
+OpenStreetMap ile şehir yol ağı
+PostGIS ‘e yüklenir.
+Dinamik Maliyet: Hava durumu ve 
+eğime göre değişen yol ağırlığı.
+Tam Kontrol: Sokak bazlı
+özelleştirilebilir graf yapısı.Hibrit Karar
+Mekanizması
+Rota optimizasyonunda çevresel
+faktörleri matematiksel modele dahil
+edebilmek için dakikalık tahmin
+özelliğine sahip bu API'yi seçtik.
+07
+Meteorolojik Zekâ & Akıllı Mekan KeşfiHAVA DURUMU ANALİZİ
+OpenWeatherMap One Call API 3.0MEKAN (POI) VERİLERİ
+ Google Places + OpenStreetMap
+Tek bir kaynağın algoritmik önyargılarını
+elimine etmek için iki ana kaynağı
+birleştiren bir füzyon algoritması kullanılır.
+UYDU GÖRÜNTÜLERİ &
+API'SİZ VERİLER
+08Petabayt seviyesindeki uydu
+görüntülerini işlemek için geleneksel indir
+ve işle yöntemi artık sürdürülemez. STAC
+ve COG standartları sayesinde,
+görüntünün tamamını indirmeden
+sadece ihtiyaç duyulan coğrafi alana
+denk gelen bayt aralığını HTTP Range
+Requests ile stream ediyoruz.
+API desteği olmayan ancak kritik öneme sahip dinamik verileri (nöbetçi eczaneler, anlık duyurular,
+etkinlikler) sisteme entegre etmek için Playwright/Selenium tabanlı Headless Browser
+teknolojisini kullanıyoruz
+SİSTEM MİMARİSİ 
+Akıllı Karar Mekanizması
+09Döngüsel Akış ve Hata Toleransı
+Maliyet Odaklı Yönlendirme
+Modüler Model YapısıLangGraph Kurgusu
+SİSTEM MİMARİSİ 
+MCP KATMANLARIModülerlik & Bağımsızlık
+10
+StandartlaştırmaÖlçeklenebilirlik
+Güvenlik
+AlgoritmalarDinamik Maliyet Analizi
+11
+WFS Veri DönüşümüYerinde NDVI Hesaplama
+Standart yol uzunluğunu, anlık yağış verisi  ve
+yol eğim i ile çarparak sanal m aliyet üretiyoruz.Form ülüm üz sadece NIR ve Red bantlarına ihtiyaç duyar.
+STAC ve COG m im arim iz sayesinde, 13 bantlık tüm  uydu
+görüntüsünü indirm ek yerine; sadece form ülün ihtiyaç
+duyduğu bu iki bandı stream ing (akış) yöntem iyle çekiyoruz.
+Türkiye’de yerel haritalam ada standart olan ITRF96 (EPSG:5254) projeksiyonundaki koordinatlar, küresel web
+haritalam a standardı olan W GS84 (EPSG:4326) sistem ine m atem atiksel olarak iz düşürülür.
+MOBİL MİMARİ TERCİHİSorun
+12
+React Native gibi hibrit yapılar "JavaScript
+Köprüsü" darboğazı nedeniyle yoğun harita
+verisinde takılma yapıyor.
+Çözümümüz
+Google Flutter & Impeller Motoru
+Teknik Nedeni
+Köprüsüz Mimari: Kod doğrudan makine
+diline (AOT) derleniyor.
+Performans Hedefi: Literatürde 120 FPS
+sabit kare hızı sağladığı kanıtlandığı için bu
+mimari seçilmiştir
+Kullanıcı Senaryosu1.  Kullanıcı Talebi (Input)
+13  2.  Anlama ve Planlama (LLM & MCP)
+3. Karar ve Hesaplama (Engine)Kadıköy'de sessizce
+çalışabileceğim  bir yer bul. Bisikletle
+gideceğim  am a hava bozacak gibi.Madde 1: Anlam sal Analiz: "Sessiz"
+→  Kütüphane veya Kitap-Kafe
+(pgvector ile aranır).
+Madde 2: M eteorolojik Kontrol:
+OpenW eather API →  "30 dk sonra
+şiddetli yağm ur bekleniyor
+Madde 1: M ekansal Filtre: Yağm ur
+riski nedeniyle aram a çapı 5km 'den
+1km 'ye düşürülür.
+Madde 2: Güvenli rota  form ülü
+devreye girer. Kaygan zem in riski
+olan dik yokuşlar elenir, daha düz
+am a güvenli rota seçilir.4: Sonuç (Output)
+Öneri: Idea Kadıköy
+Uyarı: Yağm ur 20 dk içinde
+başlayacak. Yokuşsuz 'Yeşil Rota'
+üzerinden 15 dakikada varabilirsiniz.
+Başarı Kriterleri Bilgi Doğruluğu ve Halüsinasyon Kontrolü: Sistem in, m ekansal bilgileri m odelin hafızasından
+uydurm ası yerine, M CP standartlarını kullanarak doğrulanm ış kaynaklardan kesin ve güvenilir
+yanıtlar üretm esi.
+Çok Değişkenli Karar Yetkinliği: Hava durum u, trafik ve fiziksel çevre verilerini tek bir potada
+sentezleyerek; sadece en kısa yolu değil, kullanıcı talebine en uygun, en m antıklı ve güvenli rotayı
+otonom  olarak belirleyebilm esi.
+Mekansal Veri İşleme Verimliliği: Devasa boyutlu uydu arşivlerini ve dinam ik şehir verilerini
+sistem e yük bindirm eden Cloud-Native yöntem lerle yerinde işleyebilm esi ve m obil arayüzde bu
+verileri takılm a yaşam adan akıcı bir şekilde sunabilm esi.
+14
+İş- Zaman Çizelgesi
+15
+Kaynakça
+161.Z. Li and H. Ning, "Autonomous gis: the next-generation ai-powered gis," International Journal of Digital Earth,
+vol. 16, no. 2, pp. 4668-4686, 2023 
+2.  S. Li, et al., "A high-performance cross-platform map rendering engine for mobile geographic information
+system (gis)," ISPRS International Journal of Geo-Information, vol. 8, no. 10, p. 427, 2019. 
+3.Anthropic, "Model context protocol (mcp)," 2024. 
+4.  Radiant Earth Foundation, "Spatiotemporal asset catalog (stac) specification," 2025. 
+5.J. Maso, "Ogc testbed-17: Cloud optimized geotiﬀ specification engineering report," OGC Engineering Report,
+2022. 
+6.D. Fabjan, et al., "Comparison of google maps, here maps, and openstreetmap reliability," Transportation
+Research Procedia, vol. 22, pp. 55-62, 2017. 
+7.P. Blythe, et al., "Vehicle-as-a-sensor: usage of vehicle data for road weather monitoring," IET Intelligent
+Transport Systems, vol. 10, no. 5, pp. 315-322, 2016. 
+8.A. Crooks et al., "Big-data reliability in informing the 15-min city modelling: A comparison between
+openstreetmap and google maps," GISRUK, 2024 
+9.D. Glez-Peña, et al., "Web scraping technologies in an api world," Briefings in Bioinformatics, vol. 15, no. 5, pp.
+788-797, 2014. 
+10.S. Yao, et al., "React: Synergizing reasoning and acting in language models," ICLR, 2023 
+11.J. W. Rouse, et al., "Monitoring vegetation systems in the great plains with erts," NASA, 1974. 
+BİZİ DİNLEDİĞİNİZ İÇİN
+TEŞEKKÜRLER
