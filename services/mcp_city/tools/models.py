@@ -59,6 +59,9 @@ class RouteResponse(BaseModel):
     checkpoints: Dict[str, Any]
     source_system: str
     alternatives: List[Dict[str, Any]] = Field(default_factory=list, description="Alternatif rota seçenekleri (isim, mesafe_km, sure_dk, polyline_encoded)")
+    # Feature 4: Multi-waypoint leg metadata
+    legs: List[Dict[str, Any]] = Field(default_factory=list, description="Her waypoint arası leg bilgisi (mesafe, süre, arrival/departure koordinatları)")
+    leg_count: int = Field(default=1, description="Rota üzerindeki toplam ara segment (leg) sayısı")
 
 class ErrorResponse(BaseModel):
     """Standart hata formatı."""

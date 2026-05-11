@@ -10,8 +10,6 @@ from .local_routing import is_in_service_area, get_local_route
 from .weather import get_weather_handler as _get_weather
 
 
-
-
 from .db import get_saved_locations as _db_get_saved_locations
 
 # Saved location resolver — artık orchestrator'a bağımlı değil
@@ -61,7 +59,8 @@ async def _resolve_coordinates(location: str, session_id: str = "test_pilot") ->
             loc_data = redis_store.client.get(f"loc:{session_id}")
             if loc_data:
                 current_loc_bias = loc_data.decode("utf-8") if isinstance(loc_data, bytes) else loc_data
-        except: pass
+        except Exception:
+            pass
 
     # 2. A PLANI: GOOGLE MAPS API (Geocoding)
     if settings.GOOGLE_MAPS_API_KEY:
@@ -71,8 +70,8 @@ async def _resolve_coordinates(location: str, session_id: str = "test_pilot") ->
             params = {"address": location, "key": settings.GOOGLE_MAPS_API_KEY, "language": "tr", "region": "tr"}
             if current_loc_bias:
                 params["location"] = current_loc_bias
-                params["radius"] = "50000" # 50km bias
-            
+                params["radius"] = "50000"  # 50km bias
+
             resp = await http_client.get(url, params=params, timeout=10.0)
             data = resp.json()
             if data.get("status") == "OK" and data.get("results"):
@@ -87,7 +86,6 @@ async def _resolve_coordinates(location: str, session_id: str = "test_pilot") ->
         log.info(f"🔍 [Google Places Search] POI olarak aranıyor: {location}")
         try:
             from .google import search_places_google_handler
-            # Bias koordinatlarını ayır
             b_lat, b_lon = 0.0, 0.0
             if current_loc_bias and "," in current_loc_bias:
                 b_lat, b_lon = map(float, current_loc_bias.split(","))
@@ -110,37 +108,38 @@ async def _resolve_coordinates(location: str, session_id: str = "test_pilot") ->
         params = {
             "q": location,
             "format": "json",
-            "limit": 10,           # Daha fazla sonuç al, en iyisini seç
+            "limit": 10,
             "countrycodes": "tr",
-            "addressdetails": "1",  # Adres detayları (şehir, ilçe ayrımı için)
-            "featuretype": "settlement",  # Sadece yerleşim yerleri
+            "addressdetails": "1",
+            "featuretype": "settlement",
         }
         resp = await http_client.get(url, params=params, headers=headers, timeout=10.0)
         data = resp.json()
         if data:
-            # importance skoruna göre sırala — en önemli sonuç en başta
             data.sort(key=lambda x: float(x.get("importance", 0)), reverse=True)
 
-            # İl/ilçe merkezini tercih et, önce şehir/kasaba ara
             best_match = data[0]
             for item in data:
                 item_type = item.get("type", "")
                 item_class = item.get("class", "")
-                # city > town > municipality > village sıralaması
                 if item_class == "place" and item_type in ["city", "town", "municipality"]:
                     best_match = item
                     break
 
             lat, lon = best_match["lat"], best_match["lon"]
 
-            # Seçilen sonucun adını logla (debug için)
             addr = best_match.get("address", {})
-            city_name = addr.get("city") or addr.get("town") or addr.get("village") or best_match.get("display_name", location)
+            city_name = (
+                addr.get("city")
+                or addr.get("town")
+                or addr.get("village")
+                or best_match.get("display_name", location)
+            )
             log.success(f"✅ [OSM] Bulundu: {city_name} → {lat},{lon} (importance: {best_match.get('importance', '?')})")
             return f"{lat},{lon}"
     except Exception as e:
         log.error(f"OSM Geocoding Hatası: {e}")
-    
+
     log.warning(f"❌ Konum hiçbir serviste bulunamadı: {location}")
     return None
 
@@ -155,24 +154,32 @@ async def get_location_name(lat, lon):
         data = resp.json()
         if data.get("results"):
             for comp in data["results"][0]["address_components"]:
-                if "administrative_area_level_2" in comp["types"]: 
+                if "administrative_area_level_2" in comp["types"]:
                     return comp["long_name"]
             return data["results"][0]["formatted_address"]
-    except:
+    except Exception:
         pass
     return "Bilinmeyen Konum"
 
 # --- 3. ANA ROTA HANDLER (HİBRİT YAPININ KALBİ) ---
-async def get_route_data_handler(origin: str, destination: str, waypoints: list[str] | None = None, preference: str = "fastest", session_id: str = "test_pilot") -> dict:
+async def get_route_data_handler(
+    origin: str,
+    destination: str,
+    waypoints: list[str] | None = None,
+    preference: str = "fastest",
+    session_id: str = "test_pilot",
+) -> dict:
     try:
         # A. Koordinat Çözümleme
         origin_coord = await _resolve_coordinates(origin, session_id)
         dest_coord = await _resolve_coordinates(destination, session_id)
-        
-        if not origin_coord: return {"error": f"Başlangıç konumu bulunamadı: {origin}"}
-        if not dest_coord: return {"error": f"Bitiş konumu bulunamadı: {destination}"}
-        
-        # Waypoint çözümleme
+
+        if not origin_coord:
+            return {"error": f"Başlangıç konumu bulunamadı: {origin}"}
+        if not dest_coord:
+            return {"error": f"Bitiş konumu bulunamadı: {destination}"}
+
+        # Waypoint çözümleme (Feature 4: multi-waypoint)
         via_coords = []
         if waypoints:
             for wp in waypoints:
@@ -182,29 +189,31 @@ async def get_route_data_handler(origin: str, destination: str, waypoints: list[
                 else:
                     log.warning(f"⚠️ [Waypoint] Çözümlenemedi, atlandı: {wp}")
 
-        # Cache Kontrolü
+        # Cache Kontrolü (waypointler de key'e dahil)
         import hashlib
         import json
-        cache_key = f"route_calc:{hashlib.md5(f'{origin_coord}_{dest_coord}'.encode()).hexdigest()}"
+        wp_key = "_".join(via_coords)
+        cache_key = f"route_calc:{hashlib.md5(f'{origin_coord}_{dest_coord}_{wp_key}'.encode()).hexdigest()}"
         cached_route = redis_store.get(cache_key)
         if cached_route:
             try:
                 log.info(f"⚡ [Route Cache] Önceden hesaplanmış rota bulundu: {origin} -> {destination}")
                 return json.loads(cached_route)
-            except:
+            except Exception:
                 pass
 
         try:
             lat1, lon1 = map(float, origin_coord.split(","))
             lat2, lon2 = map(float, dest_coord.split(","))
         except ValueError:
-             return {"error": "Koordinat formatı hatalı."}
+            return {"error": "Koordinat formatı hatalı."}
 
         # B. HİBRİT KARAR MEKANİZMASI: İSTANBUL MU?
-        if is_in_service_area(lat1, lon1) and is_in_service_area(lat2, lon2):
+        # Waypoint varsa HERE API kullan (yerel DB multi-waypoint desteklemiyor)
+        if not via_coords and is_in_service_area(lat1, lon1) and is_in_service_area(lat2, lon2):
             log.info(f"🏙️ [GEOINTEL] Yerel Veritabanı Devrede: {origin} -> {destination}")
 
-            # --- Hava durumu ile rain_factor hesapla ---
+            # Hava durumu ile rain_factor hesapla
             rain_factor = 0.0
             try:
                 mid_lat = (lat1 + lat2) / 2
@@ -215,7 +224,7 @@ async def get_route_data_handler(origin: str, destination: str, waypoints: list[
                 if any(w in condition_raw for w in ["rain", "drizzle", "thunderstorm", "yağmur"]):
                     rain_factor = 0.8
                 elif any(w in condition_raw for w in ["snow", "kar"]):
-                    rain_factor = 1.0  # Kar → max maliyet
+                    rain_factor = 1.0
                 elif any(w in condition_raw for w in ["fog", "mist", "sis"]):
                     rain_factor = 0.4
                 log.info(f"🌧️ [WeatherCost] rain_factor={rain_factor} ({condition_raw})")
@@ -223,38 +232,30 @@ async def get_route_data_handler(origin: str, destination: str, waypoints: list[
                 log.warning(f"⚠️ [WeatherCost] Hava durumu alınamadı: {we}")
 
             # PostGIS Sorgusu
-            local_result = await get_local_route(lat1, lon1, lat2, lon2, preference=preference, rain_factor=rain_factor)
-            
+            local_result = await get_local_route(
+                lat1, lon1, lat2, lon2, preference=preference, rain_factor=rain_factor
+            )
+
             if local_result:
-                # 🔥🔥🔥 FİNAL DÜZELTME: MULTILINESTRING DESTEĞİ 🔥🔥🔥
-                encoded_poly = "LOCAL_ROUTE" # Varsayılan değer
-                
+                encoded_poly = "LOCAL_ROUTE"
                 try:
                     geom = local_result.get("geometry")
                     if geom and "coordinates" in geom:
                         raw_coords = geom["coordinates"]
                         flat_coords = []
 
-                        # Durum 1: MultiLineString (İç içe liste gelir: [[[lon, lat],..], [[lon, lat],..]])
                         if geom.get("type") == "MultiLineString":
                             for segment in raw_coords:
-                                flat_coords.extend(segment) # Hepsini tek çizgiye indir
-                        
-                        # Durum 2: LineString (Düz liste gelir: [[lon, lat], [lon, lat]])
+                                flat_coords.extend(segment)
                         else:
                             flat_coords = raw_coords
 
-                        # GeoJSON [Lon, Lat] verir -> Polyline [Lat, Lon] ister
-                        # Ayrıca her ihtimale karşı float'a çeviriyoruz
                         lat_lon_coords = [(float(c[1]), float(c[0])) for c in flat_coords]
-                        
-                        # Artık encode edebiliriz
+
                         if lat_lon_coords:
                             encoded_poly = flexpolyline.encode(lat_lon_coords)
-                            
                 except Exception as e:
                     log.error(f"Polyline Encode Hatası: {e}")
-                    # Hata olsa bile kod patlamasın, rota bilgisini döndürsün
 
                 return {
                     "source": "GeoIntel_Local_DB",
@@ -270,16 +271,15 @@ async def get_route_data_handler(origin: str, destination: str, waypoints: list[
                     "geometry": local_result["geometry"],
                     "analiz_noktalari": {
                         "baslangic": {"coords": [lat1, lon1], "ad": origin},
-                        "bitis": {"coords": [lat2, lon2], "ad": destination}
+                        "bitis": {"coords": [lat2, lon2], "ad": destination},
                     },
-                    "not": "IBB Live Traffic + OSM local routing."
+                    "not": "IBB Live Traffic + OSM local routing.",
                 }
 
-        # C. FALLBACK: HERE MAPS API
-        log.info(f"🌍 [HERE API] Dış Hat Rotası: {origin} -> {destination}")
-        
+        # C. FALLBACK: HERE MAPS API (şehirlerarası + multi-waypoint)
+        log.info(f"🌍 [HERE API] Dış Hat Rotası: {origin} -> {destination} (via: {via_coords})")
+
         req = RouteRequest(origin=origin_coord, destination=dest_coord)
-        # Anlık zaman damgası → HERE real-time trafik dahil ETA
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         params = {
             "transportMode": "car",
@@ -288,16 +288,15 @@ async def get_route_data_handler(origin: str, destination: str, waypoints: list[
             "destination": req.destination,
             "return": "summary,polyline",
             "alternatives": 2,
-            "departureTime": now_utc,  # 🚦 Canlı trafik dahil ETA
-            "apiKey": settings.HERE_API_KEY
+            "departureTime": now_utc,
+            "apiKey": settings.HERE_API_KEY,
         }
-        
-        # 'Safest' için ek kısıtlamalar
+
         if preference == "safest":
-            params["avoid[features]"] = "unpavedRoads" # Toprak yollardan kaçın
-            params["routingMode"] = "fast" # Güvenli yol genelde ana yollardır (hızlı olanlar)
-            
-        # httpx'te birden fazla aynı key (via) göndermek için list of tuples'a çeviriyoruz
+            params["avoid[features]"] = "unpavedRoads"
+            params["routingMode"] = "fast"
+
+        # httpx'te birden fazla aynı key (via) göndermek için list of tuples
         params_list = list(params.items())
         for via in via_coords:
             params_list.append(("via", via))
@@ -309,53 +308,118 @@ async def get_route_data_handler(origin: str, destination: str, waypoints: list[
             return {"error": f"HERE API Hatası (HTTP {resp.status_code}): {resp.text[:100]}"}
 
         data = resp.json()
-        
+
         if data.get("routes"):
             all_routes = []
-            primary_encoded_polyline = None
-            
+
             for idx, route_data in enumerate(data["routes"]):
-                if not route_data.get("sections"):
-                     continue
-                
-                section = route_data["sections"][0]
-                summary = section["summary"]
-                encoded_polyline = section["polyline"]
-                
-                if idx == 0:
-                    primary_encoded_polyline = encoded_polyline
-                    # Redis Cache (sadece ana rotayı önbellekle)
+                sections = route_data.get("sections", [])
+                if not sections:
+                    continue
+
+                # ─── Feature 4: Multi-Leg Polyline Stitching ───────────────────────
+                # HERE API, her via (waypoint) için ayrı bir section döner.
+                # Tüm section polyline'larını tek bir kesintisiz polyline'a birleştir.
+                total_length_m = 0
+                total_duration_s = 0
+                all_leg_coords: list = []
+                legs_meta: list = []
+
+                for sec_idx, section in enumerate(sections):
+                    sec_summary = section.get("summary", {})
+                    sec_poly = section.get("polyline", "")
+                    leg_len = sec_summary.get("length", 0)
+                    leg_dur = sec_summary.get("duration", 0)
+
+                    total_length_m += leg_len
+                    total_duration_s += leg_dur
+
+                    if sec_poly:
+                        try:
+                            decoded = flexpolyline.decode(sec_poly)
+                            # İlk leg dışındakilerin ilk noktasını atla (birleşim noktası tekrarı)
+                            if all_leg_coords and decoded:
+                                all_leg_coords.extend(decoded[1:])
+                            else:
+                                all_leg_coords.extend(decoded)
+                        except Exception as decode_err:
+                            log.warning(f"⚠️ [HERE] Section {sec_idx} decode hatası: {decode_err}")
+
+                    legs_meta.append({
+                        "leg_index": sec_idx,
+                        "distance_km": round(leg_len / 1000, 2),
+                        "duration_min": round(leg_dur / 60, 1),
+                        "departure_coords": (
+                            section.get("departure", {})
+                                   .get("place", {})
+                                   .get("originalLocation", {})
+                        ),
+                        "arrival_coords": (
+                            section.get("arrival", {})
+                                   .get("place", {})
+                                   .get("originalLocation", {})
+                        ),
+                    })
+
+                # Tüm leg koordinatlarını tek polyline'a encode et
+                stitched_polyline = ""
+                if all_leg_coords:
                     try:
-                        redis_store.set_route(primary_encoded_polyline)
-                    except: pass
-                
+                        stitched_polyline = flexpolyline.encode(all_leg_coords)
+                    except Exception as enc_err:
+                        log.warning(f"⚠️ [HERE] Polyline encode hatası: {enc_err}")
+                        stitched_polyline = sections[0].get("polyline", "")
+
+                if idx == 0:
+                    try:
+                        redis_store.set_route(stitched_polyline)
+                    except Exception:
+                        pass
+
                 route_info = {
                     "isim": f"Rota {idx + 1}" if idx > 0 else "Ana Rota",
-                    "mesafe_km": round(summary["length"] / 1000, 2),
-                    "sure_dk": round(summary["duration"] / 60, 0),
-                    "polyline_encoded": encoded_polyline
+                    "mesafe_km": round(total_length_m / 1000, 2),
+                    "sure_dk": round(total_duration_s / 60, 0),
+                    "polyline_encoded": stitched_polyline,
+                    "legs": legs_meta,           # Feature 4: per-leg detail
+                    "leg_count": len(sections),
                 }
                 all_routes.append(route_info)
+                log.info(
+                    f"📍 [HERE] Rota {idx + 1}: "
+                    f"{round(total_length_m/1000, 1)} km, "
+                    f"{round(total_duration_s/60, 0)} dk, "
+                    f"{len(sections)} leg"
+                )
 
             if not all_routes:
-                 return {"error": "Rota bulunamadı (HERE API)"}
-                 
-            # Geriye uyumluluk için ilk rotayı ana alanlara taşı, alternatifleri içine sakla
+                return {"error": "Rota bulunamadı (HERE API)"}
+
             primary_route = all_routes[0]
-            
+
+            # Waypoint isimlerini checkpoints'e ekle (Flutter marker'ları için)
+            checkpoints = {
+                "baslangic": {"coords": [lat1, lon1], "ad": origin},
+                "bitis": {"coords": [lat2, lon2], "ad": destination},
+            }
+            for wp_idx, wp_coord in enumerate(via_coords):
+                checkpoints[f"waypoint_{wp_idx + 1}"] = {
+                    "coords": [float(c) for c in wp_coord.split(",")],
+                    "ad": waypoints[wp_idx] if waypoints and wp_idx < len(waypoints) else wp_coord,
+                }
+
             return {
                 "source": "HERE_Maps_API",
                 "mesafe_km": primary_route["mesafe_km"],
                 "sure_dk": primary_route["sure_dk"],
-                "polyline_encoded": primary_route["polyline_encoded"], 
+                "polyline_encoded": primary_route["polyline_encoded"],
+                "legs": primary_route.get("legs", []),       # Feature 4: per-leg data
+                "leg_count": primary_route.get("leg_count", 1),
                 "alternatif_rotalar": all_routes,
-                "geometry": None, 
-                "analiz_noktalari": {
-                    "baslangic": {"coords": [lat1, lon1], "ad": origin},
-                    "bitis": {"coords": [lat2, lon2], "ad": destination}
-                }
+                "geometry": None,
+                "analiz_noktalari": checkpoints,
             }
-        
+
         return {"error": "Rota bulunamadı (HERE API)"}
 
     except Exception as e:
