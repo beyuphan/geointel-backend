@@ -296,11 +296,13 @@ async def get_route_data_handler(origin: str, destination: str, waypoints: list[
         if preference == "safest":
             params["avoid[features]"] = "unpavedRoads" # Toprak yollardan kaçın
             params["routingMode"] = "fast" # Güvenli yol genelde ana yollardır (hızlı olanlar)
-        # Waypoint'leri ekle (via parametreleri)
-        for i, via in enumerate(via_coords):
-            params[f"via[{i}]"] = via
+            
+        # httpx'te birden fazla aynı key (via) göndermek için list of tuples'a çeviriyoruz
+        params_list = list(params.items())
+        for via in via_coords:
+            params_list.append(("via", via))
 
-        resp = await http_client.get(settings.HERE_ROUTING_URL, params=params, timeout=15.0)
+        resp = await http_client.get(settings.HERE_ROUTING_URL, params=params_list, timeout=15.0)
         if resp.status_code != 200:
             log.error(f"❌ [HERE API ERROR] Durum Kodu: {resp.status_code}")
             log.error(f"📄 [HERE API RESPONSE] Body: {resp.text}")

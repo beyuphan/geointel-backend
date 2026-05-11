@@ -3,9 +3,11 @@ api/schemas.py — Mobil API Pydantic Modelleri
 
 Tüm request/response şemaları tek dosyada.
 ApiResponse[T] generic envelope ile mobil app her zaman aynı yapıyı bekler.
+
+v4.0 — POI Overlay (Tam Ekran Swipe Kartları) + Routing Phase eklendi
 """
 from __future__ import annotations
-from typing import TypeVar, Generic, Optional, Any
+from typing import TypeVar, Generic, Optional, Any, List
 from pydantic import BaseModel, Field
 from datetime import datetime
 
@@ -83,7 +85,7 @@ class AuthResponse(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CHAT
+# CHAT — POI OVERLAY & ROUTING PHASE CARDS
 # ═══════════════════════════════════════════════════════════════════════════
 
 class ChatRequest(BaseModel):
@@ -98,8 +100,11 @@ class MapMarker(BaseModel):
     lat: float
     lon: float
     title: Optional[str] = None
-    type: Optional[str] = None  # origin, destination, poi, fuel_station
-    icon: Optional[str] = None  # pin_green, pin_red, fuel, pharmacy
+    type: Optional[str] = "poi"   # poi, pharmacy, fuel_station, waypoint
+    icon: Optional[str] = None
+    snippet: Optional[str] = None
+    # ★ Zengin POI kart metadata'sı
+    poi_card: Optional[dict] = None  # Kaydırılabilir kart için detaylı bilgi
 
 
 class LatLon(BaseModel):
@@ -115,7 +120,7 @@ class MapBounds(BaseModel):
 class MapData(BaseModel):
     markers: list[MapMarker] = []
     polyline: Optional[str] = None
-    alternatives: list[str] = [] # 🗺️ Alternatif rotalar için
+    alternatives: list[str] = []  # 🗺️ Alternatif rotalar için
     bounds: Optional[MapBounds] = None
     center: Optional[dict] = None  # {"lat": float, "lon": float}
     geojson_layers: list[dict] = []
@@ -124,9 +129,103 @@ class MapData(BaseModel):
 class ActionCard(BaseModel):
     id: str
     label: str
-    action: str    # start_navigation, show_alternatives, show_on_map, compare_fuel
-    icon: str      # navigation, swap, map, fuel
+    action: str    # "ui:<type>" = mobil handle eder | "<metin>" = AI'a gönderilir
+    icon: str
     style: str = "secondary"  # primary, secondary, danger
+    # Mobil UI'ın kullanıcıdan input alıp dolduracağı şablon
+    # Örn: "Yakıt analizimi yap, {range_km} km menzilim var, güzergahtaki istasyonları bul"
+    action_template: Optional[str] = None
+    # True ise AI'a gönderilmez, mobil direkt handle eder
+    is_ui_only: bool = False
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# ★ POI OVERLAY — Tam Ekran Swipe Kartları (v4.0 YENİ)
+# ─────────────────────────────────────────────────────────────────────────
+
+class PoiOverlayCard(BaseModel):
+    """
+    Tekil mekan kartı — tam ekran overlay'de swipe ile gösterilir.
+    Mobil: PageView/SwipeableCard bileşeni bu modeli kullanır.
+    """
+    id: str = Field(description="Benzersiz kart ID'si (Google Place ID veya UUID)")
+    name: str = Field(description="Mekan adı")
+    address: Optional[str] = Field(default=None, description="Tam adres")
+    category: Optional[str] = Field(default=None, description="restoran, kafe, benzin_istasyonu, market vb.")
+    lat: float
+    lon: float
+
+    # Navigasyon bilgileri
+    deviation_meters: Optional[int] = Field(default=None, description="Rota'dan sapma (metre)")
+    distance_along_route_km: Optional[float] = Field(default=None, description="Rota üzerindeki km")
+    extra_time_min: Optional[int] = Field(default=None, description="Bu durağın eklediği süre (dk)")
+    eta: Optional[str] = Field(default=None, description="Tahmini varış: 'HH:MM' formatında")
+    on_route_side: Optional[str] = Field(default=None, description="right, left, unknown")
+
+    # Kalite bilgileri
+    rating: Optional[float] = Field(default=None, ge=0, le=5)
+    review_count: Optional[int] = Field(default=None)
+    price_level: Optional[int] = Field(default=None, ge=0, le=4, description="0=ücretsiz, 1=ucuz, 2=orta, 3=pahalı, 4=çok pahalı")
+    is_open: Optional[bool] = Field(default=None)
+    open_now: Optional[bool] = Field(default=None)
+    opening_hours: Optional[list] = Field(default=None)
+    phone: Optional[str] = Field(default=None)
+
+    # UI için hesaplanmış alanlar
+    deviation_label: Optional[str] = Field(default=None, description="'Yol üstü ✅', '850m sapma ⚠️', '3.2km uzatır ❌'")
+    route_impact_label: Optional[str] = Field(default=None, description="'+5 dk', 'Sıfır etki', '+12 dk'")
+    is_recommended: bool = Field(default=False, description="AI'ın öne çıkardığı mekan mı?")
+    recommendation_reason: Optional[str] = Field(default=None, description="'En yüksek puan', 'Yol üstü', 'En ucuz'")
+
+
+class PoiOverlay(BaseModel):
+    """
+    Tam ekran POI overlay container.
+    Mobil bu nesneyi alınca harita yerine tam ekran swipe arayüzü açar.
+    """
+    mode: str = Field(
+        default="poi_selection",
+        description="poi_selection | route_confirmation | final_summary"
+    )
+    title: str = Field(description="Overlay başlığı: 'Yol Üzerindeki Restoranlar'")
+    subtitle: Optional[str] = Field(default=None, description="'3 mekan bulundu, kaydırarak incele'")
+    cards: List[PoiOverlayCard] = Field(default=[], description="Swipe kartları")
+    primary_action: Optional[str] = Field(
+        default=None,
+        description="Birincil buton metni: 'Rotama Ekle', 'Navigasyona Başla'"
+    )
+    secondary_action: Optional[str] = Field(
+        default=None,
+        description="İkincil buton metni: 'Atla', 'Farklı Mekan Öner'"
+    )
+    # Rota özeti için (mode=final_summary)
+    route_summary: Optional[dict] = Field(
+        default=None,
+        description="Tamamlanan rota özeti: {total_km, total_min, stops, warnings}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# ★ ROUTING PHASE — Akıllı Faz Yönetimi
+# ─────────────────────────────────────────────────────────────────────────
+
+class RoutingPhaseInfo(BaseModel):
+    """
+    Mobil uygulamanın routing UI state machine'i için faz bilgisi.
+    Mobil bu nesneye göre hangi UI'ı göstereceğine karar verir.
+    """
+    phase: int = Field(
+        description=(
+            "1=İlk rota (harita + action cards), "
+            "2=POI sorgu (overlay açıldı), "
+            "3=Seçim yapıldı (güncellenen rota), "
+            "4=Onay (final summary)"
+        )
+    )
+    phase_label: str = Field(description="'Rota Hazır', 'Mekan Seçimi', 'Rota Güncellendi', 'Yolculuk Özeti'")
+    has_active_route: bool = Field(default=False)
+    active_destination: Optional[str] = Field(default=None)
+    waypoints_count: int = Field(default=0)
 
 
 class ChatResponse(BaseModel):
@@ -138,6 +237,21 @@ class ChatResponse(BaseModel):
     tools_used: list[str] = Field(default=[], description="Kullanılan MCP tool adları (context indicator)")
     fuel_data: Optional[dict] = None
     weather_warning: Optional[str] = None
+
+    # ★ YENİ — Tam ekran POI overlay (mekan öneri fazı)
+    poi_overlay: Optional[PoiOverlay] = Field(
+        default=None,
+        description=(
+            "Doluysa mobil haritayı kaldırıp tam ekran swipe kartlarını gösterir. "
+            "Boşsa normal sohbet/harita modu devam eder."
+        )
+    )
+
+    # ★ YENİ — Routing faz bilgisi
+    routing_phase: Optional[RoutingPhaseInfo] = Field(
+        default=None,
+        description="Mobil UI state machine için rotalama faz bilgisi"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

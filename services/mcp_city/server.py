@@ -139,28 +139,34 @@ async def search_places_google(query: str, lat: float = 0.0, lon: float = 0.0, r
 # --- 3. HERE ROTA OLUŞTURMA ---
 @mcp.tool()
 @safe_tool(fallback_message="Route calculation failed.")
-async def get_route_data(origin: str, destination: str, preference: str = "fastest") -> str:
+async def get_route_data(origin: str, destination: str, preference: str = "fastest", waypoints: Optional[str] = None) -> str:
     """
     Calculates route between two locations with real-time traffic, distance and ETA.
     Uses Istanbul local DB for city routes, HERE Maps for intercity.
 
     Args:
-        origin: Start location name or 'lat,lon' coordinates.
+        origin: Start location name or 'lat,lon' coordinates. Use 'CURRENT_LOCATION' for user's GPS.
         destination: End location name or 'lat,lon' coordinates.
         preference: 'fastest', 'shortest' or 'safest' (default: fastest).
+        waypoints: Optional comma-separated intermediate stops e.g. '41.003,38.456' or 'Ünye Shell İstasyonu'.
+                   Use when user selects a fuel station or restaurant to add to the route.
     """
     try:
-        logger.info(f"🛠️ [Tool: Rota] Hesapla: {origin} -> {destination} (Tercih: {preference})")
-        raw_data = await get_route_data_handler(origin, destination, preference=preference)
+        logger.info(f"🛠️ [Tool: Rota] Hesapla: {origin} -> {destination} (Tercih: {preference}, Via: {waypoints})")
+        
+        # Waypoints string'ini listeye çevir
+        wp_list = None
+        if waypoints:
+            wp_list = [w.strip() for w in waypoints.split("|") if w.strip()]
+
+        raw_data = await get_route_data_handler(origin, destination, waypoints=wp_list, preference=preference)
 
         if "error" in raw_data:
             return ErrorResponse(message=raw_data["error"]).model_dump_json()
 
-        # Rota polyline verisini belirle (Local veya HERE)
         poly_data = raw_data.get("polyline_encoded")
         final_polyline = poly_data if poly_data else "LOCAL_ROUTE"
 
-        # Alternatif rota verilerini aktar (HERE API alternatifler döndürürse)
         alternatives = raw_data.get("alternatif_rotalar", [])
 
         response = RouteResponse(
@@ -178,6 +184,8 @@ async def get_route_data(origin: str, destination: str, preference: str = "faste
 
     except Exception as e:
         return handle_critical_error(e, "get_route_data")
+
+
 
 # --- 4. HAVA DURUMU (KONUM BAZLI) ---
 @mcp.tool()
@@ -529,9 +537,13 @@ async def search_hybrid_places(query: str, location_name: Optional[str] = None, 
                 "address": g_place.get("address"),
                 "rating": g_place.get("rating"),
                 "is_open": str(g_place.get("open_now")),
-                "lat": g_lat, # Varsayılan Google geometrisi
+                "lat": g_lat,
                 "lon": g_lon,
-                "fusion_status": "Google Only" # Başlangıç durumu
+                "deviation_meters": g_place.get("deviation_meters", 0),
+                "distance_along_route_km": g_place.get("distance_along_route_km"),
+                "eta": g_place.get("eta"),
+                "score": g_place.get("score", 0),
+                "fusion_status": "Google Only"
             }
 
             # OSM ile 20 Metre (Sapma) Kontrolü
@@ -567,8 +579,14 @@ async def search_hybrid_places(query: str, location_name: Optional[str] = None, 
                 })
 
         logger.success(f"✅ [Tool: Hybrid Fusion] {len(fused_results)} nesne oluşturuldu.")
+
+        # LLM için strict (yol üstü) ve relaxed (sapmalı) olarak ayır
+        strict = [p for p in fused_results if (p.get("deviation_meters") or 0) <= 400]
+        relaxed = [p for p in fused_results if (p.get("deviation_meters") or 0) > 400]
+
         return json.dumps({
-            "places": fused_results,
+            "strict_route_places": strict[:6],
+            "relaxed_route_places": relaxed[:6],
             "count": len(fused_results),
             "data_source": "Google + OSM Fusion"
         }, ensure_ascii=False)

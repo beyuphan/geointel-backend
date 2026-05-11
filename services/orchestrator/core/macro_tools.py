@@ -71,14 +71,36 @@ class RouteStrategyEvaluator:
                  "analysis": "Rota üzerinde uygun istasyon bulunamadı."
              }
 
-        # 3. İstasyonların bulunduğu şehri adreslerinden ayıklayıp Intel'e sor
+        # 3. Rota üzerindeki şehirleri ve fiyatları karşılaştır
+        city_prices = {}
+        processed_cities = set()
+        
         best_station = places[0]
-        address_parts = str(best_station.get("address", "")).split(",")
-        predicted_city = address_parts[-1].strip().split(" ")[-1] if len(address_parts) > 0 else "Bilinmiyor"
+        best_address_parts = str(best_station.get("address", "")).split(",")
+        predicted_city = best_address_parts[-1].strip().split(" ")[-1] if len(best_address_parts) > 0 else "Bilinmiyor"
         
-        # 4. Yakıt Fiyatı Sorgusu (Intel Server)
-        fuel_res = await self._safe_call("intel", "get_fuel_prices", {"city": predicted_city, "district": "merkez"})
-        
+        # En iyi 8 istasyonu incele (farklı şehirleri yakalamak için)
+        for station in places[:8]:
+            address = str(station.get("address", ""))
+            # Basit şehir tahmini (virgülden sonraki son parça genellikle şehir/ilçe)
+            parts = address.split(",")
+            if len(parts) >= 2:
+                city = parts[-1].strip().split(" ")[-1]
+                if city and city not in processed_cities:
+                    fuel_data = await self._safe_call("intel", "get_fuel_prices", {"city": city, "district": "merkez"})
+                    if fuel_data and "error" not in fuel_data:
+                        prices = fuel_data.get("data", fuel_data)
+                        if isinstance(prices, list) and len(prices) > 0:
+                            # Şehirdeki en ucuz fiyatı bul
+                            cheapest_in_city = min([p.get(fuel_type, 999) for p in prices])
+                            city_prices[city] = cheapest_in_city
+                    processed_cities.add(city)
+
+        # 4. En ucuz şehri belirle
+        cheapest_city = None
+        if city_prices:
+            cheapest_city = min(city_prices, key=city_prices.get)
+
         return {
             "status": "success",
             "route_summary": {
@@ -86,6 +108,10 @@ class RouteStrategyEvaluator:
                  "duration": safe_route_summary["duration_min"]
             },
             "polyline": polyline,
+            "cheapest_fuel_city": {
+                "city": cheapest_city,
+                "price": city_prices.get(cheapest_city) if cheapest_city else None
+            },
             "best_station_recommendation": {
                  "name": best_station.get("name"),
                  "address": best_station.get("address"),
@@ -93,8 +119,9 @@ class RouteStrategyEvaluator:
                  "rating": best_station.get("rating"),
                  "lat": best_station.get("lat"),
                  "lon": best_station.get("lon"),
+                 "estimated_price": city_prices.get(predicted_city)
             },
-            "regional_fuel_prices": fuel_res.get("data", fuel_res) if fuel_res else "Fiyat verisi alınamadı.",
+            "all_analyzed_cities": city_prices,
             "stations_found": len(places),
         }
 
