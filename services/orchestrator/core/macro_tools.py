@@ -25,7 +25,7 @@ class RouteStrategyEvaluator:
             log.error(msg)
             return {"status": "error", "message": msg}
 
-    async def evaluate(self, origin: str, destination: str, fuel_type: str = "benzin") -> Dict[str, Any]:
+    async def evaluate(self, origin: str, destination: str, fuel_type: str = "benzin", fuel_range: Optional[float] = None) -> Dict[str, Any]:
         """Ana Macro-Tool metodu. Rota çıkarır, şehirleri bulur, fiyatı basar."""
         log.info(f"🧠 [Macro-Tool] Rota Stratejisi Başlatıldı: {origin} -> {destination}")
         
@@ -64,6 +64,40 @@ class RouteStrategyEvaluator:
                 # Fallback to old format
                 places = places_res.get("strict_route_places", []) + places_res.get("relaxed_route_places", [])
         
+        if fuel_range:
+            total_dist_raw = route_res.get("mesafe_km", 0) or route_res.get("distance_km", 0)
+            try:
+                total_dist = float(total_dist_raw)
+            except:
+                total_dist = 500.0
+
+            target_distances = []
+            curr = fuel_range * 0.8
+            while curr < total_dist:
+                target_distances.append(curr)
+                curr += fuel_range * 0.8
+            
+            selected_places = []
+            for target in target_distances:
+                best_match = None
+                best_diff = 9999.0
+                for p in places:
+                    d = p.get("distance_along_route_km", 0)
+                    diff = abs(target - d)
+                    if diff < best_diff and diff < (fuel_range * 0.3):
+                        best_match = p
+                        best_diff = diff
+                if best_match and best_match not in selected_places:
+                    selected_places.append(best_match)
+            
+            if selected_places:
+                places = selected_places
+            else:
+                filtered_places = [p for p in places if p.get("distance_along_route_km", 0) <= fuel_range]
+                if filtered_places:
+                    places = filtered_places
+                    places.sort(key=lambda p: abs(fuel_range * 0.8 - p.get("distance_along_route_km", 0)))
+
         if not places:
              return {
                  "status": "success", 
@@ -123,6 +157,7 @@ class RouteStrategyEvaluator:
             },
             "all_analyzed_cities": city_prices,
             "stations_found": len(places),
+            "places": places[:5], # Return top 5 places to be used as markers
         }
 
 class ContextAwarePOIPlanner:

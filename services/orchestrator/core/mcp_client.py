@@ -150,7 +150,8 @@ class GeoIntelOrchestrator:
                     return await RouteStrategyEvaluator(self).evaluate(
                         origin=kwargs.get("origin"),
                         destination=kwargs.get("destination"),
-                        fuel_type=kwargs.get("fuel_type", "benzin")
+                        fuel_type=kwargs.get("fuel_type", "benzin"),
+                        fuel_range=kwargs.get("fuel_range")
                     )
                 if name == "plan_weather_aware_route":
                     from core.macro_tools import ContextAwarePOIPlanner

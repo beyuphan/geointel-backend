@@ -137,6 +137,10 @@ class ActionCard(BaseModel):
     action_template: Optional[str] = None
     # True ise AI'a gönderilmez, mobil direkt handle eder
     is_ui_only: bool = False
+    ui_component: Optional[str] = None # 'button', 'slider', 'radio'
+    options: Optional[List[str]] = None # radio seçenekleri
+    min_val: Optional[int] = None # slider min
+    max_val: Optional[int] = None # slider max
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -229,28 +233,18 @@ class RoutingPhaseInfo(BaseModel):
 
 
 class ChatResponse(BaseModel):
+    status: str = Field(default="completed", description="completed | action_required")
     message: str
     intent: Optional[dict] = None
     map: MapData = Field(default_factory=MapData)
     action_cards: list[ActionCard] = []
-    model_used: Optional[str] = None
-    tools_used: list[str] = Field(default=[], description="Kullanılan MCP tool adları (context indicator)")
-    fuel_data: Optional[dict] = None
-    weather_warning: Optional[str] = None
-
-    # ★ YENİ — Tam ekran POI overlay (mekan öneri fazı)
+    tools_used: list[str] = Field(default=[], description="Kullanılan MCP tool adları")
+    distance_km: Optional[float] = None
+    duration_min: Optional[int] = None
+    # Tam ekran POI overlay — doluysa mobil swipe kartları gösterir
     poi_overlay: Optional[PoiOverlay] = Field(
         default=None,
-        description=(
-            "Doluysa mobil haritayı kaldırıp tam ekran swipe kartlarını gösterir. "
-            "Boşsa normal sohbet/harita modu devam eder."
-        )
-    )
-
-    # ★ YENİ — Routing faz bilgisi
-    routing_phase: Optional[RoutingPhaseInfo] = Field(
-        default=None,
-        description="Mobil UI state machine için rotalama faz bilgisi"
+        description="Doluysa harita yerine tam ekran POI swipe overlay açılır."
     )
 
 

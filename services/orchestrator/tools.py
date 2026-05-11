@@ -24,7 +24,8 @@ MANUAL_TOOLS = [
             "properties": {
                 "origin": {"type": "string", "description": "Başlangıç noktası (Örn: Rize)"},
                 "destination": {"type": "string", "description": "Varış noktası (Örn: İstanbul)"},
-                "fuel_type": {"type": "string", "description": "Yakıt tipi, varsayılan: benzin"}
+                "fuel_type": {"type": "string", "description": "Yakıt tipi, varsayılan: benzin"},
+                "fuel_range": {"type": "number", "description": "Aracın menzili km cinsinden, varsayılan: 500"}
             },
             "required": ["origin", "destination"]
         }
