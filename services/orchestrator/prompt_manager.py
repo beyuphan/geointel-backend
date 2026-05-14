@@ -7,7 +7,7 @@ Felsefe:
   - LLM asla soru sormaz — UI zaten butonları basacak.
   - Kategori başına ayrı, net kurallar. Faz mantığı YOK.
 """
-from typing import Dict, Any, Union
+from typing import Dict, Any, Union, Optional
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -37,6 +37,18 @@ hitaplar kullanırsın ama bunları aşırıya kaçmadan kullanırsın.
 
 5. KOORDİNAT HER ZAMAN VAR
    ANLIK_KONUM zaten sana verildi. "Konum belirtmediniz" deme, direkt kullan.
+
+6. ⚠️ POI YASAĞI — KESİN VE İSTİSNASIZ
+   Yanıt metninde hiçbir zaman spesifik mekan adı, restoran adı, benzin istasyonu
+   adı, otel adı YAZMA. Sadece genel sayı/kategori yaz:
+   ✅ DOĞRU: "Rotanda 3 yemek durağı buldum, kartlarda detaylar var."
+   ✅ DOĞRU: "Güzergahında 2 benzin istasyonu öneriyorum."
+   ❌ YANLIŞ: "Shell Bolu, Opet Düzce veya Araç Lokantası'na uğrayabilirsin."
+   Mekan detayları overlay kartlarda görünecek, sen sadece özet yaz.
+
+7. YAKIT = ANLİK MENZİL
+   Kullanıcı artık araç menzilini değil, o an kaç km gidebileceğini söylüyor.
+   fuel_remaining_km → bu değere göre ilk yakıt durağını hesapla (0 ise ihmal et).
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -255,10 +267,14 @@ classify_intent_fast = classify_intent
 # DYNAMIC SYSTEM PROMPT BUILDER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_dynamic_system_prompt(user_context: Union[Dict, str], intent_dict: Union[Dict, str]) -> str:
+def get_dynamic_system_prompt(
+    user_context: Union[Dict, str],
+    intent_dict: Union[Dict, str],
+    trip_context: Optional[Dict] = None,
+) -> str:
     """
     Kullanıcı profiline ve intent'e göre tam system prompt oluşturur.
-    LLM'in ne yapması gerektiğini net talimatlarla anlatır.
+    trip_context: /trip/plan endpoint'inden gelen yapılandırılmış yolculuk bilgisi.
     """
     # ── Kullanıcı profili ─────────────────────────────────────────────────
     if isinstance(user_context, dict):
@@ -266,8 +282,10 @@ def get_dynamic_system_prompt(user_context: Union[Dict, str], intent_dict: Union
         location  = user_context.get("current_location", "Bilinmiyor")
         home      = user_context.get("home_location", "?")
         team      = user_context.get("team", "?")
+        consumption = user_context.get("highway_consumption", 8.0)
         user_line = (
             f"Araç yakıt tipi: {fuel_type} | "
+            f"Otoyol tüketim: {consumption}L/100km | "
             f"ANLIK_KONUM: {location} | "
             f"Ev: {home} | Takım: {team}"
         )
@@ -282,6 +300,26 @@ def get_dynamic_system_prompt(user_context: Union[Dict, str], intent_dict: Union
         category = str(intent_dict)
         urgency  = False
 
+    # ── Trip context bloğu ────────────────────────────────────────────────
+    trip_block = ""
+    if trip_context:
+        dest  = trip_context.get("destination", "?")
+        total = trip_context.get("total_km", "?")
+        dur   = trip_context.get("total_min", "?")
+        fuel_rem = trip_context.get("fuel_remaining_km", 0)
+        note  = trip_context.get("custom_note", "")
+        trip_block = (
+            f"\n\n🗺️ AKTİF YOLCULUK BAĞLAMI:\n"
+            f"  Hedef: {dest} | Mesafe: {total}km | Tahmini: {dur}dk\n"
+            f"  Anlık yakıt menzili: {fuel_rem}km\n"
+        )
+        if note:
+            trip_block += f"  Kullanıcı notu: '{note}'\n"
+        trip_block += (
+            "  Bu bağlamı her yanıtta dikkate al. "
+            "Kullanıcının ek talepleri (sahil yolu, durak ekleme) bu rotaya göre işle."
+        )
+
     # ── Kategori talimatları ──────────────────────────────────────────────
     instructions = INSTRUCTIONS.get(category, INSTRUCTIONS["general"])
 
@@ -292,5 +330,5 @@ def get_dynamic_system_prompt(user_context: Union[Dict, str], intent_dict: Union
 
 👤 KULLANICI PROFİLİ: {user_line}
 🎯 GÖREV KATEGORİSİ: {category.upper()}
-{urgency_block}
+{trip_block}{urgency_block}
 {instructions}"""

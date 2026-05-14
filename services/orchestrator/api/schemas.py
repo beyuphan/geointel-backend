@@ -96,6 +96,40 @@ class ChatRequest(BaseModel):
     fcm_token: Optional[str] = None
 
 
+class TripPlanRequest(BaseModel):
+    """
+    Structured trip planning request — TripSetupWizard'dan gelir.
+    LLM'e doğal dil mesaj olarak değil, deterministic parametreler olarak işlenir.
+    """
+    origin: str = Field(default="CURRENT_LOCATION", description="Başlangıç noktası ('CURRENT_LOCATION' veya 'lat,lon' veya şehir adı)")
+    destination: str = Field(description="Hedef şehir veya adres")
+    waypoints: List[str] = Field(default=[], description="Ara duraklar: ['Bolu', 'Düzce']")
+    break_interval_hours: float = Field(default=2.0, ge=0.5, le=8.0, description="Kaç saatte bir mola (0=molasız)")
+    food_preference: str = Field(default="Fark etmez", description="Yöresel, Fast Food, Ev Yemeği, Kahve & Tatlı, Fark etmez")
+    food_location: str = Field(default="Ortaları", description="Rotanın neresinde yemek: Başları, Ortaları, Sonları, belirli şehir adı")
+    fuel_remaining_km: float = Field(default=0, ge=0, le=1200, description="Anlık yakıt ile gidilebilecek km (0 = bilinmiyor)")
+    custom_note: str = Field(default="", max_length=500, description="Serbest not: 'sahil yolundan git'")
+    session_id: str = Field(default="default_session")
+    current_lat: Optional[float] = None
+    current_lon: Optional[float] = None
+    fcm_token: Optional[str] = None
+
+
+class TripAddStopsRequest(BaseModel):
+    """
+    Kullanıcının seçtiği durakları doğrudan rotaya ekler.
+    LLM kullanılmaz — tamamen deterministik.
+    """
+    session_id: str = Field(default="default_session")
+    # Seçilen koordinatlar: [{"lat": 41.1, "lon": 29.2, "name": "..."}]
+    selected_stops: List[dict] = Field(description="Seçilen durак koordinatları")
+    # Mevcut rota bilgisi
+    origin: Optional[str] = Field(default=None, description="Başlangıç koordinatı")
+    destination: Optional[str] = Field(default=None, description="Hedef şehir/koordinat")
+    current_lat: Optional[float] = None
+    current_lon: Optional[float] = None
+
+
 class MapMarker(BaseModel):
     lat: float
     lon: float
@@ -175,11 +209,22 @@ class PoiOverlayCard(BaseModel):
     opening_hours: Optional[list] = Field(default=None)
     phone: Optional[str] = Field(default=None)
 
+    # Yakıt fiyat bilgisi (fuel_station tipi için)
+    fuel_price_info: Optional[dict] = Field(
+        default=None,
+        description="{'price_per_liter': 45.2, 'company': 'Opet', 'fuel_type': 'benzin'}"
+    )
+
     # UI için hesaplanmış alanlar
     deviation_label: Optional[str] = Field(default=None, description="'Yol üstü ✅', '850m sapma ⚠️', '3.2km uzatır ❌'")
     route_impact_label: Optional[str] = Field(default=None, description="'+5 dk', 'Sıfır etki', '+12 dk'")
     is_recommended: bool = Field(default=False, description="AI'ın öne çıkardığı mekan mı?")
     recommendation_reason: Optional[str] = Field(default=None, description="'En yüksek puan', 'Yol üstü', 'En ucuz'")
+    # AI tarafından üretilen tek cümlelik öneri metni (kart açıklaması)
+    ai_recommendation: Optional[str] = Field(
+        default=None,
+        description="Neden bu mekanı öneriyoruz — kısa, özgün açıklama. Örn: 'Düzce geçişinde yol üstünde, yüksek puanlı ve açık.'"
+    )
 
 
 class PoiOverlay(BaseModel):
@@ -189,7 +234,7 @@ class PoiOverlay(BaseModel):
     """
     mode: str = Field(
         default="poi_selection",
-        description="poi_selection | route_confirmation | final_summary"
+        description="poi_selection | route_confirmation | final_summary | trip_plan"
     )
     title: str = Field(description="Overlay başlığı: 'Yol Üzerindeki Restoranlar'")
     subtitle: Optional[str] = Field(default=None, description="'3 mekan bulundu, kaydırarak incele'")
@@ -202,10 +247,20 @@ class PoiOverlay(BaseModel):
         default=None,
         description="İkincil buton metni: 'Atla', 'Farklı Mekan Öner'"
     )
-    # Rota özeti için (mode=final_summary)
+    # Rota özeti için (mode=final_summary / trip_plan)
     route_summary: Optional[dict] = Field(
         default=None,
         description="Tamamlanan rota özeti: {total_km, total_min, stops, warnings}"
+    )
+    # Hava durumu uyarıları (rota boyunca)
+    weather_warnings: Optional[List[dict]] = Field(
+        default=None,
+        description="[{'location': 'Bolu', 'condition': 'Kar', 'severity': 'warning'}]"
+    )
+    # Trip plan modu için kategorize duraklar
+    sections: Optional[List[dict]] = Field(
+        default=None,
+        description="[{'type': 'food', 'title': 'Yemek Durağı', 'cards': [...]}]"
     )
 
 
@@ -245,6 +300,11 @@ class ChatResponse(BaseModel):
     poi_overlay: Optional[PoiOverlay] = Field(
         default=None,
         description="Doluysa harita yerine tam ekran POI swipe overlay açılır."
+    )
+    # Trip plan modu — yapılandırılmış yolculuk özeti
+    trip_plan: Optional[dict] = Field(
+        default=None,
+        description="Structured trip plan: {origin, destination, total_km, breaks, fuel_stops, food_stops}"
     )
 
 
