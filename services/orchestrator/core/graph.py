@@ -57,12 +57,25 @@ async def agent_node(state: AgentState):
         and orchestrator.redis_client.exists(f"route:{session_id}")
     )
 
+    # Trip context (yapılandırılmış yolculuk — /trip/plan endpoint'inden gelir)
+    trip_context = None
+    if orchestrator.redis_client:
+        raw_tc = orchestrator.redis_client.get(f"trip_ctx:{session_id}")
+        if raw_tc:
+            import json as _json
+            try:
+                trip_context = _json.loads(
+                    raw_tc if isinstance(raw_tc, str) else raw_tc.decode("utf-8")
+                )
+            except Exception:
+                pass
+
     # System prompt oluştur
     user_ctx = await ProfileManager.get_combined_context(session_id)
-    sys_prompt = get_dynamic_system_prompt(user_ctx, state["intent"])
+    sys_prompt = get_dynamic_system_prompt(user_ctx, state["intent"], trip_context=trip_context)
     if has_active_route:
         sys_prompt += (
-            "\n\n[SISTEM NOTU: Kullanıcının aktif bir rotası var. "
+            "\n\n[SİSTEM NOTU: Kullanıcının aktif bir rotası var. "
             "Rota gerektiren tool çağrılarında polyline='LATEST' kullan, "
             "sistem otomatik Redis'ten gerçek polyline'ı enjekte edecek.]"
         )

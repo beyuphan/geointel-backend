@@ -62,48 +62,48 @@ class RouteStrategyEvaluator:
         }
 
         # ─── 2. MIDPOINT-BASED BENZINLIK ARAMASI ─────────────────────────────
-        # search_hybrid_places, route_polyline aldığında Google/OSM tarafında
-        # midpoint mantığını (fraction=0.5) otomatik uygular (Feature 1 entegrasyon).
-        places_res = await self._safe_call(
-            "city",
-            "search_hybrid_places",
-            {"query": f"{fuel_type} istasyonu", "route_polyline": polyline},
-        )
+        # ─── 2. MENZILE GÖRE HEDEF MESAFELERİ BELİRLE ──────────────────────────────────────
+        total_dist_raw = route_res.get("mesafe_km", 0) or route_res.get("distance_km", 0)
+        try:
+            total_dist = float(total_dist_raw)
+        except Exception:
+            total_dist = 500.0
 
-        if "error" in places_res or places_res.get("status") == "error":
-            return {
-                "status": "partial_success",
-                "route": safe_route_summary,
-                "warning": "Akaryakıt istasyonları bulunamadı.",
-            }
-
-        # Eski ve yeni format desteği
-        places: List[dict] = []
-        if isinstance(places_res, list):
-            places = places_res
-        elif isinstance(places_res, dict):
-            places = places_res.get("places", [])
-            if not places:
-                places = (
-                    places_res.get("strict_route_places", [])
-                    + places_res.get("relaxed_route_places", [])
-                )
-
-        # ─── 3. MENZILE GÖRE FİLTRELEME ──────────────────────────────────────
+        target_distances = []
         if fuel_range:
-            total_dist_raw = route_res.get("mesafe_km", 0) or route_res.get("distance_km", 0)
-            try:
-                total_dist = float(total_dist_raw)
-            except Exception:
-                total_dist = 500.0
-
-            target_distances = []
             curr = fuel_range * 0.8
             while curr < total_dist:
                 target_distances.append(curr)
                 curr += fuel_range * 0.8
+        
+        if not target_distances:
+            target_distances = [total_dist * 0.5]
 
-            selected_places = []
+        # ─── 3. HER HEDEF İÇİN AYRI ARAMA YAP ──────────────────────────────────────
+        import asyncio
+        search_tasks = []
+        for target in target_distances:
+            fraction = target / total_dist
+            search_tasks.append(self._safe_call(
+                "city",
+                "search_hybrid_places",
+                {"query": f"{fuel_type} istasyonu", "route_polyline": polyline, "target_fraction": fraction},
+            ))
+
+        results = await asyncio.gather(*search_tasks)
+        
+        places: List[dict] = []
+        for places_res in results:
+            if isinstance(places_res, dict):
+                p_list = places_res.get("places", [])
+                if not p_list:
+                    p_list = places_res.get("strict_route_places", []) + places_res.get("relaxed_route_places", [])
+                places.extend(p_list)
+            elif isinstance(places_res, list):
+                places.extend(places_res)
+
+        selected_places = []
+        if fuel_range:
             for target in target_distances:
                 best_match = None
                 best_diff = 9999.0
@@ -141,9 +141,24 @@ class RouteStrategyEvaluator:
         async def _enrich_station(station: dict) -> dict:
             """Tek bir istasyona mcp_intel'den gerçek akaryakıt fiyatı inject et."""
             address = str(station.get("address", ""))
-            parts = address.split(",")
-            city_guess = parts[-1].strip().split(" ")[-1] if parts else ""
-            district_guess = parts[-2].strip().split(" ")[-1] if len(parts) >= 2 else "merkez"
+            parts = [p.strip() for p in address.split(",")]
+            if parts and parts[-1].lower() in ["türkiye", "turkey"]:
+                parts.pop()
+            
+            city_guess = ""
+            district_guess = "merkez"
+            
+            if parts:
+                last_part = parts[-1]
+                tokens = last_part.split(" ")
+                location_str = tokens[-1]
+                
+                if "/" in location_str:
+                    d_c = location_str.split("/")
+                    district_guess = d_c[0]
+                    city_guess = d_c[1]
+                else:
+                    city_guess = location_str
 
             if not city_guess:
                 station["fuel_price_enriched"] = False

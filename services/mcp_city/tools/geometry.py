@@ -41,7 +41,6 @@ def _get_line_coords(encoded_polyline: str = None, geojson_geometry: dict = None
         else:
             line_coords = [tuple(c) for c in raw_coords]
 
-    # 2. DURUM: Polyline String Varsa (HERE API'den geldiyse)
     elif encoded_polyline and len(encoded_polyline) > 5:
         try:
             # flexpolyline decode -> [(lat, lon)] döner.
@@ -49,8 +48,13 @@ def _get_line_coords(encoded_polyline: str = None, geojson_geometry: dict = None
             # Shapely (lon, lat) ister. Ters çeviriyoruz.
             line_coords = [(lon, lat) for lat, lon in decoded]
         except Exception as e:
-            log.error(f"Polyline decode hatası: {e}")
-            return []
+            try:
+                import polyline
+                decoded = polyline.decode(encoded_polyline)
+                line_coords = [(lon, lat) for lat, lon in decoded]
+            except Exception as e2:
+                log.error(f"Polyline decode hatası (flex & std): {e2}")
+                return []
             
     return line_coords
 

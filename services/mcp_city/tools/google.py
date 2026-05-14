@@ -118,7 +118,7 @@ async def search_places_google_handler(
     points = []
 
     if should_calc_distance:
-        # Rota midpoint'ini birincil arama konumu yap
+        # Rota hedef noktasını birincil arama konumu yap
         mp = get_route_midpoint(encoded_polyline=route_polyline, fraction=fraction)
         if mp:
             locations_to_search.append((mp["lat"], mp["lon"]))
@@ -126,18 +126,15 @@ async def search_places_google_handler(
                 f"🎯 [Google Midpoint] fraction={fraction:.2f} → "
                 f"({mp['lat']:.4f}, {mp['lon']:.4f}) @ +{mp['distance_from_start_km']} km"
             )
+            # Daha fazla çeşitlilik için hedefin biraz gerisini ve ilerisini de ara
+            mp_prev = get_route_midpoint(encoded_polyline=route_polyline, fraction=max(0.0, fraction - 0.03))
+            if mp_prev: locations_to_search.append((mp_prev["lat"], mp_prev["lon"]))
+            mp_next = get_route_midpoint(encoded_polyline=route_polyline, fraction=min(1.0, fraction + 0.03))
+            if mp_next: locations_to_search.append((mp_next["lat"], mp_next["lon"]))
 
-        # Ek örnekleme noktaları (başlangıç + 3/4 noktası)
+        # Yalnızca hedeflenen noktayı (ve etrafını) arayacağız
         points = sample_route_points(encoded_polyline=route_polyline, interval_km=40)
-        if points:
-            start_loc = (points[0]["lat"], points[0]["lon"])
-            if start_loc not in locations_to_search:
-                locations_to_search.append(start_loc)
-            if len(points) >= 4:
-                three_qrt = points[len(points) * 3 // 4]
-                loc_3q = (three_qrt["lat"], three_qrt["lon"])
-                if loc_3q not in locations_to_search:
-                    locations_to_search.append(loc_3q)
+
 
     # LLM'den gelen spesifik koordinat varsa en öne ekle
     if lat and lon and lat != 0.0 and lon != 0.0:

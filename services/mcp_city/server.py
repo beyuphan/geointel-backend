@@ -429,7 +429,7 @@ async def get_toll_for_route(route_polyline: str) -> str:
 
 @mcp.tool()
 @safe_tool(fallback_message="Hybrid place search failed.")
-async def search_hybrid_places(query: str, location_name: Optional[str] = None, lat: Optional[float] = None, lon: Optional[float] = None, category: Optional[str] = "commercial", route_polyline: Optional[str] = None) -> str:
+async def search_hybrid_places(query: str, location_name: Optional[str] = None, lat: Optional[float] = None, lon: Optional[float] = None, category: Optional[str] = "commercial", route_polyline: Optional[str] = None, target_fraction: float = 0.5) -> str:
     """
     Finds places using Google + OSM data fusion for best accuracy.
     If you don't have exact coordinates, leave lat/lon empty and provide location_name (e.g. 'Kadikoy', 'Rize').
@@ -455,7 +455,7 @@ async def search_hybrid_places(query: str, location_name: Optional[str] = None, 
         is_semantic = any(k in query.lower() for k in semantic_keywords)
         
         tasks = [
-            search_places_google_handler(query, lat or 0.0, lon or 0.0, route_polyline),
+            search_places_google_handler(query, lat or 0.0, lon or 0.0, route_polyline, fraction=target_fraction),
             search_infrastructure_osm_handler(lat, lon, category, radius=2000) if (lat and lon) else asyncio.sleep(0, result=[])
         ]
         if is_semantic:
@@ -512,6 +512,9 @@ async def search_hybrid_places(query: str, location_name: Optional[str] = None, 
                     "is_open": str(g_place.get("open_now")),
                     "lat": g_lat,
                     "lon": g_lon,
+                    "deviation_meters": g_place.get("deviation_meters"),
+                    "distance_along_route_km": g_place.get("distance_along_route_km"),
+                    "on_route_side": g_place.get("on_route_side"),
                     "fusion_status": "Google Route-Only Match"
                 })
             
