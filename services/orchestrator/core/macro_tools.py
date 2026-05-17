@@ -36,38 +36,47 @@ class RouteStrategyEvaluator:
         destination: str,
         fuel_type: str = "benzin",
         fuel_range: Optional[float] = None,
+        polyline: Optional[str] = None,
+        total_dist_km: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Ana Macro-Tool metodu. Rota çıkarır, şehirleri bulur, fiyatı basar."""
         log.info(f"🧠 [Macro-Tool] Rota Stratejisi Başlatıldı: {origin} -> {destination}")
 
-        # ─── 1. BASE ROUTE (Feature 1: Önce polyline oluştur) ────────────────
-        route_res = await self._safe_call(
-            "city", "get_route_data", {"origin": origin, "destination": destination}
-        )
-        if "error" in route_res or route_res.get("status") == "error":
-            return {
-                "status": "error",
-                "message": f"Rota oluşturulamadı: {route_res.get('message', route_res.get('error', 'Bilinmeyen hata'))}",
+        # ─── 1. BASE ROUTE — polyline dışarıdan verilmişse route çağrısını atla ──
+        if polyline and total_dist_km is not None:
+            safe_route_summary = {
+                "distance_km": total_dist_km,
+                "polyline": polyline,
+                "status": "success",
             }
+            total_dist = float(total_dist_km)
+        else:
+            route_res = await self._safe_call(
+                "city", "get_route_data", {"origin": origin, "destination": destination}
+            )
+            if "error" in route_res or route_res.get("status") == "error":
+                return {
+                    "status": "error",
+                    "message": f"Rota oluşturulamadı: {route_res.get('message', route_res.get('error', 'Bilinmeyen hata'))}",
+                }
 
-        polyline = route_res.get("polyline") or route_res.get("polyline_encoded", "")
-        if not polyline or "GİZLENDİ" in str(polyline) or "HARİTA" in str(polyline):
-            return {"status": "error", "message": "Geçerli bir polyline bulunamadı."}
+            polyline = route_res.get("polyline") or route_res.get("polyline_encoded", "")
+            if not polyline or "GİZLENDİ" in str(polyline) or "HARİTA" in str(polyline):
+                return {"status": "error", "message": "Geçerli bir polyline bulunamadı."}
 
-        safe_route_summary = {
-            "distance_km": route_res.get("mesafe_km") or route_res.get("distance_km"),
-            "duration_min": route_res.get("sure_dk") or route_res.get("duration_min"),
-            "polyline": polyline,
-            "status": "success",
-        }
+            safe_route_summary = {
+                "distance_km": route_res.get("mesafe_km") or route_res.get("distance_km"),
+                "duration_min": route_res.get("sure_dk") or route_res.get("duration_min"),
+                "polyline": polyline,
+                "status": "success",
+            }
+            total_dist_raw = route_res.get("mesafe_km", 0) or route_res.get("distance_km", 0)
+            try:
+                total_dist = float(total_dist_raw)
+            except Exception:
+                total_dist = 500.0
 
-        # ─── 2. MIDPOINT-BASED BENZINLIK ARAMASI ─────────────────────────────
         # ─── 2. MENZILE GÖRE HEDEF MESAFELERİ BELİRLE ──────────────────────────────────────
-        total_dist_raw = route_res.get("mesafe_km", 0) or route_res.get("distance_km", 0)
-        try:
-            total_dist = float(total_dist_raw)
-        except Exception:
-            total_dist = 500.0
 
         target_distances = []
         if fuel_range:
@@ -119,7 +128,11 @@ class RouteStrategyEvaluator:
             if selected_places:
                 places = selected_places
             else:
-                filtered_places = [p for p in places if p.get("distance_along_route_km", 0) <= fuel_range]
+                # distance_along_route_km > 0 ve fuel_range içinde olan istasyonları al
+                filtered_places = [
+                    p for p in places
+                    if 0 < p.get("distance_along_route_km", 0) <= fuel_range
+                ]
                 if filtered_places:
                     places = filtered_places
                     places.sort(
@@ -234,8 +247,8 @@ class RouteStrategyEvaluator:
         return {
             "status": "success",
             "route_summary": {
-                "distance": safe_route_summary["distance_km"],
-                "duration": safe_route_summary["duration_min"],
+                "distance": safe_route_summary.get("distance_km"),
+                "duration": safe_route_summary.get("duration_min"),
             },
             "polyline": polyline,
             "cheapest_fuel_city": {
