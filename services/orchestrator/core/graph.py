@@ -57,9 +57,12 @@ async def agent_node(state: AgentState):
         and orchestrator.redis_client.exists(f"route:{session_id}")
     )
 
-    # Trip context (yapılandırılmış yolculuk — /trip/plan endpoint'inden gelir)
+    # Trip context — yalnızca routing/trip_plan intent'lerinde inject et.
+    # Serbest mod sorguları (eczane, poi_search, general vb.) önceki rota
+    # context'iyle kirletilmemeli.
+    _ROUTING_CATEGORIES = {"routing"}
     trip_context = None
-    if orchestrator.redis_client:
+    if orchestrator.redis_client and state.get("intent", {}).get("category") in _ROUTING_CATEGORIES:
         raw_tc = orchestrator.redis_client.get(f"trip_ctx:{session_id}")
         if raw_tc:
             import json as _json
@@ -206,24 +209,70 @@ async def custom_tool_node(state: AgentState):
                 "plan_weather_aware_route", "evaluate_route_strategy"
             }
             if t_name in POI_TOOLS:
-                # Tek POI
+                # mcp_intel get_pharmacies sadece adres + telefon döner,
+                # koordinat YOK. Google Places Text Search ile lat/lon enrich et.
+                if t_name == "get_pharmacies" and isinstance(res, dict):
+                    pharms = res.get("data") or res.get("pharmacies") or []
+                    if isinstance(pharms, list) and pharms:
+                        await _geocode_pharmacies(pharms)
+
+                # Tek POI (res seviyesinde lat/lon)
                 if "lat" in res and "lon" in res:
                     local_visual["markers"].append(_build_marker(res))
 
-                # Listeler (strict/relaxed veya places)
-                all_places = (
-                    res.get("strict_route_places", [])
-                    + res.get("relaxed_route_places", [])
-                    + res.get("places", [])
-                )
-                for p in all_places:
+                # Listeler — birden çok olası key adı (places / pharmacies / data / results)
+                all_places: list = []
+                for key in (
+                    "strict_route_places", "relaxed_route_places",
+                    "places", "pharmacies", "results", "data", "items",
+                ):
+                    v = res.get(key)
+                    if isinstance(v, list):
+                        all_places.extend(v)
+
+                def _normalize_coords(p: dict) -> bool:
+                    """lat/lon yoksa latitude/longitude veya coords alanından doldur."""
                     if "lat" in p and "lon" in p:
-                        m = _build_marker(p)
-                        if t_name == "get_pharmacies":
-                            m["type"] = "pharmacy"
-                        elif _is_fuel_place(p, res):
-                            m["type"] = "fuel_station"
-                        local_visual["markers"].append(m)
+                        return True
+                    if "latitude" in p and "longitude" in p:
+                        try:
+                            p["lat"] = float(p["latitude"])
+                            p["lon"] = float(p["longitude"])
+                            return True
+                        except Exception:
+                            return False
+                    coords = p.get("coords") or p.get("location") or p.get("position")
+                    if isinstance(coords, str) and "," in coords:
+                        try:
+                            cl, cln = coords.split(",", 1)
+                            p["lat"] = float(cl.strip())
+                            p["lon"] = float(cln.strip())
+                            return True
+                        except Exception:
+                            return False
+                    if isinstance(coords, dict):
+                        lat = coords.get("lat") or coords.get("latitude")
+                        lon = coords.get("lon") or coords.get("lng") or coords.get("longitude")
+                        if lat is not None and lon is not None:
+                            try:
+                                p["lat"] = float(lat)
+                                p["lon"] = float(lon)
+                                return True
+                            except Exception:
+                                return False
+                    return False
+
+                for p in all_places:
+                    if not isinstance(p, dict):
+                        continue
+                    if not _normalize_coords(p):
+                        continue
+                    m = _build_marker(p)
+                    if t_name == "get_pharmacies":
+                        m["type"] = "pharmacy"
+                    elif _is_fuel_place(p, res):
+                        m["type"] = "fuel_station"
+                    local_visual["markers"].append(m)
 
             # Waypoint marker'ları (rota güncellendiğinde)
             if t_name == "get_route_data":
@@ -322,3 +371,72 @@ def _is_fuel_place(p: dict, res: dict) -> bool:
     fuel_brands = {"benzin", "shell", "opet", "bp", "petrol", "total", "akaryak", "motorin"}
     combined = (p.get("name", "") + str(res)).lower()
     return any(b in combined for b in fuel_brands)
+
+
+async def _geocode_pharmacies(pharms: list) -> None:
+    """
+    mcp_intel'in get_pharmacies sonucu sadece adres + telefon döner — koordinat
+    YOKTUR. Google Places Text Search API ile her eczanenin lat/lon'unu doldur.
+    (GOOGLE_API_KEY Geocoding API'ye yetkili değil; GOOGLE_MAPS_API_KEY Places'e
+    yetkili — onu kullanıyoruz.)
+    """
+    import os
+    try:
+        import httpx
+    except Exception as e:
+        log.warning(f"⚠️ [Pharmacy Geocode] Bağımlılık yok: {e}")
+        return
+
+    api_key = os.getenv("GOOGLE_MAPS_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+    if not api_key:
+        log.warning("⚠️ [Pharmacy Geocode] API key yok, atlandı")
+        return
+
+    async def _geocode_one(client: httpx.AsyncClient, ph: dict) -> None:
+        if "lat" in ph and "lon" in ph and ph["lat"] and ph["lon"]:
+            return
+        # Eczane ismi + ilçe + il/ülke → Text Search en güvenilir
+        name = (ph.get("name") or "").strip()
+        district = (ph.get("district") or "").strip()
+        query_parts = [name, district, "Samsun", "Türkiye"]
+        # Eğer district adres içinde geçiyorsa duplicate olmasın
+        addr = ph.get("address") or ""
+        if addr and addr not in query_parts:
+            # Daha kısa tutmak için sadece sokak/mahalle kısmını al
+            query_parts.insert(1, addr.split(",")[0].strip())
+        query = " ".join([p for p in query_parts if p])
+        if not query.strip():
+            return
+        try:
+            resp = await client.get(
+                "https://maps.googleapis.com/maps/api/place/textsearch/json",
+                params={"query": query, "key": api_key, "language": "tr"},
+                timeout=8.0,
+            )
+            data = resp.json()
+            results = data.get("results") or []
+            if results:
+                loc = results[0].get("geometry", {}).get("location") or {}
+                lat = loc.get("lat")
+                lng = loc.get("lng")
+                if lat is not None and lng is not None:
+                    ph["lat"] = float(lat)
+                    ph["lon"] = float(lng)
+                    # Adres yoksa Google'dan da çek
+                    if not ph.get("address"):
+                        ph["address"] = results[0].get("formatted_address", "")
+            elif data.get("status") not in ("OK", "ZERO_RESULTS"):
+                log.warning(
+                    f"⚠️ [Pharmacy Geocode] '{name}' API hatası: "
+                    f"{data.get('status')} / {data.get('error_message','')[:80]}"
+                )
+        except Exception as exc:
+            log.warning(f"⚠️ [Pharmacy Geocode] '{name}' başarısız: {exc}")
+
+    async with httpx.AsyncClient() as client:
+        await asyncio.gather(
+            *[_geocode_one(client, ph) for ph in pharms if isinstance(ph, dict)],
+            return_exceptions=True,
+        )
+    enriched = sum(1 for ph in pharms if isinstance(ph, dict) and "lat" in ph)
+    log.info(f"📍 [Pharmacy Geocode] {enriched}/{len(pharms)} eczane geocode edildi")

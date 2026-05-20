@@ -44,10 +44,14 @@ class GeoIntelOrchestrator:
             # temperature=0,  # V4.x modellerinde opsiyonel veya depreke olabilir
             api_key=settings.ANTHROPIC_API_KEY
         )
+        # Gemini: 3-preview ve 2.5-flash projeye kapalı olabiliyor (PERMISSION_DENIED).
+        # En geniş erişimli stable model olarak 2.0-flash'a düştük. Hata olursa
+        # tüm LLM çağrılarında orchestrator.llm_claude'a otomatik fallback edilir
+        # (run_llm_with_fallback helper'ı).
         self.llm_gemini = ChatGoogleGenerativeAI(
-            model="gemini-3-flash-preview",
+            model="gemini-2.0-flash",
             temperature=0,
-            google_api_key=settings.GOOGLE_API_KEY
+            google_api_key=settings.GOOGLE_API_KEY,
         )
 
     def _init_redis(self):
@@ -116,19 +120,39 @@ class GeoIntelOrchestrator:
         fields = {}
         required_fields = schema.get("required", [])
 
+        t_map = {
+            "string": str, "number": float, "integer": int, "boolean": bool,
+            "array": list, "object": dict,
+        }
+
+        def _extract_type(info: dict) -> str | None:
+            """JSON Schema'dan birincil tipi al — anyOf/oneOf/allOf desteği.
+            FastMCP, Optional[X] = None için anyOf: [{type: X}, {type: null}] üretir;
+            'type' anahtarı yoksa düz None döner ve fallback str'ye düşer (eski bug)."""
+            if not isinstance(info, dict):
+                return None
+            if "type" in info and info["type"] != "null":
+                return info["type"]
+            for key in ("anyOf", "oneOf", "allOf"):
+                variants = info.get(key)
+                if isinstance(variants, list):
+                    for variant in variants:
+                        if isinstance(variant, dict):
+                            t = variant.get("type")
+                            if t and t != "null":
+                                return t
+            return None
+
         if "properties" in schema:
             for field_name, field_info in schema["properties"].items():
-                t_map = {
-                    "string": str, "number": float, "integer": int, "boolean": bool,
-                    "array": list, "object": dict,
-                }
-                field_type = t_map.get(field_info.get("type"), str)
-                description = field_info.get("description", "")
+                raw_type = _extract_type(field_info)
+                field_type = t_map.get(raw_type, str)
+                description = (field_info.get("description") or "") if isinstance(field_info, dict) else ""
                 if field_name in required_fields:
                     fields[field_name] = (field_type, Field(description=description))
                 else:
                     fields[field_name] = (Optional[field_type], Field(default=None, description=description))
-                
+
         fields["session_id"] = (str, "default_session")
         return create_model(f"{name}Input", **fields)
 
@@ -207,7 +231,13 @@ class GeoIntelOrchestrator:
                     except Exception as redis_err:
                         log.warning(f"⚠️ [Proxy] Redis okunamadı: {redis_err}")
 
-            mcp_args = {k: v for k, v in kwargs.items() if k != "session_id"}
+            # None değerleri MCP'ye gönderme — MCP server tarafında alanın
+            # default'u varsa onu kullansın, Optional[X]=None wrapper'ımız strict
+            # validation'ı patlatmasın (örn. target_fraction: float = 0.5).
+            mcp_args = {
+                k: v for k, v in kwargs.items()
+                if k != "session_id" and v is not None
+            }
             
             # V2.5: Redis Smart Cache — tekrarlı API çağrılarını önle
             cache_ttl = self.cache_ttls.get(name)
@@ -239,6 +269,21 @@ class GeoIntelOrchestrator:
                 if poly and self.redis_client:
                     self.redis_client.setex(route_key, 3600, poly)
 
+                # Waypoint listesi — "|" separated string'i parse et
+                # (passthrough markeri "!pt" varsa temizle)
+                wp_raw = mcp_args.get("waypoints") or ""
+                wp_list = None
+                if isinstance(wp_raw, str) and wp_raw:
+                    wp_list = [
+                        (w[:-3] if w.endswith("!pt") else w).strip()
+                        for w in wp_raw.split("|") if w.strip()
+                    ] or None
+                elif isinstance(wp_raw, list):
+                    wp_list = [
+                        (w[:-3] if isinstance(w, str) and w.endswith("!pt") else w)
+                        for w in wp_raw
+                    ] or None
+
                 # Rota geçmişini arka planda DB'ye kaydet (non-blocking)
                 try:
                     import asyncio
@@ -247,6 +292,8 @@ class GeoIntelOrchestrator:
                         destination=mcp_args.get("destination", "Bilinmiyor"),
                         distance_km=float(result.get("mesafe_km", 0)),
                         duration_min=float(result.get("sure_dk", 0)),
+                        polyline_encoded=poly,
+                        waypoints=wp_list,
                     ))
                     log.info("📚 [RouteHistory] Rota geçmişe kaydediliyor (arka plan)...")
                 except Exception as e:

@@ -1,6 +1,6 @@
 """
 V3 Fuel Scraper — Playwright KALDIRILDI, httpx + regex ile 5x hızlı çalışır.
-doviz.com'dan akaryakıt fiyatlarını çeker (OPET, Petrol Ofisi, Total).
+doviz.com'dan akaryakıt fiyatlarını çeker (OPET, Petrol Ofisi, Total, BP, Shell, Aytemiz).
 """
 import asyncio
 import httpx
@@ -11,7 +11,7 @@ from datetime import datetime
 
 
 class FuelScraper:
-    FIRMS = ["opet", "petrol-ofisi", "total"]
+    FIRMS = ["opet", "petrol-ofisi", "total", "bp", "shell", "aytemiz"]
     BASE_URL = "https://www.doviz.com/akaryakit-fiyatlari"
     HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",

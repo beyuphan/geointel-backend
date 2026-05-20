@@ -1,0 +1,14 @@
+{
+  "origin": "Samsun",
+  "destination": "Rize",
+  "waypoints": [],
+  "waypoint_labels": [],
+  "break_interval_hours": 2.0,
+  "food_preference": "Yöresel Lezzetler",
+  "food_location": "Ortaları",
+  "fuel_remaining_km": 150,
+  "custom_note": "Karadeniz sahil yoluyla gitmek istiyorum",
+  "session_id": "sess_test_e2e_4",
+  "current_lat": 41.337,
+  "current_lon": 36.267
+}

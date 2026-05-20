@@ -1,7 +1,139 @@
 import asyncio
 import json
+import math
+import httpx
 from loguru import logger as log
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
+
+try:
+    import flexpolyline as _flex
+except Exception:
+    _flex = None
+try:
+    import polyline as _polyline_lib  # type: ignore
+except Exception:
+    _polyline_lib = None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Yakıt algoritması yardımcıları
+# ──────────────────────────────────────────────────────────────────────────
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def _decode_polyline(polyline_str: str) -> List[Tuple[float, float]]:
+    """Polyline → [(lat, lon)] decode (flexpolyline → fallback polyline lib)."""
+    if not polyline_str:
+        return []
+    try:
+        if _flex:
+            return [(float(p[0]), float(p[1])) for p in _flex.decode(polyline_str)]
+    except Exception:
+        pass
+    try:
+        if _polyline_lib:
+            return [(float(p[0]), float(p[1])) for p in _polyline_lib.decode(polyline_str)]
+    except Exception:
+        pass
+    return []
+
+
+def _sample_polyline_at_km(
+    polyline_str: str, start_km: float, end_km: float, every_km: float = 20.0
+) -> List[Dict[str, float]]:
+    """Polyline'ı decode edip [start_km, end_km] arasında every_km arayla noktalar döner."""
+    pts = _decode_polyline(polyline_str)
+    if len(pts) < 2 or end_km <= start_km:
+        return []
+    samples: List[Dict[str, float]] = []
+    cum_km = 0.0
+    target = max(start_km, 0.0)
+    for i in range(1, len(pts)):
+        seg_km = _haversine_km(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1])
+        next_cum = cum_km + seg_km
+        while target <= next_cum and target <= end_km:
+            t = (target - cum_km) / seg_km if seg_km > 1e-6 else 0.0
+            lat = pts[i - 1][0] + (pts[i][0] - pts[i - 1][0]) * t
+            lon = pts[i - 1][1] + (pts[i][1] - pts[i - 1][1]) * t
+            samples.append({"lat": lat, "lon": lon, "km": target})
+            target += every_km
+            if target > end_km:
+                break
+        cum_km = next_cum
+        if cum_km > end_km:
+            break
+    return samples
+
+
+# Modül-seviyesi cache: aynı koordinatları tekrar reverse-geocode etmeyiz.
+_REVERSE_GEOCODE_CACHE: Dict[Tuple[float, float], Optional[Dict[str, str]]] = {}
+
+
+async def _reverse_geocode_district(
+    lat: float, lon: float, client: httpx.AsyncClient
+) -> Optional[Dict[str, str]]:
+    """Nominatim reverse geocoding → {city, district} or None. Cache'li."""
+    key = (round(lat, 2), round(lon, 2))
+    if key in _REVERSE_GEOCODE_CACHE:
+        return _REVERSE_GEOCODE_CACHE[key]
+    url = "https://nominatim.openstreetmap.org/reverse"
+    params = {
+        "lat": lat,
+        "lon": lon,
+        "format": "json",
+        # zoom=12 → ilçe (admin_level=6) ayrımı keskinleşir. Önceki 10 değeri
+        # Atakum/Tekkeköy gibi komşu ilçelerin karışmasına yol açıyordu.
+        "zoom": 12,
+        "accept-language": "tr",
+    }
+    try:
+        resp = await client.get(url, params=params, timeout=10.0)
+        if resp.status_code != 200:
+            log.warning(
+                f"⚠️ [ReverseGeocode] HTTP {resp.status_code} - body: {resp.text[:200]!r}"
+            )
+            _REVERSE_GEOCODE_CACHE[key] = None
+            return None
+        data = resp.json()
+        addr = data.get("address", {}) or {}
+        city = (
+            addr.get("province")
+            or addr.get("state")
+            or addr.get("city")
+            or ""
+        ).strip()
+        district = (
+            addr.get("county")
+            or addr.get("town")
+            or addr.get("district")
+            or addr.get("suburb")
+            or "merkez"
+        ).strip()
+        for suffix in (" Province", " Il", " ili", " İli"):
+            if city.endswith(suffix):
+                city = city[: -len(suffix)].strip()
+        if not city:
+            log.warning(
+                f"⚠️ [ReverseGeocode] city boş — addr keys: {list(addr.keys())} "
+                f"data: {str(data)[:300]}"
+            )
+            _REVERSE_GEOCODE_CACHE[key] = None
+            return None
+        result = {"city": city, "district": district}
+        _REVERSE_GEOCODE_CACHE[key] = result
+        log.info(f"📍 [ReverseGeocode] {lat:.4f},{lon:.4f} → {result}")
+        return result
+    except Exception as e:
+        log.warning(f"⚠️ [ReverseGeocode] {lat},{lon} EXCEPTION: {type(e).__name__}: {e}")
+        _REVERSE_GEOCODE_CACHE[key] = None
+        return None
 
 
 class RouteStrategyEvaluator:
@@ -39,10 +171,16 @@ class RouteStrategyEvaluator:
         polyline: Optional[str] = None,
         total_dist_km: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Ana Macro-Tool metodu. Rota çıkarır, şehirleri bulur, fiyatı basar."""
-        log.info(f"🧠 [Macro-Tool] Rota Stratejisi Başlatıldı: {origin} -> {destination}")
+        """
+        İlçe-bazlı yakıt önerisi:
+        cur_km'den safe_max=fuel_range*0.85 mesafesine kadar olan segmentteki
+        ilçeleri reverse-geocode et → paralel fiyat çek → en ucuz 2-3 ilçe →
+        o ilçelerde yol üstü istasyonları topla → best + alternatives.
+        Dolum yapıldıktan sonra cur_km güncellenir, döngü devam eder.
+        """
+        log.info(f"🧠 [Macro-Tool] Yakıt Stratejisi Başlatıldı: {origin} -> {destination}")
 
-        # ─── 1. BASE ROUTE — polyline dışarıdan verilmişse route çağrısını atla ──
+        # ─── 1. BASE ROUTE ─────────────────────────────────────────────────
         if polyline and total_dist_km is not None:
             safe_route_summary = {
                 "distance_km": total_dist_km,
@@ -59,11 +197,9 @@ class RouteStrategyEvaluator:
                     "status": "error",
                     "message": f"Rota oluşturulamadı: {route_res.get('message', route_res.get('error', 'Bilinmeyen hata'))}",
                 }
-
             polyline = route_res.get("polyline") or route_res.get("polyline_encoded", "")
             if not polyline or "GİZLENDİ" in str(polyline) or "HARİTA" in str(polyline):
                 return {"status": "error", "message": "Geçerli bir polyline bulunamadı."}
-
             safe_route_summary = {
                 "distance_km": route_res.get("mesafe_km") or route_res.get("distance_km"),
                 "duration_min": route_res.get("sure_dk") or route_res.get("duration_min"),
@@ -76,173 +212,305 @@ class RouteStrategyEvaluator:
             except Exception:
                 total_dist = 500.0
 
-        # ─── 2. MENZILE GÖRE HEDEF MESAFELERİ BELİRLE ──────────────────────────────────────
+        # ─── 2. KÜMÜLATIF DOLUM MANTIĞI ─────────────────────────────────────
+        # Kullanıcının gerçek menzili: her dolumdan sonra menzil tazelenir.
+        # safe_max = fuel_range * 0.85 → %15 tampon, kullanıcı menzil sınırını aşmasın.
+        if not fuel_range or fuel_range <= 0:
+            fuel_range = 400.0  # default
+        safe_max = float(fuel_range) * 0.85
+        type_key_map = {
+            "benzin": "gasoline",
+            "motorin": "diesel",
+            "dizel": "diesel",
+            "lpg": "lpg",
+        }
+        price_key = type_key_map.get(fuel_type.lower(), "gasoline")
 
-        target_distances = []
-        if fuel_range:
-            curr = fuel_range * 0.8
-            while curr < total_dist:
-                target_distances.append(curr)
-                curr += fuel_range * 0.8
-        
-        if not target_distances:
-            target_distances = [total_dist * 0.5]
+        stops_by_km: List[dict] = []
+        all_enriched: List[dict] = []
+        seen_station_keys: set = set()
 
-        # ─── 3. HER HEDEF İÇİN AYRI ARAMA YAP ──────────────────────────────────────
-        import asyncio
-        search_tasks = []
-        for target in target_distances:
-            fraction = target / total_dist
-            search_tasks.append(self._safe_call(
-                "city",
-                "search_hybrid_places",
-                {"query": f"{fuel_type} istasyonu", "route_polyline": polyline, "target_fraction": fraction},
-            ))
+        cur_km = 0.0
+        iteration_safety = 0
 
-        results = await asyncio.gather(*search_tasks)
-        
-        places: List[dict] = []
-        for places_res in results:
-            if isinstance(places_res, dict):
-                p_list = places_res.get("places", [])
-                if not p_list:
-                    p_list = places_res.get("strict_route_places", []) + places_res.get("relaxed_route_places", [])
-                places.extend(p_list)
-            elif isinstance(places_res, list):
-                places.extend(places_res)
+        # Tek bir httpx client'ı tüm reverse-geocode çağrıları için paylaş
+        nom_headers = {"User-Agent": "GeoIntel_Orchestrator/4.0"}
+        async with httpx.AsyncClient(headers=nom_headers) as nom_client:
+            while cur_km + 20 < total_dist and iteration_safety < 6:
+                iteration_safety += 1
+                segment_end = min(cur_km + safe_max, total_dist - 5)
+                if segment_end - cur_km < 40:
+                    # Çok kısa segment → son dolum gerekmez
+                    break
 
-        selected_places = []
-        if fuel_range:
-            for target in target_distances:
-                best_match = None
-                best_diff = 9999.0
-                for p in places:
-                    d = p.get("distance_along_route_km", 0)
-                    diff = abs(target - d)
-                    if diff < best_diff and diff < (fuel_range * 0.3):
-                        best_match = p
-                        best_diff = diff
-                if best_match and best_match not in selected_places:
-                    selected_places.append(best_match)
+                # 2a. Polyline'ı örnekle (ilk 30km'de dolum aramaya gerek yok)
+                sample_start = cur_km + 30
+                if sample_start >= segment_end:
+                    break
+                samples = _sample_polyline_at_km(
+                    polyline, sample_start, segment_end, every_km=20.0
+                )
+                if not samples:
+                    break
 
-            if selected_places:
-                places = selected_places
-            else:
-                # distance_along_route_km > 0 ve fuel_range içinde olan istasyonları al
-                filtered_places = [
-                    p for p in places
-                    if 0 < p.get("distance_along_route_km", 0) <= fuel_range
-                ]
-                if filtered_places:
-                    places = filtered_places
-                    places.sort(
-                        key=lambda p: abs(fuel_range * 0.8 - p.get("distance_along_route_km", 0))
+                # 2b. Her örneği reverse-geocode et → benzersiz (city, district) seti
+                unique_districts: Dict[Tuple[str, str], Dict[str, float]] = {}
+                for s in samples:
+                    rg = await _reverse_geocode_district(s["lat"], s["lon"], nom_client)
+                    if rg:
+                        key = (rg["city"], rg["district"])
+                        if key not in unique_districts:
+                            unique_districts[key] = s
+                    # Nominatim rate limit (1 req/sec) — cache hit'ler atlar
+                    await asyncio.sleep(0.4)
+
+                if not unique_districts:
+                    log.warning(
+                        f"⛽ [Fuel] cur_km={cur_km:.0f} reverse geocode başarısız, segment atlanıyor"
                     )
+                    cur_km = segment_end
+                    continue
 
-        if not places:
+                log.info(
+                    f"⛽ [Fuel] cur_km={cur_km:.0f}..{segment_end:.0f}km — "
+                    f"{len(unique_districts)} ilçe: {list(unique_districts.keys())}"
+                )
+
+                # 2c. Paralel fiyat çek
+                district_list = list(unique_districts.keys())
+
+                async def _get_district_prices(city: str, district: str) -> list:
+                    res = await self._safe_call(
+                        "intel",
+                        "get_fuel_prices",
+                        {"city": city, "district": district},
+                    )
+                    return res.get("data", []) if isinstance(res, dict) else []
+
+                price_results = await asyncio.gather(
+                    *[_get_district_prices(c, d) for c, d in district_list]
+                )
+
+                # 2d. En ucuz ilçeler — min fiyat (target fuel_type)
+                district_min: List[dict] = []
+                for (city, dist), prices in zip(district_list, price_results):
+                    valid = [
+                        p
+                        for p in prices
+                        if isinstance(p.get(price_key), (int, float))
+                        and p.get(price_key, 0) > 5
+                    ]
+                    if valid:
+                        min_p = min(p.get(price_key, 999) for p in valid)
+                        district_min.append({
+                            "city": city,
+                            "district": dist,
+                            "min_price": min_p,
+                            "prices": valid,
+                            "sample": unique_districts[(city, dist)],
+                        })
+
+                district_min.sort(key=lambda x: x["min_price"])
+                cheap_districts = district_min[:3]
+
+                if not cheap_districts:
+                    # Fiyat verisi olmayan ilçeler — yine istasyon ara (fiyatsız)
+                    cheap_districts = [
+                        {
+                            "city": c,
+                            "district": d,
+                            "min_price": None,
+                            "prices": [],
+                            "sample": unique_districts[(c, d)],
+                        }
+                        for c, d in district_list[:3]
+                    ]
+
+                # 2e. Bu ilçelerde rota üstü istasyon ara
+                async def _search_in_district(cd: dict) -> list:
+                    s = cd["sample"]
+                    fraction = (s["km"] / total_dist) if total_dist > 0 else 0.5
+                    res = await self._safe_call(
+                        "city",
+                        "search_hybrid_places",
+                        {
+                            "query": f"{fuel_type} istasyonu",
+                            "lat": s["lat"],
+                            "lon": s["lon"],
+                            "route_polyline": polyline,
+                            "target_fraction": fraction,
+                        },
+                    )
+                    if isinstance(res, dict):
+                        return (
+                            res.get("places")
+                            or res.get("strict_route_places", [])
+                            + res.get("relaxed_route_places", [])
+                        )
+                    return []
+
+                station_results = await asyncio.gather(
+                    *[_search_in_district(cd) for cd in cheap_districts]
+                )
+
+                # 2f. Aday istasyonları topla + fiyat eşle
+                def _norm_brand(s: str) -> str:
+                    return s.lower().replace(" ", "").replace("-", "").replace("_", "")
+
+                candidates: List[dict] = []
+                for cd, places in zip(cheap_districts, station_results):
+                    for p in places or []:
+                        if not isinstance(p, dict):
+                            continue
+                        d_km = p.get("distance_along_route_km") or 0
+                        dev = p.get("deviation_meters", 9999) or 9999
+                        if not (cur_km < d_km <= segment_end):
+                            continue
+                        if dev > 500:
+                            continue
+
+                        # Marka eşleşmesi → varsa o fiyatı kullan
+                        st_norm = _norm_brand(p.get("name", ""))
+                        brand_match = next(
+                            (
+                                pr
+                                for pr in cd["prices"]
+                                if _norm_brand(pr.get("company", "")) in st_norm
+                                or st_norm in _norm_brand(pr.get("company", ""))
+                            ),
+                            None,
+                        )
+                        if brand_match:
+                            p["fuel_price"] = {
+                                "price_per_liter": brand_match.get(price_key),
+                                "company": brand_match.get("company"),
+                                "fuel_type": fuel_type,
+                                "city": cd["city"],
+                                "district": cd["district"],
+                                "price_label": f"{brand_match.get(price_key):.2f} ₺/L",
+                            }
+                            p["fuel_price_enriched"] = True
+                        else:
+                            label = "Fiyat bilgisi yok"
+                            if cd["min_price"]:
+                                label = (
+                                    f"{cd['district']} ortalama ~"
+                                    f"{cd['min_price']:.2f} ₺/L"
+                                )
+                            p["fuel_price"] = {
+                                "price_per_liter": None,
+                                "company": None,
+                                "fuel_type": fuel_type,
+                                "city": cd["city"],
+                                "district": cd["district"],
+                                "price_label": label,
+                            }
+                            p["fuel_price_enriched"] = False
+
+                        p["_district_min_price"] = cd["min_price"]
+                        candidates.append(p)
+
+                if not candidates:
+                    log.info(
+                        f"⛽ [Fuel] cur_km={cur_km:.0f} aday yok, segment ilerletiliyor"
+                    )
+                    cur_km = segment_end
+                    continue
+
+                # 2g. Sırala: ilçe min fiyatı, sonra deviation
+                def _candidate_key(p):
+                    mp = p.get("_district_min_price")
+                    fp = p.get("fuel_price") or {}
+                    own_price = fp.get("price_per_liter")
+                    # Önce marka fiyatı olanlar, sonra ilçe ortalaması
+                    price = own_price if isinstance(own_price, (int, float)) else (mp or 9999)
+                    dev = p.get("deviation_meters") or 9999
+                    return (price, dev)
+
+                candidates.sort(key=_candidate_key)
+
+                # Tekrarları ele
+                deduped: List[dict] = []
+                for p in candidates:
+                    k = (p.get("name"), round(p.get("lat", 0), 4), round(p.get("lon", 0), 4))
+                    if k in seen_station_keys:
+                        continue
+                    seen_station_keys.add(k)
+                    deduped.append(p)
+
+                if not deduped:
+                    cur_km = segment_end
+                    continue
+
+                best = deduped[0]
+                alternatives_list = deduped[1:5]
+
+                stops_by_km.append({
+                    "stop_target_km": round(
+                        best.get("distance_along_route_km") or (cur_km + safe_max * 0.9), 1
+                    ),
+                    "best": {
+                        "name": best.get("name"),
+                        "address": best.get("address"),
+                        "lat": best.get("lat"),
+                        "lon": best.get("lon"),
+                        "distance_along_route_km": best.get("distance_along_route_km"),
+                        "deviation_meters": best.get("deviation_meters"),
+                        "fuel_price": best.get("fuel_price"),
+                    },
+                    "alternatives": [
+                        {
+                            "name": s.get("name"),
+                            "address": s.get("address"),
+                            "lat": s.get("lat"),
+                            "lon": s.get("lon"),
+                            "distance_along_route_km": s.get("distance_along_route_km"),
+                            "deviation_meters": s.get("deviation_meters"),
+                            "fuel_price": s.get("fuel_price"),
+                        }
+                        for s in alternatives_list
+                    ],
+                    "cheap_districts": [
+                        {
+                            "city": cd["city"],
+                            "district": cd["district"],
+                            "min_price": cd["min_price"],
+                        }
+                        for cd in cheap_districts
+                    ],
+                })
+
+                all_enriched.extend(deduped)
+
+                # 2h. Sonraki segment: cur_km = seçilen istasyonun km'si
+                new_km = best.get("distance_along_route_km")
+                if not isinstance(new_km, (int, float)) or new_km <= cur_km:
+                    log.info(
+                        f"⛽ [Fuel] cur_km ilerleyemedi (new_km={new_km}), döngü kırılıyor"
+                    )
+                    break
+                cur_km = float(new_km)
+
+        if not all_enriched:
             return {
                 "status": "success",
                 "route": safe_route_summary,
                 "analysis": "Rota üzerinde uygun istasyon bulunamadı.",
+                "stops_by_km": [],
             }
 
-        # ─── 4. FEATURE 3: mcp_intel PIPELINE — Fiyat Inject & Sıralama ──────
-        log.info(f"⛽ [Fuel Pipeline] {len(places)} istasyon için mcp_intel'den fiyat çekiliyor...")
-
-        city_price_cache: Dict[str, list] = {}  # "city|district" -> FuelPrice listesi
-
-        async def _enrich_station(station: dict) -> dict:
-            """Tek bir istasyona mcp_intel'den gerçek akaryakıt fiyatı inject et."""
-            address = str(station.get("address", ""))
-            parts = [p.strip() for p in address.split(",")]
-            if parts and parts[-1].lower() in ["türkiye", "turkey"]:
-                parts.pop()
-            
-            city_guess = ""
-            district_guess = "merkez"
-            
-            if parts:
-                last_part = parts[-1]
-                tokens = last_part.split(" ")
-                location_str = tokens[-1]
-                
-                if "/" in location_str:
-                    d_c = location_str.split("/")
-                    district_guess = d_c[0]
-                    city_guess = d_c[1]
-                else:
-                    city_guess = location_str
-
-            if not city_guess:
-                station["fuel_price_enriched"] = False
-                return station
-
-            ck = f"{city_guess}|{district_guess}".lower()
-
-            if ck not in city_price_cache:
-                fuel_res = await self._safe_call(
-                    "intel",
-                    "get_fuel_prices",
-                    {"city": city_guess, "district": district_guess},
-                )
-                city_price_cache[ck] = fuel_res.get("data", []) if isinstance(fuel_res, dict) else []
-
-            price_list = city_price_cache[ck]
-
-            if price_list:
-                type_key_map = {
-                    "benzin": "gasoline",
-                    "motorin": "diesel",
-                    "dizel": "diesel",
-                    "lpg": "lpg",
-                }
-                price_key = type_key_map.get(fuel_type.lower(), "gasoline")
-                valid = [
-                    p for p in price_list
-                    if isinstance(p.get(price_key), (int, float)) and p.get(price_key, 0) > 5
-                ]
-
-                if valid:
-                    cheapest = min(valid, key=lambda p: p.get(price_key, 9999))
-                    station["fuel_price"] = {
-                        "price_per_liter": cheapest.get(price_key),
-                        "company": cheapest.get("company"),
-                        "fuel_type": fuel_type,
-                        "city": city_guess,
-                        "district": district_guess,
-                    }
-                    station["fuel_price_enriched"] = True
-                    log.info(
-                        f"💰 [{station.get('name', '?')}] "
-                        f"{cheapest.get(price_key)} TL/{fuel_type} ({cheapest.get('company')})"
-                    )
-                    return station
-
-            station["fuel_price_enriched"] = False
-            return station
-
-        # Paralel fiyat sorgulama (en fazla 8 istasyon)
-        enriched_places: List[dict] = list(
-            await asyncio.gather(*[_enrich_station(p) for p in places[:8]])
-        )
-
-        # Ucuzdan pahalıya sırala; fiyat bilinmeyenler en sona
-        def _sort_key(p):
+        # Geriye uyumluluk: best_station + cheapest_city + tüm enriched
+        best_station = stops_by_km[0]["best"] if stops_by_km else {}
+        all_cities: Dict[str, float] = {}
+        for p in all_enriched:
             fp = p.get("fuel_price") or {}
-            price = fp.get("price_per_liter")
-            has_price = isinstance(price, (int, float))
-            dev = p.get("deviation_meters", p.get("mesafe_raw", 99999))
-            return (0 if has_price else 1, price if has_price else 9999, dev)
-
-        enriched_places.sort(key=_sort_key)
-
-        best_station = enriched_places[0] if enriched_places else {}
-        all_cities: Dict[str, float] = {
-            p["fuel_price"]["city"]: p["fuel_price"]["price_per_liter"]
-            for p in enriched_places
-            if p.get("fuel_price_enriched") and p.get("fuel_price", {}).get("city")
-        }
-        cheapest_city = min(all_cities, key=lambda c: all_cities[c]) if all_cities else None
+            ppl = fp.get("price_per_liter")
+            if isinstance(ppl, (int, float)) and fp.get("city"):
+                # En düşük fiyatı tut
+                cur = all_cities.get(fp["city"])
+                if cur is None or ppl < cur:
+                    all_cities[fp["city"]] = ppl
+        cheapest_city = min(all_cities, key=all_cities.get) if all_cities else None
 
         return {
             "status": "success",
@@ -265,10 +533,10 @@ class RouteStrategyEvaluator:
                 "lon": best_station.get("lon"),
                 "fuel_price": best_station.get("fuel_price"),
             },
+            "stops_by_km": stops_by_km,
             "all_analyzed_cities": all_cities,
-            "stations_found": len(enriched_places),
-            # Fiyat inject edilmiş, ucuzdan pahalıya sıralı liste (Feature 3)
-            "places": enriched_places[:5],
+            "stations_found": len(all_enriched),
+            "places": all_enriched[:16],
         }
 
 
@@ -328,11 +596,20 @@ class ContextAwarePOIPlanner:
         weather_condition = "Açık"
         is_bad_weather = False
 
+        weather_temp = "?"
+        rain_prob_pct = 0
         if "error" not in weather_res:
             weather_data = weather_res.get("data", weather_res)
             if isinstance(weather_data, dict) and "ANLIK_DURUM" in weather_data:
                 condition_raw = weather_data["ANLIK_DURUM"].get("durum", "").lower()
                 weather_condition = condition_raw
+                weather_temp = weather_data["ANLIK_DURUM"].get("sicaklik", "?")
+                hourly = weather_data.get("ONUMUZDEKI_SAATLER", [])
+                if hourly:
+                    try:
+                        rain_prob_pct = int(float(hourly[0].get("pop", 0)) * 100)
+                    except (TypeError, ValueError):
+                        rain_prob_pct = 0
                 if any(w in condition_raw for w in ["rain", "drizzle", "thunderstorm", "yağmur", "kar", "snow", "fırtına"]):
                     is_bad_weather = True
                     if "kapalı" not in semantic_query.lower() and "iç" not in semantic_query.lower():
@@ -389,6 +666,8 @@ class ContextAwarePOIPlanner:
             "intent_analyzed": semantic_query,
             "weather_analysis": {
                 "condition": weather_condition,
+                "temperature": weather_temp,
+                "rain_probability_pct": rain_prob_pct,
                 "is_bad_weather": is_bad_weather,
                 "impact": "Kapalı mekanlar önceliklendirildi." if is_bad_weather else "Normal arama.",
             },

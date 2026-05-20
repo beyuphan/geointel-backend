@@ -1,11 +1,12 @@
 import uuid
 from sqlmodel import SQLModel, Field, Session, create_engine
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.dialects.postgresql import JSONB
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import Column
 import os
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Any
 
 # We extract the db connection logic to here
 DB_DSN = os.getenv("DATABASE_URL", "postgresql+asyncpg://user:password@geo_db:5432/geodb")
@@ -70,6 +71,33 @@ class RouteHistory(SQLModel, table=True):
     distance_km: float
     duration_min: float
     created_at: datetime | None = Field(default_factory=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    # ── Phase 5: tam re-open + LLM anlatımı ─────────────────────────────────
+    polyline_encoded: Optional[str] = None
+    waypoints: Optional[Any] = Field(default=None, sa_column=Column(JSONB))
+    waypoint_labels: Optional[Any] = Field(default=None, sa_column=Column(JSONB))
+    label: Optional[str] = None
+    weather_summary: Optional[str] = None
+    warnings: Optional[Any] = Field(default=None, sa_column=Column(JSONB))
+    narrative: Optional[str] = None
+    # Zenginleştirilmiş duraklar — origin, waypoint, fuel, food, rest, destination.
+    # Her item: {lat, lon, name, address, kind, km}
+    stops: Optional[Any] = Field(default=None, sa_column=Column(JSONB))
+
+
+class DayPlanHistory(SQLModel, table=True):
+    __tablename__ = "day_plan_history"
+    id: int | None = Field(default=None, primary_key=True)
+    user_id: uuid.UUID = Field(foreign_key="users.id", index=True)
+    created_at: datetime | None = Field(
+        default_factory=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+    )
+    plan_date: str  # YYYY-MM-DD
+    city: Optional[str] = None
+    activity_note: Optional[str] = None
+    summary: Optional[str] = None
+    # schedule: List[ScheduleItem] — saat-saat program
+    schedule: Optional[Any] = Field(default=None, sa_column=Column(JSONB))
+
 
 class POIEmbedding(SQLModel, table=True):
     __tablename__ = "poi_embeddings"

@@ -180,19 +180,27 @@ async def get_route_data_handler(
             return {"error": f"Bitiş konumu bulunamadı: {destination}"}
 
         # Waypoint çözümleme (Feature 4: multi-waypoint)
-        via_coords = []
+        # Suffix "!pt" → passThrough=true (sahil yolu, manzaralı duraklar için)
+        via_specs: list[tuple[str, bool]] = []  # (lat,lon, passthrough?)
         if waypoints:
             for wp in waypoints:
-                wc = await _resolve_coordinates(wp.strip(), session_id)
+                wp_clean = wp.strip()
+                is_passthrough = False
+                if wp_clean.endswith("!pt"):
+                    is_passthrough = True
+                    wp_clean = wp_clean[:-3].strip()
+                wc = await _resolve_coordinates(wp_clean, session_id)
                 if wc:
-                    via_coords.append(wc)
+                    via_specs.append((wc, is_passthrough))
                 else:
                     log.warning(f"⚠️ [Waypoint] Çözümlenemedi, atlandı: {wp}")
 
-        # Cache Kontrolü (waypointler de key'e dahil)
+        via_coords = [c for c, _ in via_specs]
+
+        # Cache Kontrolü (waypointler + passthrough flag key'e dahil)
         import hashlib
         import json
-        wp_key = "_".join(via_coords)
+        wp_key = "_".join(f"{c}{'!pt' if pt else ''}" for c, pt in via_specs)
         cache_key = f"route_calc:{hashlib.md5(f'{origin_coord}_{dest_coord}_{wp_key}'.encode()).hexdigest()}"
         cached_route = redis_store.get(cache_key)
         if cached_route:
@@ -297,9 +305,12 @@ async def get_route_data_handler(
             params["routingMode"] = "fast"
 
         # httpx'te birden fazla aynı key (via) göndermek için list of tuples
+        # passThrough=true → HERE bu noktayı "stop" yerine "geçiş ipucu" sayar,
+        # tüm rotayı tek optimizasyonda çözer → manzaralı/sahil yolu kopmaz
         params_list = list(params.items())
-        for via in via_coords:
-            params_list.append(("via", via))
+        for coord, is_passthrough in via_specs:
+            via_val = f"{coord}!passThrough=true" if is_passthrough else coord
+            params_list.append(("via", via_val))
 
         resp = await http_client.get(settings.HERE_ROUTING_URL, params=params_list, timeout=15.0)
         if resp.status_code != 200:

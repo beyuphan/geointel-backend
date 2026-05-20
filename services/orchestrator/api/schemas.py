@@ -94,6 +94,7 @@ class ChatRequest(BaseModel):
     current_lat: Optional[float] = None
     current_lon: Optional[float] = None
     fcm_token: Optional[str] = None
+    mode: Optional[str] = None  # "free" → trip_ctx Redis'ten temizlenir
 
 
 class TripPlanRequest(BaseModel):
@@ -103,7 +104,8 @@ class TripPlanRequest(BaseModel):
     """
     origin: str = Field(default="CURRENT_LOCATION", description="Başlangıç noktası ('CURRENT_LOCATION' veya 'lat,lon' veya şehir adı)")
     destination: str = Field(description="Hedef şehir veya adres")
-    waypoints: List[str] = Field(default=[], description="Ara duraklar: ['Bolu', 'Düzce']")
+    waypoints: List[str] = Field(default=[], description="Ara duraklar: ['lat,lon', ...] formatında koordinat veya şehir adı")
+    waypoint_labels: List[str] = Field(default=[], description="Waypoint görünen isimleri (waypoints ile paralel)")
     break_interval_hours: float = Field(default=2.0, ge=0.5, le=8.0, description="Kaç saatte bir mola (0=molasız)")
     food_preference: str = Field(default="Fark etmez", description="Yöresel, Fast Food, Ev Yemeği, Kahve & Tatlı, Fark etmez")
     food_location: str = Field(default="Ortaları", description="Rotanın neresinde yemek: Başları, Ortaları, Sonları, belirli şehir adı")
@@ -257,6 +259,11 @@ class PoiOverlay(BaseModel):
         default=None,
         description="[{'location': 'Bolu', 'condition': 'Kar', 'severity': 'warning'}]"
     )
+    # Rota boyunca km-bazlı tam hava durumu noktaları (genişletilebilir kart için)
+    weather_details: Optional[List[dict]] = Field(
+        default=None,
+        description="[{'km': '80. km', 'saat': '14:30', 'durum': '☀️ Açık', 'sicaklik': '22°C', 'yagis_olasiligi': '%5', 'ruzgar': '3 m/s', 'riskli_mi': false}]"
+    )
     # Trip plan modu için kategorize duraklar
     sections: Optional[List[dict]] = Field(
         default=None,
@@ -368,11 +375,55 @@ class ProfileResponse(BaseModel):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class RouteHistoryItem(BaseModel):
+    id: Optional[int] = None
     origin: str
     destination: str
     distance_km: float
     duration_min: float
     date: Optional[str] = None
+    # Phase 5 — tam re-open + zengin görüntüleme
+    polyline_encoded: Optional[str] = None
+    waypoints: Optional[list] = None
+    waypoint_labels: Optional[list] = None
+    label: Optional[str] = None
+    weather_summary: Optional[str] = None
+    warnings: Optional[list] = None
+    narrative: Optional[str] = None
+    # Phase 6 — zenginleştirilmiş duraklar (origin/waypoint/fuel/food/rest/destination)
+    stops: Optional[list] = None
+
+
+class RouteHistoryUpdateRequest(BaseModel):
+    """PATCH /history/routes/{id} — etiket güncelleme."""
+    label: Optional[str] = None
+
+
+class ReplaceStopRequest(BaseModel):
+    """POST /api/v1/route/replace_stop — Rotadaki bir durağı LLM aramasıyla değiştir."""
+    origin: str                          # "lat,lon" veya yer adı
+    destination: str                     # "lat,lon" veya yer adı
+    waypoints: list[str] = []            # mevcut waypoint listesi "lat,lon" formatında
+    stop_index: int                      # waypoint listesinde değiştirilecek index
+    query: str                           # kullanıcının serbest metin talebi (ör. "kafe öner")
+    current_lat: float                   # arama merkezini hesaplamak için
+    current_lon: float
+    session_id: str = "default_session"
+
+
+class ReplaceStopSuggestion(BaseModel):
+    name: str
+    address: Optional[str] = None
+    lat: float
+    lon: float
+    rating: Optional[float] = None
+    description: Optional[str] = None
+
+
+class ReplaceStopResponse(BaseModel):
+    success: bool
+    suggestion: Optional[ReplaceStopSuggestion] = None
+    alternates: list[ReplaceStopSuggestion] = []
+    reason: Optional[str] = None         # LLM'in seçim gerekçesi
 
 
 class ChatHistoryItem(BaseModel):
@@ -439,3 +490,121 @@ class HealthResponse(BaseModel):
     redis: bool = False
     services: list[ServiceStatus] = []
     tool_count: int = 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DAY PLAN — Event-Anchored Günlük Plan
+# ═══════════════════════════════════════════════════════════════════════════
+
+class DayPlanRequest(BaseModel):
+    city: str = Field(default="", description="Şehir adı — boşsa mevcut konum kullanılır")
+    city_lat: float
+    city_lon: float
+    date: str = Field(description="YYYY-MM-DD formatında tarih")
+    activity_note: str = Field(
+        default="",
+        description="Serbest metin: 'Sabah kahve içeceğim, öğleden sonra bir müze...'",
+    )
+    transport_mode: str = Field(default="car", description="car | walk")
+    session_id: str = Field(default="default_session")
+    current_lat: float
+    current_lon: float
+
+
+class DayPlanCard(BaseModel):
+    name: str
+    address: Optional[str] = None
+    lat: float
+    lon: float
+    rating: Optional[float] = None
+    description: str = ""
+    category: str = "poi"
+    is_anchor: bool = False
+
+
+class DayPlanSection(BaseModel):
+    slot: str = Field(description="Kategori etiketi — '☕ Kafeler', '🍽️ Yemek', '🏖️ Sahil & Doğa' vb.")
+    time_range: str = Field(default="", description="Opsiyonel zaman aralığı — kullanıcı belirttiyse '14:00 – 16:00', boş bırakılırsa zamansız kategori")
+    cards: List[DayPlanCard] = []
+    is_event_slot: bool = False
+    event_detail: Optional[dict] = None
+    # LLM tarafından üretilen "kilitli" slot mu? (Kullanıcının kesin bir randevusu)
+    is_locked: bool = Field(
+        default=False,
+        description="True ise kullanıcının kesin etkinliği — kartlar swap edilemez, tek bilgi kartı gösterilir",
+    )
+    # LLM'in slot için ürettiği kısa hedef metni
+    intent: Optional[str] = Field(
+        default=None,
+        description="Slot'un amacı: 'kahve molası', 'iş randevusu' vb.",
+    )
+    # Kategori için anlatıcı giriş — kullanıcıya sohbet havasında sunum
+    narrative_intro: Optional[str] = Field(
+        default=None,
+        description="Kategori başlığı altında gösterilen anlatıcı paragraf: 'Sahil kenarında sessiz bir kahve molası ister misin?'",
+    )
+
+
+class DayPlanResponse(BaseModel):
+    success: bool
+    date: str
+    city: str
+    weather_summary: str = ""
+    event_anchor: Optional[dict] = None
+    sections: List[DayPlanSection] = []
+    narrative: str = ""
+    # O gün şehirdeki tüm etkinlikler/maçlar — kullanıcıya üstte "X etkinlik var,
+    # ilgileniyor musun?" şeklinde sunulur. Her item: {type, title, time, venue, link}
+    all_events: List[dict] = []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DAY PLAN SCHEDULE — Seçim sonrası saat-saat program
+# ═══════════════════════════════════════════════════════════════════════════
+
+class DayPlanSchedulePlaceInput(BaseModel):
+    """Kullanıcının kategori önerilerinden seçtiği mekan."""
+    name: str
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    address: Optional[str] = None
+    category: Optional[str] = None
+
+
+class DayPlanScheduleRequest(BaseModel):
+    """Kullanıcı kategori önerilerinden mekan seçtikten sonra LLM ile saat-saat
+    program üretmek için POST edilen istek."""
+    activity_note: str = Field(default="", description="Kullanıcının orijinal serbest notu")
+    date: str = Field(description="YYYY-MM-DD")
+    transport_mode: str = Field(default="car")
+    current_lat: float
+    current_lon: float
+    city: str = Field(default="")
+    selected_places: List[DayPlanSchedulePlaceInput] = Field(
+        default_factory=list,
+        description="Kullanıcının kategori önerilerinden seçtiği mekanlar — boş olabilir",
+    )
+    session_id: str = Field(default="default_session")
+
+
+class ScheduleItem(BaseModel):
+    """Saat-saat programdaki tek bir öğe."""
+    time: str = Field(description="Başlangıç saati 'HH:MM'")
+    end_time: Optional[str] = Field(default=None, description="Bitiş saati 'HH:MM'")
+    name: str
+    address: Optional[str] = None
+    type: str = Field(
+        default="place",
+        description="place | locked | travel | free | meal",
+    )
+    duration_min: Optional[int] = None
+    note: Optional[str] = Field(default=None, description="LLM'in samimi tek-cümlelik açıklaması")
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+
+
+class DayPlanScheduleResponse(BaseModel):
+    success: bool = True
+    date: str
+    summary: str = Field(default="", description="Programın 1-2 cümlelik özeti")
+    schedule: List[ScheduleItem] = []

@@ -195,8 +195,16 @@ class ProfileManager:
         distance_km: float,
         duration_min: float,
         username: str = "test_pilot",
+        polyline_encoded: str | None = None,
+        waypoints: list | None = None,
+        waypoint_labels: list | None = None,
+        weather_summary: str | None = None,
+        warnings: list | None = None,
+        narrative: str | None = None,
+        stops: list | None = None,
     ):
-        """Rota geçmişini kaydeder. 24 saat içinde aynı rota tekrar kaydedilmez."""
+        """Rota geçmişini kaydeder. 24 saat içinde aynı rota tekrar kaydedilmez.
+        Polyline + waypoint + LLM narrative kaydedilirse geçmişten tam re-open mümkün olur."""
         try:
             async with async_session_maker() as session:
                 result = await session.execute(select(User).where(User.username == username))
@@ -205,7 +213,6 @@ class ProfileManager:
                     return
 
                 # 24 saatlik pencerede aynı rota var mı?
-                # Asyncpg timezone information ile doğrudan kıyaslama yapmayı bekler, string atarsak patlar.
                 cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=24)
 
                 stmt = (
@@ -221,10 +228,37 @@ class ProfileManager:
                 existing = (await session.execute(stmt)).scalars().first()
 
                 if existing:
-                    logger.info(
-                        f"⏭️ [RouteHistory] 24h içinde aynı rota zaten var, atlandı: "
-                        f"{origin} → {destination}"
-                    )
+                    # Aynı rota yeniden planlandı — yeni veriler varsa eskiyi güncelle
+                    updated = False
+                    if polyline_encoded and not existing.polyline_encoded:
+                        existing.polyline_encoded = polyline_encoded
+                        updated = True
+                    if waypoints is not None and not existing.waypoints:
+                        existing.waypoints = waypoints
+                        updated = True
+                    if waypoint_labels is not None and not existing.waypoint_labels:
+                        existing.waypoint_labels = waypoint_labels
+                        updated = True
+                    if narrative and not existing.narrative:
+                        existing.narrative = narrative
+                        updated = True
+                    if weather_summary and not existing.weather_summary:
+                        existing.weather_summary = weather_summary
+                        updated = True
+                    if warnings is not None and not existing.warnings:
+                        existing.warnings = warnings
+                        updated = True
+                    if stops is not None and not existing.stops:
+                        existing.stops = stops
+                        updated = True
+                    if updated:
+                        await session.commit()
+                        logger.info(f"🔄 [RouteHistory] Mevcut rota detayları güncellendi: {origin} → {destination}")
+                    else:
+                        logger.info(
+                            f"⏭️ [RouteHistory] 24h içinde aynı rota zaten var, atlandı: "
+                            f"{origin} → {destination}"
+                        )
                     return
 
                 new_route = RouteHistory(
@@ -234,6 +268,13 @@ class ProfileManager:
                     distance_km=distance_km,
                     duration_min=duration_min,
                     created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                    polyline_encoded=polyline_encoded,
+                    waypoints=waypoints,
+                    waypoint_labels=waypoint_labels,
+                    weather_summary=weather_summary,
+                    warnings=warnings,
+                    narrative=narrative,
+                    stops=stops,
                 )
                 session.add(new_route)
                 await session.commit()

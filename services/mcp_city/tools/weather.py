@@ -94,6 +94,8 @@ async def analyze_route_weather_handler(
         desc         = main_weather.get("description", "")
         temp         = forecast.get("main", {}).get("temp")
         wind         = forecast.get("wind", {}).get("speed", 0)
+        pop_raw      = forecast.get("pop", 0)
+        rain_prob    = int((pop_raw or 0) * 100)
 
         is_risky   = False
         risk_emoji = "🌤️"
@@ -110,14 +112,21 @@ async def analyze_route_weather_handler(
         if is_risky or km == 0 or point == checkpoints[-1]:
             summary.append({
                 "km":            f"{km}. km",
-                "tahmini_saat":  eta_str,   # Kullanicinin o noktada olacagi saat
+                "tahmini_saat":  eta_str,
                 "durum":         f"{risk_emoji} {desc.title()}",
                 "sicaklik":      f"{temp}°C" if temp is not None else "?",
+                "yagis_olasiligi": f"%{rain_prob}",
                 "ruzgar":        f"{wind} m/s",
                 "riskli_mi":     is_risky,
             })
             if is_risky:
-                risks.append(f"{km}. km (~{eta_str}'de) {risk_emoji} {desc} ({temp}°C)")
+                risks.append({
+                    "km": f"{km}. km",
+                    "saat": eta_str,
+                    "durum": f"{risk_emoji} {desc.title()}",
+                    "sicaklik": f"{temp}°C" if temp is not None else "?",
+                    "yagis_olasiligi": f"%{rain_prob}",
+                })
 
     return {
         "tarama_noktasi_sayisi": len(checkpoints),
