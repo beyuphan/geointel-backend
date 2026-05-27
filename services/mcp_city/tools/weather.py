@@ -3,7 +3,61 @@ import asyncio
 from datetime import datetime, timezone, timedelta
 from .config import settings, http_client
 from logger import log
-from .geometry import sample_route_points 
+from .geometry import sample_route_points
+
+
+# 13. Tur — Lightweight reverse-geocode cache (lat/lon → (il, ilçe))
+# Process-local cache; Nominatim rate-limit'i (1 req/sec) buffer'lar.
+_GEOCODE_CACHE: dict[tuple[float, float], tuple[str, str] | None] = {}
+
+
+async def _reverse_geocode_short(
+    client, lat: float, lon: float,
+) -> tuple[str, str] | None:
+    """Nominatim → (il, ilçe) tuple. Cache hit'lerde anında döner.
+
+    Hata/fail → None (caller km fallback'i kullanır).
+    """
+    key = (round(lat, 3), round(lon, 3))  # ~110m hassasiyet
+    if key in _GEOCODE_CACHE:
+        return _GEOCODE_CACHE[key]
+    try:
+        url = "https://nominatim.openstreetmap.org/reverse"
+        params = {
+            "format": "json",
+            "lat": lat,
+            "lon": lon,
+            "zoom": 10,                # ilçe seviyesi
+            "addressdetails": 1,
+            "accept-language": "tr",
+        }
+        headers = {"User-Agent": "GeoIntel_Weather/1.0"}
+        resp = await client.get(url, params=params, headers=headers, timeout=8.0)
+        if resp.status_code != 200:
+            _GEOCODE_CACHE[key] = None
+            return None
+        data = resp.json()
+        addr = data.get("address", {}) or {}
+        # İl: province / state ; İlçe: town / county / city_district / suburb
+        il = addr.get("province") or addr.get("state") or ""
+        ilce = (
+            addr.get("town")
+            or addr.get("county")
+            or addr.get("city_district")
+            or addr.get("suburb")
+            or addr.get("city")
+            or ""
+        )
+        if not il and not ilce:
+            _GEOCODE_CACHE[key] = None
+            return None
+        result = (il.strip(), ilce.strip())
+        _GEOCODE_CACHE[key] = result
+        return result
+    except Exception as e:
+        log.warning(f"⚠️ [RevGeocodeShort] lat={lat:.3f} lon={lon:.3f}: {e}")
+        _GEOCODE_CACHE[key] = None
+        return None
 
 
 async def _get_forecast_at_eta(client, lat: float, lon: float, eta_minutes: float) -> dict | None:
@@ -59,10 +113,10 @@ async def analyze_route_weather_handler(
     if not polyline:
         return {"error": "Rota verisi (polyline) eksik."}
 
-    # Rota uzunluğuna göre örnekleme aralığını dinamikleştir (Hız Optimizasyonu)
-    # Rota > 400km ise 80km aralıklarla bak, değilse 40km.
-    # Bu, 1000km'lik rotada API çağrı sayısını 25'ten 12'ye indirir.
-    interval = 80 if len(polyline) > 1000 else 40 # Polyline uzunluğu yaklaşık bir göstergedir
+    # Latency v2 — Strategist akışında Nominatim çağrısı zaten yoktur,
+    # weather için sample aralığını gevşet: kısa rotalarda 60km, uzun rotalarda 120km.
+    # 1000km rotada 16→9, 400km rotada 10→7 çağrıya indirir.
+    interval = 120 if len(polyline) > 1000 else 60
     # Daha garanti bir mesafe tahmini için sample_route_points içinde mesafe kontrolü yapılır.
     
     checkpoints = sample_route_points(polyline, interval_km=interval)
@@ -74,13 +128,21 @@ async def analyze_route_weather_handler(
     risks = []
     summary = []
 
-    tasks = []
+    # 13. Tur — forecast + reverse-geocode paralel
+    forecast_tasks = []
+    geo_tasks = []
     for point in checkpoints:
         eta_min = departure_minutes_from_now + (point["km_point"] / avg_speed_kmh) * 60
-        tasks.append(_get_forecast_at_eta(http_client, point["lat"], point["lon"], eta_min))
-    results = await asyncio.gather(*tasks)
+        forecast_tasks.append(
+            _get_forecast_at_eta(http_client, point["lat"], point["lon"], eta_min)
+        )
+        geo_tasks.append(
+            _reverse_geocode_short(http_client, point["lat"], point["lon"])
+        )
+    results = await asyncio.gather(*forecast_tasks)
+    geo_results = await asyncio.gather(*geo_tasks)
 
-    for point, forecast in zip(checkpoints, results):
+    for point, forecast, geo in zip(checkpoints, results, geo_results):
         if not forecast:
             continue
 
@@ -109,23 +171,80 @@ async def analyze_route_weather_handler(
         elif temp is not None and temp < 2:
             is_risky, risk_emoji = True, "🧈"
 
+        # 12. Tur — Severity scale (UI renk kodu + intensity bar için)
+        # condition + rain_prob + wind_speed + temp baz alınarak 4 seviye
+        severity = "acik"
+        if condition == "Thunderstorm" or rain_prob >= 70:
+            severity = "siddetli"
+        elif condition == "Snow":
+            severity = "siddetli" if rain_prob >= 50 else "orta"
+        elif condition == "Rain":
+            severity = "orta" if rain_prob >= 40 else "hafif"
+        elif condition == "Drizzle" or (condition in ("Clouds",) and rain_prob >= 30):
+            severity = "hafif"
+        elif condition in ("Fog", "Mist"):
+            severity = "orta"
+        elif temp is not None and temp < 2:
+            severity = "orta"
+        elif wind and wind >= 12:
+            # Şiddetli rüzgar (43 km/s+) → uyarı
+            severity = max(severity, "hafif", key=["acik", "hafif", "orta", "siddetli"].index)
+
+        # Intensity yüzdesi (UI bar için 0-100)
+        intensity_pct = max(rain_prob, {
+            "acik": 5, "hafif": 30, "orta": 60, "siddetli": 90,
+        }[severity])
+        intensity_pct = min(100, intensity_pct)
+
+        # 13. Tur — Konum etiketi (il/ilçe), reverse-geocode fail ise km fallback
+        il = geo[0] if geo else None
+        ilce = geo[1] if geo else None
+        if ilce and il:
+            location_label = f"{ilce}, {il}"
+        elif il:
+            location_label = il
+        elif ilce:
+            location_label = ilce
+        else:
+            location_label = f"{km}. km"
+
         if is_risky or km == 0 or point == checkpoints[-1]:
             summary.append({
                 "km":            f"{km}. km",
+                "km_int":        km,                                # 12. Tur — int km (UI timeline için)
                 "tahmini_saat":  eta_str,
                 "durum":         f"{risk_emoji} {desc.title()}",
                 "sicaklik":      f"{temp}°C" if temp is not None else "?",
                 "yagis_olasiligi": f"%{rain_prob}",
+                "yagis_pct":     rain_prob,                          # 12. Tur — int (kalk yağış)
                 "ruzgar":        f"{wind} m/s",
+                "ruzgar_ms":     float(wind or 0),                   # 12. Tur — float (rüzgar)
                 "riskli_mi":     is_risky,
+                "severity":      severity,                           # 12. Tur — acik/hafif/orta/siddetli
+                "intensity_pct": intensity_pct,                      # 12. Tur — UI bar 0-100
+                "emoji":         risk_emoji,                         # 12. Tur — emoji ayrı (kolay render)
+                "il":            il,                                  # 13. Tur — Çorum vs.
+                "ilce":          ilce,                                # 13. Tur — Sungurlu vs.
+                "location_label": location_label,                     # 13. Tur — "Sungurlu, Çorum"
+                "lat":           point["lat"],                        # 14. Tur — mini map marker için
+                "lon":           point["lon"],                        # 14. Tur
             })
             if is_risky:
                 risks.append({
                     "km": f"{km}. km",
+                    "km_int": km,
                     "saat": eta_str,
                     "durum": f"{risk_emoji} {desc.title()}",
                     "sicaklik": f"{temp}°C" if temp is not None else "?",
                     "yagis_olasiligi": f"%{rain_prob}",
+                    "yagis_pct": rain_prob,
+                    "ruzgar_ms": float(wind or 0),
+                    "severity": severity,
+                    "intensity_pct": intensity_pct,
+                    "emoji": risk_emoji,
+                    "il": il,
+                    "ilce": ilce,
+                    "location_label": location_label,
                 })
 
     return {

@@ -38,13 +38,14 @@ services:
 
   # 3. BEYİN (ORCHESTRATOR - LANGGRAPH)
   orchestrator:
-    build: 
+    build:
       context: ./services/orchestrator
       dockerfile: Dockerfile
     container_name: geo_brain
     ports:
       - "8000:8000" # Dış dünyaya açık tek kapı
     environment:
+      - TZ=Europe/Istanbul
       - MCP_CITY_URL=http://mcp_city:8000
       - MCP_INTEL_URL=http://mcp_intel:8001
       - MCP_SATELLITE_URL=http://mcp_satellite:8002

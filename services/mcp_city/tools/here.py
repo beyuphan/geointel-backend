@@ -26,14 +26,55 @@ async def _resolve_from_db(location: str, session_id: str = "test_pilot") -> str
     return None
 
 # --- 1. KOORDİNAT ÇÖZÜCÜ ---
+def _try_redis_get(key: str) -> str | None:
+    """Redis get + bytes/str normalize. Hata olursa None."""
+    if not redis_store.client:
+        return None
+    try:
+        val = redis_store.client.get(key)
+        if val:
+            return val.decode("utf-8") if isinstance(val, bytes) else val
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_current_location_from_redis(session_id: str) -> str | None:
+    """Çok katmanlı CURRENT_LOCATION lookup.
+
+    Mobile mode değişimleriyle session_id regenerate olduğunda eski Redis key'i
+    kaybolur. Bu nedenle orchestrator setex sırasında user-bazlı veya anon-stripped
+    fallback key'leri de yazar. Burada o sırayla deniyoruz.
+    """
+    # 1. Direkt session_id
+    loc = _try_redis_get(f"loc:{session_id}")
+    if loc:
+        return loc
+    # 2. Authenticated user fallback (session_id="uuid:mode_xxx")
+    if ":" in session_id:
+        user_id = session_id.split(":", 1)[0]
+        loc = _try_redis_get(f"loc:user:{user_id}")
+        if loc:
+            log.info(f"📍 [CurrentLoc] user fallback {user_id} → {loc}")
+            return loc
+    # 3. Anon mode-stripped fallback
+    parts = session_id.split("_", 1)
+    if len(parts) == 2 and parts[0] in ("chat", "trip", "dayplan", "free"):
+        loc = _try_redis_get(f"loc:anon:{parts[1]}")
+        if loc:
+            log.info(f"📍 [CurrentLoc] anon-stripped fallback → {loc}")
+            return loc
+    return None
+
+
 async def _resolve_coordinates(location: str, session_id: str = "test_pilot") -> str | None:
-    # 0. CURRENT_LOCATION magic keyword → Redis'ten al
+    # 0. CURRENT_LOCATION magic keyword → Redis'ten al (çok katmanlı)
     if location.upper().strip() in ("CURRENT_LOCATION", "BENIM_KONUM", "ANLIK_KONUM"):
-        loc = redis_store.client.get(f"loc:{session_id}") if redis_store.client else None
+        loc = _resolve_current_location_from_redis(session_id)
         if loc:
             log.info(f"📍 [CurrentLoc] Redis'ten konum alındı: {loc}")
             return loc
-        log.warning("⚠️ [CurrentLoc] Anlık konum henüz bilinmiyor.")
+        log.warning(f"⚠️ [CurrentLoc] Anlık konum henüz bilinmiyor (session={session_id}).")
         return None
 
     # 1. Zaten koordinat formatında mı?

@@ -57,12 +57,16 @@ async def agent_node(state: AgentState):
         and orchestrator.redis_client.exists(f"route:{session_id}")
     )
 
-    # Trip context — yalnızca routing/trip_plan intent'lerinde inject et.
-    # Serbest mod sorguları (eczane, poi_search, general vb.) önceki rota
-    # context'iyle kirletilmemeli.
-    _ROUTING_CATEGORIES = {"routing"}
+    # Trip context — AKTİF ROTA VARSA her zaman inject et (places/fuel/break/scenic
+    # sorgularında bile). Kullanıcı plan_trip yaptıktan sonra "yemek öner" derse,
+    # bu sorgu o rotaya bağlamlı olmalı (rota üstünde, geçilen şehirlerde).
+    # Sadece eczane/general gibi konum-bağımsız sorgularda devre dışı.
+    _CTX_INJECT_CATEGORIES = {"routing", "places", "fuel", "event", "city_data"}
     trip_context = None
-    if orchestrator.redis_client and state.get("intent", {}).get("category") in _ROUTING_CATEGORIES:
+    if orchestrator.redis_client and (
+        has_active_route
+        or state.get("intent", {}).get("category") in _CTX_INJECT_CATEGORIES
+    ):
         raw_tc = orchestrator.redis_client.get(f"trip_ctx:{session_id}")
         if raw_tc:
             import json as _json
@@ -92,11 +96,55 @@ async def agent_node(state: AgentState):
     primary_model  = orchestrator.llm_claude if use_claude else orchestrator.llm_gemini
     fallback_model = orchestrator.llm_gemini if use_claude else orchestrator.llm_claude
 
+    # Tool-call zorunlu olduğu durumları tespit eden son-kullanıcı mesajı kontrolü
+    last_user_msg = ""
+    for m in reversed(state["messages"]):
+        try:
+            if getattr(m, "type", "") == "human":
+                last_user_msg = (m.content or "").lower() if isinstance(m.content, str) else ""
+                break
+        except Exception:
+            continue
+    _ADD_STOP_KEYWORDS = (
+        "ekle", "uğrayalım", "uğra", "durup", "durak ekle", "yolda dur",
+        "rotaya ekle", "molamızı ekle", "molamı ekle", "şuna da uğrayalım",
+    )
+    must_call_tool = (
+        has_active_route
+        and any(k in last_user_msg for k in _ADD_STOP_KEYWORDS)
+    )
+
+    def _resp_has_tool_calls(resp) -> bool:
+        tc = getattr(resp, "tool_calls", None)
+        return bool(tc)
+
+    last_response = None
     for attempt in range(3):
         model = primary_model if attempt == 0 else fallback_model
         try:
             log.info(f"🧠 [Agent] Model={getattr(model, 'model', '?')} deneme={attempt+1}")
             response = await model.bind_tools(orchestrator.runtime_tools).ainvoke(messages)
+            last_response = response
+
+            # Tool çağrısı zorunlu ama LLM atladıysa: 1 kez daha tetikle
+            if must_call_tool and not _resp_has_tool_calls(response) and attempt == 0:
+                log.warning(
+                    f"⚠️ [Agent] 'ekle/durak' niyeti var ama tool çağrılmamış — "
+                    f"force-retry. text preview: {str(response.content)[:120]!r}"
+                )
+                # Sistem prompt'una sert hatırlatma ekle
+                force_msg = SystemMessage(content=(
+                    "⚠️ ZORUNLU: Kullanıcı rotaya durak/mola eklemek istiyor. "
+                    "ASLA tool çağırmadan cevap yazma. ŞİMDİ önce "
+                    "`search_hybrid_places(query='...', route_polyline='LATEST')` "
+                    "ile yeni durağın koordinatını bul, sonra "
+                    "`get_route_data(origin='CURRENT_LOCATION', destination='<MEVCUT_HEDEF>', "
+                    "waypoints='<ESKİ_WP>|<YENİ_LAT,LON>')` ile rotayı güncelle. "
+                    "Bu iki tool çağrısını YAP, sonra cevap yaz."
+                ))
+                messages = [SystemMessage(content=sys_prompt), force_msg] + state["messages"]
+                continue  # bir sonraki attempt'te yeniden çağır
+
             return {"messages": [response], "retry_count": 0}
         except Exception as exc:
             exc_str = str(exc).lower()
@@ -109,6 +157,11 @@ async def agent_node(state: AgentState):
                 continue
             log.error(f"🔥 [Agent] Başarısız: {exc_str[:150]}")
             raise
+
+    # Force-retry sonrası bile tool yoksa, mevcut response'u döndür (kullanıcı en
+    # azından LLM metnini görür — yine de log'da neden uyarısı var)
+    if last_response is not None:
+        return {"messages": [last_response], "retry_count": 0}
 
     raise RuntimeError("[agent_node] Tüm denemeler başarısız")
 
@@ -145,6 +198,40 @@ async def custom_tool_node(state: AgentState):
                         log.info(f"🔄 [PolySubst] {k} → Redis polyline enjekte edildi")
                     else:
                         log.warning(f"⚠️ [PolySubst] {k}=LATEST ama Redis boş ({t_name})")
+
+        # ★ AUTO-WAYPOINT INJECTION — LLM get_route_data çağırıyor ama
+        # waypoints parametresini unutmuşsa, trip_ctx'teki mevcut waypoint
+        # listesini Redis'ten çek ve enjekte et. Bu sayede "Boztepe ekle"
+        # diyen kullanıcının waypoint'i kaybolmaz.
+        if t_name == "get_route_data" and orchestrator.redis_client:
+            _has_wp = bool((args.get("waypoints") or "").strip())
+            if not _has_wp:
+                try:
+                    _raw_tc = orchestrator.redis_client.get(f"trip_ctx:{session_id}")
+                    if _raw_tc:
+                        import json as _json_g
+                        _tc = _json_g.loads(
+                            _raw_tc if isinstance(_raw_tc, str) else _raw_tc.decode("utf-8")
+                        )
+                        _wps = _tc.get("waypoints") or []
+                        if _wps:
+                            # Lat,lon koordinatları olanları al; şehir adlarını bırak
+                            import re as _re_wp_inj
+                            _coord_wps = [
+                                str(w).strip() for w in _wps
+                                if isinstance(w, str) and _re_wp_inj.match(
+                                    r"^-?\d+\.?\d*,-?\d+\.?\d*$", w.strip()
+                                )
+                            ]
+                            if _coord_wps:
+                                args["waypoints"] = "|".join(_coord_wps)
+                                log.info(
+                                    f"🔧 [AutoWP] get_route_data waypoints boştu → "
+                                    f"trip_ctx'ten {len(_coord_wps)} koordinat enjekte: "
+                                    f"{args['waypoints'][:80]}"
+                                )
+                except Exception as _wpe:
+                    log.warning(f"⚠️ [AutoWP] hata: {_wpe}")
 
         log.info(f"🛠️ [Tool] Başlatıldı: {t_name}")
         tool = orchestrator.get_tool_by_name(t_name)

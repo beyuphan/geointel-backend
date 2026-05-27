@@ -1,0 +1,14 @@
+{
+  "origin": "CURRENT_LOCATION",
+  "destination": "Rize",
+  "food_preference": "Yöresel Lezzetler",
+  "food_specific": "pide",
+  "food_location": "Sonları",
+  "scene_filters": [],
+  "custom_note": "yolun başında yakıt, sonlara doğru pide",
+  "current_lat": 41.36,
+  "current_lon": 36.18,
+  "fuel_remaining_km": 300,
+  "break_interval_hours": 2,
+  "session_id": "fresh_007"
+}

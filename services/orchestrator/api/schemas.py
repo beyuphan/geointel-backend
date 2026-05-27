@@ -7,7 +7,7 @@ ApiResponse[T] generic envelope ile mobil app her zaman aynı yapıyı bekler.
 v4.0 — POI Overlay (Tam Ekran Swipe Kartları) + Routing Phase eklendi
 """
 from __future__ import annotations
-from typing import TypeVar, Generic, Optional, Any, List
+from typing import TypeVar, Generic, Optional, Any, List, Dict, Tuple, Literal
 from pydantic import BaseModel, Field
 from datetime import datetime
 
@@ -97,10 +97,23 @@ class ChatRequest(BaseModel):
     mode: Optional[str] = None  # "free" → trip_ctx Redis'ten temizlenir
 
 
+class SearchPlanItem(BaseModel):
+    """
+    LLM-1 (parse_trip_intent) tarafından üretilen aday-arama planı tek item'ı.
+    Boş bırakılırsa backend `_legacy_search_plan` ile eski deterministik akışa düşer.
+    """
+    kind: Literal["food", "fuel", "break", "scenic"]
+    query: str = Field(description="Google Places / RAG semantic query — spesifik: 'pide manzaralı', 'balık restoran'")
+    region_hint: Optional[Dict[str, str]] = Field(default=None, description="{'city': 'Trabzon'} → location_name aramaya yönlendirir")
+    fraction_range: Optional[List[float]] = Field(default=None, description="[0.3, 0.6] gibi rota yüzde aralığı")
+    anchor: Optional[Literal["start", "end"]] = Field(default=None, description="yakıt için: yola çıkışta veya varış öncesi")
+    max_results: int = Field(default=12, ge=1, le=30)
+
+
 class TripPlanRequest(BaseModel):
     """
     Structured trip planning request — TripSetupWizard'dan gelir.
-    LLM'e doğal dil mesaj olarak değil, deterministic parametreler olarak işlenir.
+    Hibrit: LLM-1 search_plan ürettiyse onu kullanır, yoksa deterministik fallback.
     """
     origin: str = Field(default="CURRENT_LOCATION", description="Başlangıç noktası ('CURRENT_LOCATION' veya 'lat,lon' veya şehir adı)")
     destination: str = Field(description="Hedef şehir veya adres")
@@ -115,6 +128,60 @@ class TripPlanRequest(BaseModel):
     current_lat: Optional[float] = None
     current_lon: Optional[float] = None
     fcm_token: Optional[str] = None
+    # ── LLM-First Curator ek alanları (hepsi opsiyonel — backward-compat) ──
+    food_specific: Optional[str] = Field(default=None, description="Spesifik yemek adı: pide, balık, lahmacun, döner — query'ye direkt eklenir")
+    food_quality_hint: Optional[str] = Field(default=None, description="ucuz | kaliteli | hızlı | romantik | manzaralı")
+    scene_filters: List[str] = Field(default=[], description="['manzaralı','sahil','aile dostu','sessiz'] — query suffix + curator hint")
+    search_plan: Optional[List[SearchPlanItem]] = Field(default=None, description="LLM-1 üretirse direkt collector'a verilir; yoksa legacy")
+
+
+class SelectedStop(BaseModel):
+    """LLM-2 Curator'ın aday havuzundan seçtiği tek durağın referansı."""
+    id: str = Field(description="Aday havuzundaki benzersiz ID (poi_id veya hash)")
+    role: Literal["food", "fuel", "break", "combined", "scenic"]
+    reason: str = Field(default="", description="Curator'ın bu durağı neden seçtiğine dair kısa not")
+    suggested_order: int = Field(default=0, description="Rota üzerinde önerilen sıra (0..N)")
+
+
+class CuratedPlan(BaseModel):
+    """LLM-2 Curator'ın çıkardığı seçim + narrative paketi."""
+    selected_stops: List[SelectedStop] = Field(default=[])
+    narrative: str = Field(default="", description="Uzun, imperative ton, 300-700 kelime")
+    weather_paragraph: Optional[str] = Field(default=None, description="Opsiyonel hava durumu paragrafı")
+
+
+class WeatherZone(BaseModel):
+    """İl-bazlı özet hava durumu zonu — mobile harita yerine chip olarak gösterilir."""
+    cities: str = Field(description="'Samsun-Trabzon' gibi birleştirilmiş il(ler)")
+    severity: str = Field(description="acik | hafif | orta | siddetli")
+    condition: str = Field(description="Doğal dil: 'yağmur', 'açık', 'kar'")
+    emoji: str = Field(default="🌤️")
+    km_range: str = Field(default="", description="'80-240. km'")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM Strategist v2 — Tek LLM çağrısı: rota stratejisi + narrative
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StrategyStop(BaseModel):
+    """Strategist LLM'in önerdiği tek bir durak — sonra backend gerçek mekana eşler."""
+    role: Literal["fuel", "food", "break", "scenic"]
+    city: str = Field(description="İl adı: Samsun, İstanbul, Bolu vb.")
+    district: str = Field(default="", description="İlçe adı: Atakum, Merzifon, Mengen vb.")
+    query_hint: str = Field(description="Google Places'e gidecek query: 'pideci fırın', 'köfteci lokanta', 'sahil çay bahçesi'")
+    anchor: Optional[Literal["home_proximity", "start", "end"]] = Field(
+        default=None,
+        description="home_proximity=eve yakın + rota üstü; start=ilk ilçe; end=son ilçe; null=normal",
+    )
+    rationale: str = Field(default="", description="LLM'in bu durağı neden seçtiği — 1 cümle")
+    narrative_token: str = Field(description="'STOP_1' gibi unique etiket — narrative içinde gerçek mekan adıyla replace edilir")
+
+
+class StrategyPlan(BaseModel):
+    """Strategist LLM çıktısı — passing_cities + stops + uzun narrative."""
+    passing_cities: List[str] = Field(default=[], description="Rotanın geçtiği büyük şehirler")
+    stops: List[StrategyStop] = Field(default=[])
+    narrative: str = Field(description="300-500 kelime imperative anlatım, içinde {{STOP_N}} placeholder'ları")
 
 
 class TripAddStopsRequest(BaseModel):
@@ -263,6 +330,11 @@ class PoiOverlay(BaseModel):
     weather_details: Optional[List[dict]] = Field(
         default=None,
         description="[{'km': '80. km', 'saat': '14:30', 'durum': '☀️ Açık', 'sicaklik': '22°C', 'yagis_olasiligi': '%5', 'ruzgar': '3 m/s', 'riskli_mi': false}]"
+    )
+    # İl-bazlı özet hava durumu zonları (mobile chip listesi için)
+    weather_zones_summary: Optional[List[dict]] = Field(
+        default=None,
+        description="[{'cities': 'Samsun-Trabzon', 'severity': 'orta', 'condition': 'yağmur', 'emoji': '☂️', 'km_range': '80-240'}]"
     )
     # Trip plan modu için kategorize duraklar
     sections: Optional[List[dict]] = Field(

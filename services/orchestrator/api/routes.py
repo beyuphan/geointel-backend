@@ -10,8 +10,272 @@ Değişiklikler:
 import json
 import asyncio
 import time
-from typing import Optional, List
+from datetime import datetime as _dt_tr
+from typing import Optional, List, Dict, Tuple, Any
 from fastapi import APIRouter, Depends
+
+# 10. Tur — TR saat helper'ı. Container TZ env Europe/Istanbul, ama
+# explicit ZoneInfo kullanmak yine de daha sağlam (env yoksa fallback).
+try:
+    from zoneinfo import ZoneInfo as _ZI
+    _TR_TZ = _ZI("Europe/Istanbul")
+except Exception:
+    _TR_TZ = None
+
+
+def _now_tr() -> _dt_tr:
+    """Türkiye yerel saati. Container TZ'sinden bağımsız."""
+    if _TR_TZ is not None:
+        return _dt_tr.now(_TR_TZ)
+    # Fallback: sistem TZ'si (container TZ env varsa OK)
+    return _dt_tr.now()
+
+
+# 13. Tur — custom_note'tan yola çıkış saatini parse et (forecast için)
+_HOUR_PATTERNS = [
+    # "saat 14:00'te", "14:30'da", "14.00 civarı"
+    (r"\b(?:saat\s+)?(\d{1,2})[:.](\d{2})\b", 'hm'),
+    # "sabah 8'de", "akşam 6'da", "öğle 12'de"
+    (r"\b(sabah|öğle|öğleden sonra|akşam|gece)\s+(\d{1,2})\b", 'period'),
+    # "8'de yola çıkacağım"
+    (r"\b(\d{1,2})['\s]?(?:de|da|te|ta)\b", 'h_only'),
+]
+
+
+def _parse_departure_minutes(custom_note: Optional[str], now: _dt_tr) -> int:
+    """custom_note'tan yola çıkış zamanını saptar, şu andan itibaren dakika döner.
+
+    Tanınan kalıplar:
+      - "yarın sabah 8'de" → yarın 08:00 (TR)
+      - "akşam 6'da" → bugün 18:00
+      - "saat 14:30'da" → bugün 14:30
+      - "öğleden sonra 3'te" → bugün 15:00
+
+    Geçmişte kalan saat (bugün için) ileri günler için uygun değilse 0 döner.
+    """
+    if not custom_note:
+        return 0
+    import re as _re_dp
+    msg = custom_note.lower()
+
+    has_tomorrow = bool(_re_dp.search(r"\byarın\b|\byarin\b", msg))
+    has_today = bool(_re_dp.search(r"\bbugün\b|\bbugun\b", msg))
+
+    target_hour: Optional[int] = None
+    target_minute = 0
+
+    # 1) saat:dakika (en spesifik)
+    m = _re_dp.search(_HOUR_PATTERNS[0][0], msg)
+    if m:
+        try:
+            h = int(m.group(1))
+            mi = int(m.group(2))
+            if 0 <= h <= 23 and 0 <= mi <= 59:
+                target_hour, target_minute = h, mi
+        except Exception:
+            pass
+
+    # 2) period + saat
+    if target_hour is None:
+        m = _re_dp.search(_HOUR_PATTERNS[1][0], msg)
+        if m:
+            period = m.group(1)
+            try:
+                h = int(m.group(2))
+                if period in ("öğleden sonra", "akşam") and h < 12:
+                    h += 12
+                elif period == "gece" and h < 6:
+                    h += 0  # gece 2 = 02:00
+                elif period == "gece" and h >= 6:
+                    pass
+                elif period == "sabah" and h == 12:
+                    h = 0
+                target_hour = h
+            except Exception:
+                pass
+
+    # 3) sadece saat ("8'de yola çıkacağım")
+    if target_hour is None:
+        m = _re_dp.search(_HOUR_PATTERNS[2][0], msg)
+        if m:
+            try:
+                h = int(m.group(1))
+                if 0 <= h <= 23:
+                    target_hour = h
+            except Exception:
+                pass
+
+    if target_hour is None:
+        # Sadece "yarın sabah" gibi belirsiz → varsayılan sabah 08:00
+        if has_tomorrow and ("sabah" in msg or "erken" in msg):
+            target_hour, target_minute = 8, 0
+        elif has_tomorrow:
+            target_hour, target_minute = 9, 0
+        else:
+            return 0
+
+    # Hedef tarih
+    target = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+    if has_tomorrow:
+        from datetime import timedelta as _td_dp
+        target = target + _td_dp(days=1)
+    elif has_today:
+        pass  # bugün
+    elif target <= now:
+        # Geçmiş bir saatse otomatik yarın
+        from datetime import timedelta as _td_dp
+        target = target + _td_dp(days=1)
+
+    diff_min = int((target - now).total_seconds() / 60)
+    return max(0, diff_min)
+
+
+# LLM-First Refactor — il-bazlı hava durumu zone özetleyicisi
+_SEVERITY_EMOJI = {
+    "acik": "☀️", "hafif": "🌤️", "orta": "☂️", "siddetli": "⛈️",
+}
+
+
+def _summarize_weather_by_city(detayli_ozet: list) -> list:
+    """Ardışık aynı-severity checkpoint'leri il-bazlı grupla.
+
+    Backend zaten her checkpoint için `il`, `ilce`, `severity`, `durum`, `km_int`
+    veriyor (mcp_city.tools.weather → Nominatim reverse geocoding). Buradaki iş:
+    aynı severity ile yan yana gelen checkpoint'leri il-bazlı tek zona indirgemek.
+
+    Returns: [{cities, severity, condition, emoji, km_range}, ...]
+    """
+    if not detayli_ozet or not isinstance(detayli_ozet, list):
+        return []
+    zones: list = []
+    current = None  # {severity, cities (ordered set), condition, km_start, km_end, emoji}
+    for pt in detayli_ozet:
+        if not isinstance(pt, dict):
+            continue
+        sev = (pt.get("severity") or "acik").strip().lower()
+        il = (pt.get("il") or "").strip()
+        ilce = (pt.get("ilce") or "").strip()
+        cond_raw = pt.get("durum") or ""
+        # 'durum' alanı emoji+kelime ('🌧️ Sağanak Yağmur') — sadece kelime kısmını al
+        cond = cond_raw.split(" ", 1)[1] if " " in cond_raw else cond_raw
+        km_int = pt.get("km_int") if isinstance(pt.get("km_int"), (int, float)) else None
+        emoji = pt.get("emoji") or _SEVERITY_EMOJI.get(sev, "🌤️")
+        if not il:
+            continue
+        if current and current["severity"] == sev:
+            # Şehri ordered-set'e ekle
+            if il and il not in current["cities"]:
+                current["cities"].append(il)
+            if km_int is not None:
+                current["km_end"] = km_int
+        else:
+            if current:
+                zones.append(current)
+            current = {
+                "severity": sev,
+                "cities": [il] if il else [],
+                "condition": cond.strip().lower() or sev,
+                "emoji": emoji,
+                "km_start": km_int if km_int is not None else 0,
+                "km_end": km_int if km_int is not None else 0,
+            }
+    if current:
+        zones.append(current)
+    # Final format
+    out: list = []
+    for z in zones:
+        if not z["cities"]:
+            continue
+        cities = "-".join(z["cities"])
+        km_range = (
+            f"{int(z['km_start'])}-{int(z['km_end'])}. km"
+            if z["km_end"] != z["km_start"] else f"{int(z['km_start'])}. km"
+        )
+        out.append({
+            "cities": cities,
+            "severity": z["severity"],
+            "condition": z["condition"],
+            "emoji": z["emoji"],
+            "km_range": km_range,
+        })
+    return out
+
+
+# Strategist v2 — narrative içindeki {{STOP_N}} placeholder'larını gerçek mekan
+# adlarıyla replace eder. Resolved stop bulunamadıysa ilçe adıyla doldurur.
+def _inject_stop_names(narrative: str, resolved_stops: list) -> str:
+    """`{{STOP_1}}` gibi placeholder'ları **`MekanAdı`** (~Nkm) formatında replace.
+
+    Çift-bold koruması: LLM bazen `**{{STOP_1}}**` yazıyor. Replace edince
+    `**...**` içinde `**...**` oluyor (4 yıldız). Önce dış sarmayı temizle.
+    """
+    if not narrative:
+        return narrative
+    import re as _re_inj
+    out = narrative
+    seen_tokens: set = set()
+    for stop in resolved_stops or []:
+        if not isinstance(stop, dict):
+            continue
+        token = stop.get("narrative_token")
+        if not token or token in seen_tokens:
+            continue
+        seen_tokens.add(token)
+        name = (stop.get("name") or "").strip()
+        district = (stop.get("district") or "").strip()
+        city = (stop.get("city") or "").strip()
+        km = stop.get("distance_along_route_km")
+        if name:
+            if km:
+                inner = f"{name} (~{int(km)}. km)"
+            else:
+                inner = name
+        else:
+            loc = district or city or "yakındaki yer"
+            inner = f"{loc} civarındaki bir yer"
+        # ★ LLM'in placeholder etrafına eklediği **bold** sarmasını temizle,
+        # sonra kendimiz tek bold ekleyelim → çift-bold problemi çözülür.
+        placeholder = f"{{{{{token}}}}}"
+        # \*\*{{STOP_N}}\*\* veya *{{STOP_N}}* veya çıplak — hepsini ele al
+        patterns = [
+            rf"\*\*\s*{_re_inj.escape(placeholder)}\s*\*\*",  # **{{STOP_1}}**
+            rf"\*\s*{_re_inj.escape(placeholder)}\s*\*",      # *{{STOP_1}}*
+            rf"`\s*{_re_inj.escape(placeholder)}\s*`",        # `{{STOP_1}}`
+            _re_inj.escape(placeholder),                      # çıplak {{STOP_1}}
+        ]
+        replacement = f"**{inner}**"
+        for pat in patterns:
+            out = _re_inj.sub(pat, replacement, out)
+    # Geriye kalan replace edilmemiş {{STOP_N}}'leri temizle
+    out = _re_inj.sub(
+        r"\*?\*?\s*\{\{STOP_\d+(?:_\d+)?\}\}\s*\*?\*?",
+        "önerilen bir durak",
+        out,
+    )
+    return out
+
+
+# 14. Tur — custom_note'tan yakıt durağı anchor hint'lerini çıkar
+def _parse_fuel_anchors(custom_note: Optional[str]) -> Dict[str, bool]:
+    """custom_note'tan yakıt durağı konum hint'lerini çıkar.
+
+    Returns:
+        {"start": True/False, "end": True/False}
+        - start: kullanıcı "yolun başında yakıt", "çıkar çıkmaz dolum" dediyse
+        - end: "sonlara doğru", "varmadan önce yakıt" dediyse
+    """
+    if not custom_note:
+        return {"start": False, "end": False}
+    msg = custom_note.lower()
+    start = any(k in msg for k in [
+        "yolun başında", "yolun başı", "başta yakıt", "ilk dolum",
+        "çıkar çıkmaz", "başlangıçta", "çıkışta yakıt", "başlangıçta yakıt",
+    ])
+    end = any(k in msg for k in [
+        "sonlara doğru", "yolun sonunda", "son dolum", "varmadan",
+        "sona doğru", "varış öncesi", "sonunda yakıt",
+    ])
+    return {"start": start, "end": end}
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -19,6 +283,18 @@ from logger import log
 from core.graph import intent_node, agent_node, custom_tool_node, should_continue, AgentState
 from core.mcp_client import orchestrator
 from core.macro_tools import RouteStrategyEvaluator, _reverse_geocode_district
+from core.trip_candidates import (
+    collect_candidates as _collect_candidates,
+    build_legacy_search_plan as _build_legacy_search_plan,
+    deterministic_select_from_pools as _det_select_pools,
+    _apply_marker_budget,
+    collect_targeted_stops as _collect_targeted_stops,
+    simple_deterministic_stops as _simple_det_stops,
+    build_simple_narrative as _build_simple_narrative,
+)
+from core.trip_curator import curate_trip as _curate_trip
+from core.trip_strategist import plan_strategy as _plan_strategy
+import os as _os_cur
 from api.schemas import (
     ApiResponse as ApiEnvelope, ApiError, ApiMetadata,
     ChatResponse, MapData, MapMarker, ActionCard,
@@ -316,7 +592,24 @@ async def _run_chat(message: str, session_id: str,
                     current_lat=None, current_lon=None, fcm_token=None) -> dict:
     # Konum + FCM kaydet
     if orchestrator.redis_client and current_lat and current_lon:
-        orchestrator.redis_client.setex(f"loc:{session_id}", 3600, f"{current_lat},{current_lon}")
+        _loc_value = f"{current_lat},{current_lon}"
+        orchestrator.redis_client.setex(f"loc:{session_id}", 3600, _loc_value)
+        # Mobile mode değişimleriyle session_id regenerate olduğunda eski Redis
+        # key'leri kayıp olmasın diye user-bazlı fallback key de yaz.
+        # session_id formatı: "user_uuid:mode_timestamp" (auth) veya "mode_timestamp" (anon)
+        if ":" in session_id:
+            _user_id = session_id.split(":", 1)[0]
+            orchestrator.redis_client.setex(
+                f"loc:user:{_user_id}", 3600, _loc_value,
+            )
+        else:
+            # Anon: mode prefix'ini at, ortak global key (multi-user'da güvensiz
+            # ama anon zaten user yok). 'chat_x_y' → 'anon_x_y'.
+            _parts = session_id.split("_", 1)
+            if len(_parts) == 2 and _parts[0] in ("chat", "trip", "dayplan", "free"):
+                orchestrator.redis_client.setex(
+                    f"loc:anon:{_parts[1]}", 3600, _loc_value,
+                )
     if orchestrator.redis_client and fcm_token:
         orchestrator.redis_client.setex(f"fcm:{session_id}", 86400 * 30, fcm_token)
 
@@ -925,6 +1218,480 @@ _FREE_INFORMATIONAL_KEYWORDS = (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FORCE ADD WAYPOINT — LLM bypass fast-path
+# Kullanıcı aktif rotaya durak eklemek istediğinde LLM tutarsızlığını atla,
+# kendi tool zincirimizi çalıştır: search_hybrid_places + get_route_data.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FORCE_ADD_STOP_WORDS = (
+    "rotama", "rotaya", "rotamıza", "ekle", "ekleyelim", "ekleyiver",
+    "ekleyiverin", "ekleyiverir", "eklesene", "eklesenize", "uğra",
+    "uğrayalım", "ugra", "ugrayalim", "durup", "durak", "molam",
+    "molamı", "molamızı", "şuna", "buna", "bir", "de", "da",
+    "lütfen", "kanka", "knk", "dostum", "kankam", "olur", "mu", "mı",
+    "olsun", "yapalım", "yapıver", "yapsana", "için", "oraya", "buraya",
+    "ben", "biz", "sen", "şu", "bu", "lan", "yav", "yaa",
+    "verelim", "verir", "veririz", "verirmisin",
+)
+
+
+_TR_CITIES = frozenset([
+    "adana","adıyaman","afyon","ağrı","aksaray","amasya","ankara","antalya",
+    "ardahan","artvin","aydın","balıkesir","bartın","batman","bayburt",
+    "bilecik","bingöl","bitlis","bolu","burdur","bursa","çanakkale","çankırı",
+    "çorum","denizli","diyarbakır","düzce","edirne","elazığ","erzincan",
+    "erzurum","eskişehir","gaziantep","giresun","gümüşhane","hakkari","hatay",
+    "ığdır","isparta","istanbul","izmir","kahramanmaraş","karabük","karaman",
+    "kars","kastamonu","kayseri","kilis","kırıkkale","kırklareli","kırşehir",
+    "kocaeli","konya","kütahya","malatya","manisa","mardin","mersin","muğla",
+    "muş","nevşehir","niğde","ordu","osmaniye","rize","sakarya","samsun",
+    "şanlıurfa","siirt","sinop","şırnak","sivas","tekirdağ","tokat","trabzon",
+    "tunceli","uşak","van","yalova","yozgat","zonguldak",
+])
+
+
+def _extract_place_query_from_add_msg(message: str) -> Tuple[str, Optional[str]]:
+    """Mesajdan (query, location_hint) çıkar.
+
+    - stop_words atılır, geri kalan query
+    - Türkiye il adı tespit edilirse location_hint döner (Google il bias için)
+    """
+    import re as _re_q
+    msg = message or ""
+    msg = _re_q.sub(r"[.,!?;:'\"]+", " ", msg)
+    tokens = msg.split()
+    cleaned: List[str] = []
+    detected_city: Optional[str] = None
+    for tok in tokens:
+        tok_low = tok.lower().strip()
+        # İl adı? — tokenin sonundaki ek'i temizle (Ordu'da → ordu)
+        tok_base = _re_q.sub(r"['ʼ’][a-zçğıöşü]*$", "", tok_low)
+        tok_base = _re_q.sub(r"[a-zçğıöşü]*$", lambda m: "", "")  # noop koruma
+        # Daha basit: bilinen son ekleri çıkar
+        for _suffix in ("'da", "'de", "'ta", "'te", "'ya", "'ye",
+                        "da", "de", "ta", "te", "ya", "ye"):
+            if tok_low.endswith(_suffix) and len(tok_low) > len(_suffix) + 2:
+                cand = tok_low[:-len(_suffix)]
+                if cand in _TR_CITIES:
+                    tok_base = cand
+                    break
+        else:
+            tok_base = tok_low
+        if tok_base in _TR_CITIES:
+            if not detected_city:
+                detected_city = tok_base.title()
+            # İl adını query'de de koru — Google relevance artar
+            cleaned.append(tok)
+            continue
+        if tok_low in _FORCE_ADD_STOP_WORDS:
+            continue
+        cleaned.append(tok)
+    out = " ".join(cleaned)
+    out = _re_q.sub(r"\s+", " ", out).strip()
+    return out, detected_city
+
+
+async def _serve_force_add_waypoint(
+    *,
+    message: str,
+    session_id: str,
+    current_lat: Optional[float],
+    current_lon: Optional[float],
+    t0: float,
+) -> Optional[ApiEnvelope]:
+    """LLM bypass: 'ekle' niyetli mesaj için doğrudan search + get_route_data.
+
+    1. trip_ctx + polyline Redis'ten oku
+    2. Mesajdan query çıkar (stop_words at)
+    3. search_hybrid_places → top-1 koordinat
+    4. get_route_data (existing waypoints + yeni) → yeni polyline
+    5. plan_markers merge + trip_ctx update
+    6. Response döndür
+    """
+    if not orchestrator.redis_client:
+        return None
+    raw_tc = orchestrator.redis_client.get(f"trip_ctx:{session_id}")
+    if not raw_tc:
+        return None
+    try:
+        tc = json.loads(
+            raw_tc if isinstance(raw_tc, str) else raw_tc.decode("utf-8")
+        )
+    except Exception:
+        return None
+
+    destination = tc.get("destination")
+    if not destination:
+        return None
+    polyline_raw = orchestrator.redis_client.get(f"route:{session_id}")
+    if not polyline_raw:
+        return None
+    polyline_str = (
+        polyline_raw if isinstance(polyline_raw, str)
+        else polyline_raw.decode("utf-8")
+    )
+
+    query, city_hint = _extract_place_query_from_add_msg(message)
+    if not query or len(query) < 3:
+        log.warning(f"⚡ [ForceAdd] query çıkarılamadı: msg={message[:50]!r}")
+        return None
+
+    log.info(f"⚡ [ForceAdd] başlıyor — query={query!r}, city_hint={city_hint!r}")
+
+    places_tool = orchestrator.get_tool_by_name("search_hybrid_places")
+    if not places_tool:
+        return None
+
+    _search_args: Dict[str, Any] = {
+        "query": query,
+        "route_polyline": polyline_str,
+    }
+    # İl adı tespit edildiyse location_name parametresi de geç — Google bias
+    if city_hint:
+        _search_args["location_name"] = city_hint
+
+    try:
+        raw_search = await asyncio.wait_for(
+            places_tool.ainvoke(_search_args),
+            timeout=25.0,
+        )
+    except asyncio.TimeoutError:
+        log.warning("⚡ [ForceAdd] search timeout (25s) — fast-path fail")
+        return None
+    except Exception as e:
+        log.warning(f"⚡ [ForceAdd] search hata: {type(e).__name__}: {e}")
+        return None
+
+    if isinstance(raw_search, str):
+        try:
+            raw_search = json.loads(raw_search)
+        except Exception:
+            return None
+    if not isinstance(raw_search, dict):
+        return None
+    places_pool = (
+        (raw_search.get("strict_route_places") or [])
+        + (raw_search.get("relaxed_route_places") or [])
+        + (raw_search.get("places") or [])
+    )
+    valid = [
+        p for p in places_pool
+        if isinstance(p, dict) and p.get("lat") and p.get("lon")
+        and (p.get("name") or "").strip().lower() not in (
+            "bilinmeyen mekan", "bilinmeyen", ""
+        )
+    ]
+
+    # ★ FIX 7: Yason Burnu gibi küçük/lokal POI'ler için 2. fallback —
+    # location_name'i at, sadece query + Türkiye geneli search
+    if not valid:
+        log.info(f"🔁 [ForceAdd] 0 sonuç → fallback: query+Türkiye geneli")
+        fb_args = {
+            "query": f"{query} Türkiye",
+            "route_polyline": polyline_str,
+        }
+        try:
+            raw_fb = await asyncio.wait_for(
+                places_tool.ainvoke(fb_args), timeout=15.0,
+            )
+            if isinstance(raw_fb, str):
+                try:
+                    raw_fb = json.loads(raw_fb)
+                except Exception:
+                    raw_fb = {}
+            if isinstance(raw_fb, dict):
+                fb_pool = (
+                    (raw_fb.get("strict_route_places") or [])
+                    + (raw_fb.get("relaxed_route_places") or [])
+                    + (raw_fb.get("places") or [])
+                )
+                valid = [
+                    p for p in fb_pool
+                    if isinstance(p, dict) and p.get("lat") and p.get("lon")
+                    and (p.get("name") or "").strip().lower() not in (
+                        "bilinmeyen mekan", "bilinmeyen", ""
+                    )
+                ]
+                if valid:
+                    log.info(f"🔁 [ForceAdd] fallback başarılı: {len(valid)} aday")
+        except Exception as fbe:
+            log.warning(f"🔁 [ForceAdd] fallback hata: {fbe}")
+
+    if not valid:
+        log.warning(f"⚡ [ForceAdd] hiç aday yok query={query!r}")
+        # User-friendly mesaj döndür (None yerine ChatResponse with explanation)
+        elapsed = int((time.monotonic() - t0) * 1000)
+        return ApiEnvelope(
+            success=True,
+            data=ChatResponse(
+                status="completed",
+                message=(
+                    f"**{query.strip().title()}** için uygun bir yer bulamadım dostum. "
+                    f"Biraz daha spesifik söyler misin? Örnek: 'Trabzon Boztepe çay bahçesi' "
+                    f"veya 'Ordu Yason Burnu seyir noktası'."
+                ),
+                intent={"category": "routing", "complexity": "low"},
+                map=MapData(
+                    markers=[],
+                    polyline=_normalize_polyline(polyline_str),
+                ),
+                tools_used=["search_hybrid_places"],
+            ).model_dump(),
+            metadata=ApiMetadata(response_time_ms=elapsed, session_id=session_id),
+        )
+
+    top = valid[0]
+    new_lat = float(top["lat"])
+    new_lon = float(top["lon"])
+    new_name = (top.get("name") or "Eklenen Durak").strip()
+    new_address = top.get("address") or top.get("snippet")
+
+    # Existing waypoints (sadece koordinat formatlı)
+    import re as _re_fc
+    _coord_re = _re_fc.compile(r"^-?\d+\.?\d*,-?\d+\.?\d*$")
+    existing_wps = [
+        w for w in (tc.get("waypoints") or [])
+        if isinstance(w, str) and _coord_re.match(w.strip())
+    ]
+    new_coord = f"{new_lat},{new_lon}"
+    if new_coord not in existing_wps:
+        existing_wps.append(new_coord)
+
+    route_tool = orchestrator.get_tool_by_name("get_route_data")
+    if not route_tool:
+        return None
+
+    origin = tc.get("origin") or (
+        f"{current_lat},{current_lon}" if current_lat and current_lon
+        else "CURRENT_LOCATION"
+    )
+    waypoints_str = "|".join(f"{w}!pt" for w in existing_wps)
+
+    try:
+        route_res = await asyncio.wait_for(
+            route_tool.ainvoke({
+                "origin": origin,
+                "destination": destination,
+                "waypoints": waypoints_str,
+                "session_id": session_id,
+            }),
+            timeout=30.0,
+        )
+    except Exception as e:
+        log.warning(f"⚡ [ForceAdd] route hata: {e}")
+        return None
+
+    if isinstance(route_res, str):
+        try:
+            route_res = json.loads(route_res)
+        except Exception:
+            route_res = {}
+    if not isinstance(route_res, dict):
+        route_res = {}
+
+    new_polyline = (
+        route_res.get("polyline")
+        or route_res.get("polyline_encoded")
+        or polyline_str
+    )
+    new_distance = float(
+        route_res.get("distance_km") or route_res.get("mesafe_km")
+        or tc.get("total_km") or 0
+    )
+    new_duration = int(
+        route_res.get("duration_min") or route_res.get("sure_dk")
+        or tc.get("total_min") or 0
+    )
+
+    # Markers oluştur — yeni POI + plan_markers merge
+    markers: List[MapMarker] = [
+        MapMarker(
+            lat=new_lat, lon=new_lon,
+            title=new_name,
+            type="poi",
+            snippet=new_address,
+            poi_card={
+                "rating": top.get("rating"),
+                "deviation_meters": top.get("deviation_meters"),
+                "distance_along_route_km": top.get("distance_along_route_km"),
+                "type": "poi",
+                "from_plan": False,
+                "added_via_chat": True,
+            },
+        ),
+    ]
+    plan_markers = tc.get("plan_markers") or []
+    seen = {(round(m.lat, 4), round(m.lon, 4)) for m in markers}
+    for pm in plan_markers:
+        if not isinstance(pm, dict) or "lat" not in pm:
+            continue
+        try:
+            pkey = (round(float(pm["lat"]), 4), round(float(pm["lon"]), 4))
+        except Exception:
+            continue
+        if pkey in seen:
+            continue
+        seen.add(pkey)
+        markers.append(MapMarker(
+            lat=float(pm["lat"]),
+            lon=float(pm["lon"]),
+            title=pm.get("title") or "Önceki durak",
+            type=pm.get("type", "poi"),
+            snippet=pm.get("snippet"),
+            poi_card={
+                "rating": pm.get("rating"),
+                "deviation_meters": pm.get("deviation_meters", 0),
+                "distance_along_route_km": pm.get("distance_along_route_km"),
+                "open_now": pm.get("open_now"),
+                "fuel_price": pm.get("fuel_price"),
+                "type": pm.get("type", "poi"),
+                "from_plan": True,
+            },
+        ))
+
+    # trip_ctx update — yeni waypoint + plan_markers + selected_stops
+    tc["waypoints"] = existing_wps
+    tc["total_km"] = new_distance
+    tc["total_min"] = new_duration
+    _new_plan_markers = list(plan_markers)
+    _selected_entry = {
+        "lat": new_lat, "lon": new_lon,
+        "title": new_name, "type": "poi",
+        "snippet": new_address,
+        "rating": top.get("rating"),
+        "deviation_meters": top.get("deviation_meters"),
+        "distance_along_route_km": top.get("distance_along_route_km"),
+        "added_via_chat": True,
+    }
+    _new_plan_markers.append(_selected_entry)
+    # ★ KULLANICININ ONAYLADIĞI DURAK — RouteDetail "Duraklar" listesinde gözükür
+    _existing_selected = list(tc.get("selected_stops") or [])
+    # Dedup by lat/lon
+    _sel_seen = {(round(float(s.get("lat", 0)), 4), round(float(s.get("lon", 0)), 4))
+                 for s in _existing_selected if isinstance(s, dict)}
+    _sel_key = (round(new_lat, 4), round(new_lon, 4))
+    if _sel_key not in _sel_seen:
+        _existing_selected.append(_selected_entry)
+    tc["selected_stops"] = _existing_selected
+    try:
+        orchestrator.redis_client.setex(
+            f"trip_ctx:{session_id}", 3600 * 8,
+            json.dumps(tc, ensure_ascii=False),
+        )
+        if new_polyline and len(new_polyline) > 50:
+            orchestrator.redis_client.setex(
+                f"route:{session_id}", 3600, new_polyline,
+            )
+    except Exception:
+        pass
+
+    km_along = int(top.get("distance_along_route_km") or 0)
+    hours = new_duration // 60
+    mins = new_duration % 60
+    msg_reply = (
+        f"**{new_name}** rotanın **~{km_along}. km'sine** eklendi. "
+        f"Yeni rota: **{int(new_distance)} km**, **{hours} sa {mins} dk**."
+    )
+
+    log.info(
+        f"⚡ [ForceAdd] OK: {new_name} (~{km_along}km), "
+        f"polyline_len={len(new_polyline)}, markers={len(markers)}"
+    )
+
+    # POI overlay sections — mobile RouteDetailScreen bunu okur
+    # ve sortedMiddle stops için kullanır
+    _sections = []
+    by_kind: Dict[str, list] = {"fuel": [], "food": [], "break": []}
+    for pm in tc["plan_markers"]:
+        if not isinstance(pm, dict):
+            continue
+        _ptype = pm.get("type", "poi")
+        if _ptype == "fuel_station":
+            by_kind["fuel"].append(pm)
+        elif _ptype == "restaurant":
+            by_kind["food"].append(pm)
+        elif _ptype == "break_stop":
+            by_kind["break"].append(pm)
+        elif _ptype == "poi" and pm.get("added_via_chat"):
+            # Chat'te eklenen POI'leri food-break harici bir kategoriye koy
+            by_kind.setdefault("custom", []).append(pm)
+    for sec_kind, sec_items in by_kind.items():
+        if not sec_items:
+            continue
+        cards = []
+        for pi in sec_items:
+            cards.append({
+                "name": pi.get("title"),
+                "address": pi.get("snippet"),
+                "lat": pi.get("lat"),
+                "lon": pi.get("lon"),
+                "rating": pi.get("rating"),
+                "distance_along_route_km": pi.get("distance_along_route_km"),
+                "deviation_meters": pi.get("deviation_meters"),
+            })
+        _sections.append({
+            "type": sec_kind,
+            "title": {
+                "fuel": "⛽ Yakıt",
+                "food": "🍽️ Yemek",
+                "break": "☕ Mola",
+                "custom": "📍 Eklenen Duraklar",
+            }.get(sec_kind, sec_kind),
+            "cards": cards,
+        })
+
+    # Mobile RouteDetailScreen için trip_plan + poi_overlay
+    trip_plan_for_mobile = {
+        "origin": tc.get("origin"),
+        "destination": destination,
+        "total_km": new_distance,
+        "total_min": new_duration,
+        "waypoints": existing_wps,
+        "weather_warnings": tc.get("weather_warnings"),
+        "weather_details": tc.get("weather_details"),
+        "weather_zones_summary": tc.get("weather_zones_summary"),
+    }
+    poi_overlay_for_mobile = PoiOverlay(
+        mode="trip_plan",
+        title=f"🗺️ {destination} Yolculuk Planı",
+        subtitle=f"{int(new_distance)} km · ~{hours}sa {mins}dk",
+        cards=[],
+        sections=_sections if _sections else None,
+        weather_warnings=tc.get("weather_warnings") or None,
+        weather_details=tc.get("weather_details") or None,
+        weather_zones_summary=tc.get("weather_zones_summary") or None,
+        route_summary={
+            "total_km": new_distance,
+            "total_min": new_duration,
+        },
+    )
+
+    elapsed = int((time.monotonic() - t0) * 1000)
+    # ★ FIX 1: poi_overlay GÖNDERMİYORUZ — mobile hub_screen listener
+    # poi_overlay değişimi görünce POI selection sheet açıyordu. Chat'te
+    # durak ekleme sonrası bu yanlış — kullanıcı zaten seçimini yaptı.
+    # trip_plan ve markers yeterli; RouteDetail bunlardan stops oluşturuyor.
+    return ApiEnvelope(
+        success=True,
+        data=ChatResponse(
+            status="completed",
+            message=msg_reply,
+            intent={"category": "routing", "complexity": "high"},
+            map=MapData(
+                markers=markers,
+                polyline=_normalize_polyline(new_polyline),
+            ),
+            tools_used=["search_hybrid_places", "get_route_data"],
+            distance_km=float(new_distance),
+            duration_min=int(new_duration),
+            poi_overlay=None,  # ← Chat add'de selection sheet açılmasın
+            trip_plan=trip_plan_for_mobile,
+        ).model_dump(),
+        metadata=ApiMetadata(response_time_ms=elapsed, session_id=session_id),
+    )
+
+
 @router.post("/api/v1/chat", response_model=ApiEnvelope, tags=["Chat v1"])
 async def chat_v1(request: ChatRequestV1, user: dict = Depends(get_optional_user)):
     """📱 Ana mobil chat endpoint."""
@@ -937,10 +1704,19 @@ async def chat_v1(request: ChatRequestV1, user: dict = Depends(get_optional_user
 
     # Serbest mod: önceki trip_ctx ve route polyline cache'ini de temizle —
     # eski rota context'i karışmasın, yeni sorgu kendi haritasını çizebilsin.
-    if request.mode == "free" and orchestrator.redis_client:
+    # ★ İSTİSNA: "ekle/uğra/durak/rotaya/waypoint" gibi durak EKLEME niyeti
+    # varsa cache silme — plan_markers + polyline merge için gerekli.
+    _msg_lower_chk = (request.message or "").lower()
+    _add_intent = any(k in _msg_lower_chk for k in (
+        "ekle", "uğra", "ugra", "durak", "rotaya", "waypoint",
+        "rotama", "yolda dur", "yolda ekle",
+    ))
+    if request.mode == "free" and not _add_intent and orchestrator.redis_client:
         orchestrator.redis_client.delete(f"trip_ctx:{session_id}")
         orchestrator.redis_client.delete(f"route:{session_id}")
         log.info(f"🧹 [v1/Chat] Serbest mod — trip_ctx + route polyline ({session_id}) temizlendi")
+    elif request.mode == "free" and _add_intent:
+        log.info(f"🔗 [v1/Chat] mode=free ama 'ekle' niyeti var — trip_ctx KORUNDU ({session_id})")
 
     # ── Serbest Mod Router ───────────────────────────────────────────────
     # Free mode'da mesajı sınıflandır: place_lookup → POI overlay (navigate_to_poi),
@@ -949,6 +1725,30 @@ async def chat_v1(request: ChatRequestV1, user: dict = Depends(get_optional_user
     # tipi hatalar engellenir.
     msg_lower = request.message.lower()
     has_location = bool(request.current_lat and request.current_lon)
+
+    # ★★ FORCE WAYPOINT ADD FAST-PATH — LLM bypass ★★
+    # Kullanıcı aktif rotaya durak eklemek istiyorsa (Boztepe ekle, çay molası
+    # yapalım vb.) ve trip_ctx Redis'te varsa, LLM'i atla — kendi tool zincirini
+    # çalıştır. LLM bazen tool çağrısını TEXT olarak yazıyor, bu fast-path
+    # bu sorunu %100 ortadan kaldırır.
+    if (
+        _add_intent
+        and has_location
+        and orchestrator.redis_client
+        and orchestrator.redis_client.exists(f"trip_ctx:{session_id}")
+    ):
+        try:
+            force_response = await _serve_force_add_waypoint(
+                message=request.message,
+                session_id=session_id,
+                current_lat=request.current_lat,
+                current_lon=request.current_lon,
+                t0=t0,
+            )
+            if force_response is not None:
+                return force_response
+        except Exception as e:
+            log.warning(f"⚠️ [v1/Chat] ForceAddWaypoint fail, LLM fallback: {e}")
 
     # 0) Eczane FOLLOW-UP — daha önce eczane listesi sunulmuşsa ve mesaj
     #    bir referans içeriyorsa (ilkini, en yakına, X eczanesine git), direkt
@@ -1030,8 +1830,13 @@ async def chat_v1(request: ChatRequestV1, user: dict = Depends(get_optional_user
 
         # ── Marker dönüşümü ───────────────────────────────────────────────
         markers = []
+        _skip_titles = {"bilinmeyen mekan", "bilinmeyen", "unknown", "unnamed", ""}
         for m in visual.get("markers", []):
             if not (isinstance(m, dict) and "lat" in m):
+                continue
+            # ★ Title'sız OSM-only sonuçları ele (genelde rating=0, name=Bilinmeyen)
+            _tlow = ((m.get("title") or m.get("name") or "").strip().lower())
+            if _tlow in _skip_titles:
                 continue
             side = m.get("on_route_side", "unknown")
             poi_card = {
@@ -1065,8 +1870,130 @@ async def chat_v1(request: ChatRequestV1, user: dict = Depends(get_optional_user
         # Deviation'a göre sırala
         markers.sort(key=lambda mk: (mk.poi_card or {}).get("deviation_meters") or 99999)
 
+        # ── ★ MARKER MERGE — durak ekleme/rota güncelleme durumlarında ──
+        # Eğer get_route_data tool çağrıldıysa (kullanıcı "X'e ekle" dedi),
+        # önceki plan_trip markerlarını (yakıt/yemek/mola) kaybetme, yeniyle birleştir.
+        # Ayrıca: 'ekle' niyeti var ama LLM tool atladı → eski marker'lar kaybolmasın.
+        _used = result.get("tools_used") or []
+        _route_tool_called = any(
+            t in ("get_route_data", "evaluate_route_strategy") for t in _used
+        )
+        _add_intent_local = any(k in (request.message or "").lower() for k in (
+            "ekle", "uğra", "ugra", "durak", "rotaya", "rotama", "waypoint",
+        ))
+        # Defensive: tool atlandı ama 'ekle' niyeti var ve eski plan var → markerları koru
+        _should_recover = _add_intent_local and not _route_tool_called and not markers
+        if (_route_tool_called or _should_recover) and orchestrator.redis_client:
+            try:
+                _raw_tc = orchestrator.redis_client.get(f"trip_ctx:{session_id}")
+                if _raw_tc:
+                    _tc_dict = json.loads(
+                        _raw_tc if isinstance(_raw_tc, str) else _raw_tc.decode("utf-8")
+                    )
+                    _old_markers = _tc_dict.get("plan_markers") or []
+                    if _old_markers:
+                        _seen = {
+                            (round(m.lat, 4), round(m.lon, 4)) for m in markers
+                        }
+                        _added = 0
+                        for _om in _old_markers:
+                            if not isinstance(_om, dict) or "lat" not in _om:
+                                continue
+                            _key = (round(float(_om["lat"]), 4), round(float(_om["lon"]), 4))
+                            if _key in _seen:
+                                continue
+                            _seen.add(_key)
+                            _added += 1
+                            markers.append(MapMarker(
+                                lat=float(_om["lat"]),
+                                lon=float(_om["lon"]),
+                                title=_om.get("title") or "Önceki durak",
+                                type=_om.get("type", "poi"),
+                                snippet=_om.get("snippet"),
+                                poi_card={
+                                    "rating": _om.get("rating"),
+                                    "deviation_meters": _om.get("deviation_meters", 0),
+                                    "distance_along_route_km": _om.get("distance_along_route_km"),
+                                    "open_now": _om.get("open_now"),
+                                    "fuel_price": _om.get("fuel_price"),
+                                    "type": _om.get("type", "poi"),
+                                    "from_plan": True,
+                                },
+                            ))
+                        if _added:
+                            log.info(
+                                f"🔀 [Chat] {_added} eski plan markerı yeni rotaya merge edildi "
+                                f"(toplam markers={len(markers)})"
+                            )
+
+                    # ★ FIX 3: Yeni eklenen markerları (Boztepe, waypoint) trip_ctx'e
+                    # PERSİSTE ET — bir sonraki chat akışında veya route detay
+                    # ekranında ara duraklar görünsün.
+                    _new_markers_for_persist = []
+                    _waypoints_to_persist: List[str] = list(_tc_dict.get("waypoints") or [])
+                    for _m in visual.get("markers", []):
+                        if not (isinstance(_m, dict) and "lat" in _m):
+                            continue
+                        _new_markers_for_persist.append({
+                            "lat": float(_m["lat"]),
+                            "lon": float(_m.get("lon", _m.get("lng", 0))),
+                            "title": _m.get("title") or _m.get("name"),
+                            "type": _m.get("type", "poi"),
+                            "snippet": _m.get("address") or _m.get("snippet"),
+                            "rating": _m.get("rating"),
+                            "deviation_meters": _m.get("deviation_meters"),
+                            "distance_along_route_km": _m.get("distance_along_route_km"),
+                            "added_via_chat": True,
+                        })
+                        # Waypoint type ise rotaya eklenen lat/lon
+                        if _m.get("type") == "waypoint":
+                            _coord = f"{_m['lat']},{_m.get('lon', _m.get('lng', 0))}"
+                            if _coord not in _waypoints_to_persist:
+                                _waypoints_to_persist.append(_coord)
+                    if _new_markers_for_persist:
+                        _merged_plan_markers = list(_old_markers) + _new_markers_for_persist
+                        # Dedup by lat/lon
+                        _seen_pers = set()
+                        _final_persist = []
+                        for _pm in _merged_plan_markers:
+                            _pkey = (round(float(_pm["lat"]), 4), round(float(_pm["lon"]), 4))
+                            if _pkey in _seen_pers:
+                                continue
+                            _seen_pers.add(_pkey)
+                            _final_persist.append(_pm)
+                        _tc_dict["plan_markers"] = _final_persist
+                        _tc_dict["waypoints"] = _waypoints_to_persist
+                        orchestrator.redis_client.setex(
+                            f"trip_ctx:{session_id}", 3600 * 8,
+                            json.dumps(_tc_dict, ensure_ascii=False)
+                        )
+                        log.info(
+                            f"💾 [Chat] trip_ctx güncellendi: "
+                            f"plan_markers={len(_final_persist)}, waypoints={len(_waypoints_to_persist)}"
+                        )
+            except Exception as _merr:
+                log.warning(f"⚠️ [Chat] Marker merge/persist hata: {_merr}")
+
         # ── Polyline ──────────────────────────────────────────────────────
         polyline = _normalize_polyline(result.get("route_polyline") or visual.get("polyline"))
+        # ★ Polyline boş ama trip_ctx aktif rota varsa Redis'ten geri yükle
+        # (LLM tool atladı durumunda mobile haritası boşalmasın)
+        if not polyline and orchestrator.redis_client:
+            try:
+                _raw_route = orchestrator.redis_client.get(f"route:{session_id}")
+                if _raw_route:
+                    _existing_poly = (
+                        _raw_route if isinstance(_raw_route, str)
+                        else _raw_route.decode("utf-8")
+                    )
+                    polyline = _normalize_polyline(_existing_poly)
+                    if polyline:
+                        log.info(
+                            f"🔄 [Chat] polyline boş → Redis'ten mevcut rotayı yükledim "
+                            f"(len={len(polyline)})"
+                        )
+            except Exception:
+                pass
 
         # ── Action cards ──────────────────────────────────────────────────
         raw_cards = _build_action_cards(intent, visual)
@@ -1304,6 +2231,15 @@ async def _generate_trip_narrative(
         if custom_note:
             ctx_parts.append(f"Kullanıcı notu: {custom_note}")
 
+        # 10. Tur — Şu anki TR saatini ve günü prompt'a kat. LLM
+        # custom_note'taki 'yarın sabah 8' / 'akşam 6' gibi ifadeleri
+        # bu saat referansından doğru parse edebilsin.
+        _now_for_prompt = _now_tr()
+        ctx_parts.insert(
+            0,
+            f"Şu an (TR): {_now_for_prompt.strftime('%Y-%m-%d %H:%M (%A)')}",
+        )
+
         context_block = "\n".join(f"- {p}" for p in ctx_parts)
 
         system = (
@@ -1337,24 +2273,43 @@ async def _generate_trip_narrative(
             "Sonrasında 1 satır: 'En ucuz nokta: **{İlçe}** (**{X.XX ₺/L}**).'\n"
             "Varsa ücretli geçiş: '- 💳 Toplam **{TL}** TL (**{N}** gişe)'.\n\n"
             "### 💬 Kapanış\n"
-            "- Kullanıcı özel notu varsa o not için 1 madde yanıt.\n"
-            "- 1 satır güvenli yolculuk dileği.\n\n"
+            "- **Kullanıcı özel istekleri** — 'Kullanıcı notu'ndaki HER spesifik "
+            "  istek için 1 satır madde yaz (1-4 madde):\n"
+            "    - 'manzaralı duraklar' → '📸 Sahil/dağ manzaralı mola noktaları seçildi'\n"
+            "    - 'ucuz ve kaliteli yemek' → '💰 Bütçe dostu yöresel restoran odaklı'\n"
+            "    - 'sık sık mola' → '☕ Sık mola için ek dinlenme noktaları'\n"
+            "    - 'yolun başında yakıt' → '⛽ İlk dolum yolun başında önerildi'\n"
+            "    - 'sahil/manzara yolu' → '🌊 Sahil rotası tercih edildi'\n"
+            "    - 'çocuk uyusun/aile' → '👨‍👩‍👧 Sessiz mola ve aile dostu yerler'\n"
+            "- Son satır: 1 cümle güvenli yolculuk dileği.\n\n"
             "KESIN KURALLAR:\n"
             "- Veri yoksa o bölümü atla; ASLA uydurma.\n"
             "- Mesafe/süreyi tek bir bölümde söyle (Rota Özeti).\n"
-            "- Toplam çıktı 10-18 satır olmalı (madde başına 1 satır).\n"
-            "- Düz cümle paragraflar yerine madde işaretleri."
+            "- Toplam çıktı 12-22 satır olmalı (madde başına 1 satır).\n"
+            "- Düz cümle paragraflar yerine madde işaretleri.\n\n"
+            "ZAMAN/TARİH KURALI (10. Tur — ÖNEMLİ):\n"
+            "- Context'in ilk satırındaki 'Şu an (TR)' referans olarak kullan.\n"
+            "- Kullanıcı notunda 'yarın sabah 8'de', 'akşam 7'de yola çıkacağım' "
+            "  gibi ifade varsa: ETA'yı bu yola çıkış saatine göre yeniden "
+            "  hesapla (yola çıkış + Süre = Varış). Rota Özeti'nde **{ETA}** "
+            "  yerine bu hesaplanan saati yaz.\n"
+            "- 'Yarın', 'önümüzdeki Pazar' gibi gün ifadesi varsa varış "
+            "  satırına o günü dahil et (örn. 'yarın 14:30 civarı').\n"
+            "- Kullanıcı saat belirtmediyse context'teki ETA olduğu gibi kullan."
         )
         user_msg = (
             "Aşağıdaki rota için kullanıcıya gösterilecek 4-paragraflık tanıtımı yaz:\n\n"
             f"{context_block}"
         )
 
-        # Gemini daha hızlı; narrative için yeterli
-        res = await orchestrator.llm_gemini.ainvoke([
-            SystemMessage(content=system),
-            HumanMessage(content=user_msg),
-        ])
+        # Gemini daha hızlı; narrative için yeterli (10. Tur: timeout 30→15sn)
+        res = await asyncio.wait_for(
+            orchestrator.llm_gemini.ainvoke([
+                SystemMessage(content=system),
+                HumanMessage(content=user_msg),
+            ]),
+            timeout=15.0,
+        )
         text = res.content if hasattr(res, "content") else str(res)
         if isinstance(text, list):
             text = "".join(b.get("text", "") for b in text if isinstance(b, dict))
@@ -1363,9 +2318,245 @@ async def _generate_trip_narrative(
             log.warning(f"⚠️ [TripPlan] Narrative çok kısa ({len(text)} char), fallback'e düşülüyor")
             return None
         return text
+    except asyncio.TimeoutError:
+        log.warning("⚠️ [TripPlan] Narrative timeout (15sn) — fallback'e düşüyor")
+        return None
     except Exception as e:
         log.warning(f"⚠️ [TripPlan] Narrative üretilemedi: {e}")
         return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRIP PARSE INTENT — 11. Tur: serbest metni TripPlanRequest field'larına çevir
+# Wizard'da "Hızlı Mod" toggle bu endpoint'i çağırır; mobile parsed JSON ile
+# form'u doldurur, sonra mevcut /trip/plan akışı çalışır.
+# ─────────────────────────────────────────────────────────────────────────────
+
+from pydantic import BaseModel as _BM, Field as _F  # noqa: E402
+
+
+class _TripParseIntentRequest(_BM):
+    message: str = _F(min_length=4, max_length=1500)
+    current_lat: Optional[float] = None
+    current_lon: Optional[float] = None
+
+
+@router.post("/api/v1/trip/parse_intent", tags=["Trip Planning"])
+async def parse_trip_intent(
+    request: _TripParseIntentRequest, user: dict = Depends(get_optional_user),
+):
+    """LLM ile serbest metni TripPlanRequest field'larına parse eder.
+
+    Mobile bu parsed dict'i alıp wizard'ı doldurur, sonra mevcut /trip/plan
+    endpoint'ini normal akışla çağırır. Bu endpoint TEK LLM call yapar;
+    rota planlamaz, sadece niyet çıkarır.
+    """
+    import re as _re_pi
+    t0 = time.monotonic()
+    try:
+        if not orchestrator.llm_gemini and not orchestrator.llm_claude:
+            return ApiEnvelope(
+                success=False,
+                error=ApiError(code="LLM_UNAVAILABLE", message="LLM mevcut değil."),
+                metadata=ApiMetadata(response_time_ms=0),
+            )
+
+        now_str = _now_tr().strftime("%Y-%m-%d %H:%M (%A)")
+        system_prompt = (
+            "Sen GeoIntel'in serbest-metin parser'ısın. Kullanıcının seyahat "
+            "niyetinden yapısal alanları çıkarırsın. ÇIKTI STRICT JSON object.\n\n"
+            f"Şu an (TR yerel): {now_str}\n\n"
+            "Şema:\n"
+            "{\n"
+            '  "destination": "<şehir veya adres — boşsa boş string>",\n'
+            '  "waypoints": ["<şehir1>", "<şehir2>"],  // opsiyonel\n'
+            '  "food_preference": "Yöresel Lezzetler|Fast Food|Ev Yemekleri|Kahve & Tatlı|Fark etmez",\n'
+            '  "food_location": "Başları|Ortaları|Sonları|<şehir adı>|\'\'",\n'
+            '  "food_specific": "<spesifik yemek adı (pide, balık, kebap, lahmacun, döner, mantı, çorba, kahvaltı) — yoksa \'\'>",\n'
+            '  "food_quality_hint": "<ucuz | kaliteli | hızlı | romantik | manzaralı — yoksa \'\'>",\n'
+            '  "scene_filters": ["manzaralı","sahil","aile dostu","sessiz","doğa"],  // 0-3 etiket\n'
+            '  "fuel_remaining_km": <int 0-1200; menzil belirtilmediyse 0>,\n'
+            '  "break_interval_hours": <float 0-8; mola sıklığı belirtilmediyse 2.0>,\n'
+            '  "custom_note": "<TÜM özel istekler — uzun ve detaylı yazılır>",\n'
+            '  "search_plan": [  // opsiyonel — kullanıcı birden çok bölgede arama istiyorsa\n'
+            '    {"kind":"food","query":"pide pideci","fraction_range":[0.3,0.6],"max_results":12},\n'
+            '    {"kind":"food","query":"balık restoran","region_hint":{"city":"Trabzon"},"max_results":10},\n'
+            '    {"kind":"break","query":"çay bahçesi sahil","fraction_range":[0.85,0.95]},\n'
+            '    {"kind":"fuel","anchor":"start"}\n'
+            '  ]\n'
+            "}\n\n"
+            "## custom_note KRİTİK KURAL\n"
+            "Bu alan **kullanıcının orijinal cümlesinden TÜM özel istekleri** "
+            "barındırmalı. Aşağıdaki ifadelerin HER BİRİ buraya yazılır:\n"
+            "  • Saat/tarih: 'yarın sabah 8'de', 'akşam 6'da yola çıkacağım'\n"
+            "  • Yakıt konumu: 'yolun başında yakıt', 'sonlarına doğru ikinci dolum'\n"
+            "  • Yemek detayı: 'ucuz ve kaliteli yemek', 'balık restoranı arıyorum'\n"
+            "  • Mola tercihi: 'sık sık mola', 'manzaralı duraklar', 'sahil molası'\n"
+            "  • Atmosfer: 'manzaralı yol', 'sessiz/huzurlu yer', 'aile dostu'\n"
+            "  • Diğer: 'çocuk uyusun', 'köpekle gidiyorum', 'engelli erişim'\n"
+            "Boyut: 50-400 char. ÖZET DEĞİL, DETAY TUT.\n\n"
+            "## YENİ ALANLAR — DETAY\n"
+            "- food_specific: Kullanıcı 'pide istiyorum/balık yiyelim/kebap canım çekti' "
+            "  derse spesifik kelimeyi buraya yaz ('pide', 'balık', 'kebap'). "
+            "  Sistem bunu Google Places query'sine direkt ekler. Belirsizse boş.\n"
+            "- food_quality_hint: 'ucuz kaliteli', 'romantik akşam yemeği', 'hızlı geçelim' "
+            "  ifadeleri için tek kelime ('ucuz','kaliteli','hızlı','romantik','manzaralı').\n"
+            "- scene_filters: ['manzaralı','sahil','aile dostu','sessiz','doğa'] etiketleri. "
+            "  Kullanıcı 'sahil yolundan', 'manzaralı duraklarda mola' derse uygun "
+            "  etiketleri seç. Max 3. Hiç hint yoksa boş array.\n"
+            "- search_plan: SADECE kullanıcı çok-bölgeli/karmaşık istek belirttiyse üret. "
+            "  Örn: 'Samsun-Rize, yolun ortasında pide, Trabzon'a varmadan balık, "
+            "  yola çıkar çıkmaz yakıt' → 3 ayrı item üret. Basit isteklerde boş bırak.\n\n"
+            "## DİĞER KURALLAR\n"
+            "- destination metinden çıkarılamıyorsa boş string döndür.\n"
+            "- food_location: 'rotanın sonuna doğru'/'sonlara' → 'Sonları'; "
+            "  'ortada'/'rotanın ortası' → 'Ortaları'; 'başında' → 'Başları'.\n"
+            "  Kullanıcı belirli şehir derse ('Trabzon\\'da', 'Akçaabat'ta yemek') "
+            "  → şehir adı döndür.\n"
+            "- food_preference: 'pide/köfte/balık/yöresel/ucuz kaliteli' → 'Yöresel Lezzetler'; "
+            "  'fast food/burger/pizza' → 'Fast Food'; 'kafe/kahve/tatlı' → 'Kahve & Tatlı'; "
+            "  'ev yemeği/ev tarzı' → 'Ev Yemekleri'.\n"
+            "- fuel_remaining_km: 'X km menzilim var', 'Y km gidebilir' → int X/Y.\n"
+            "- break_interval_hours: 'sık sık mola'/'sık mola' → 1.5; "
+            "  '2 saatte bir' → 2.0; 'molasız'/'durmadan' → 0; 'uzun mola' → 3.0.\n"
+            "- ÇIKTI yalnızca JSON object. Markdown/yorum YOK."
+        )
+        user_prompt = f"Kullanıcı niyeti:\n\"{request.message.strip()}\"\n\nJSON üret:"
+
+        text = await _llm_invoke_with_fallback(
+            [SystemMessage(content=system_prompt),
+             HumanMessage(content=user_prompt)],
+            timeout=15.0,
+        )
+        if not text:
+            return ApiEnvelope(
+                success=False,
+                error=ApiError(code="LLM_EMPTY", message="LLM yanıt vermedi."),
+                metadata=ApiMetadata(response_time_ms=int((time.monotonic() - t0) * 1000)),
+            )
+
+        m = _re_pi.search(r"\{[\s\S]*\}", text)
+        if not m:
+            log.warning(f"⚠️ [ParseIntent] JSON bulunamadı: {text[:160]!r}")
+            return ApiEnvelope(
+                success=False,
+                error=ApiError(code="PARSE_ERROR", message="JSON çıkarılamadı."),
+                metadata=ApiMetadata(response_time_ms=int((time.monotonic() - t0) * 1000)),
+            )
+        try:
+            parsed = json.loads(m.group(0))
+        except Exception as e:
+            log.warning(f"⚠️ [ParseIntent] JSON parse: {e}")
+            return ApiEnvelope(
+                success=False,
+                error=ApiError(code="JSON_INVALID", message=str(e)),
+                metadata=ApiMetadata(response_time_ms=int((time.monotonic() - t0) * 1000)),
+            )
+
+        # Sanitize / validate field'lar — defaultlara düş
+        _VALID_FOOD_PREF = {
+            "Yöresel Lezzetler", "Fast Food", "Ev Yemekleri",
+            "Kahve & Tatlı", "Fark etmez",
+        }
+        _VALID_SCENE = {
+            "manzaralı", "sahil", "aile dostu", "sessiz", "doğa",
+            "huzurlu", "tarihi",
+        }
+        _VALID_QUALITY = {"ucuz", "kaliteli", "hızlı", "romantik", "manzaralı"}
+        _VALID_KINDS = {"food", "fuel", "break", "scenic"}
+
+        # search_plan validate (LLM uyduruyorsa atılır)
+        raw_plan = parsed.get("search_plan") or []
+        clean_plan: List[dict] = []
+        if isinstance(raw_plan, list):
+            for it in raw_plan[:6]:
+                if not isinstance(it, dict):
+                    continue
+                kind = it.get("kind")
+                if kind not in _VALID_KINDS:
+                    continue
+                q = str(it.get("query") or "").strip()
+                if not q and kind != "fuel":
+                    continue
+                item = {"kind": kind, "query": q or "benzin istasyonu"}
+                rh = it.get("region_hint")
+                if isinstance(rh, dict) and rh.get("city"):
+                    item["region_hint"] = {"city": str(rh["city"]).strip()}
+                fr = it.get("fraction_range")
+                if isinstance(fr, (list, tuple)) and len(fr) == 2:
+                    try:
+                        a, b = float(fr[0]), float(fr[1])
+                        if 0.0 <= a < b <= 1.0:
+                            item["fraction_range"] = [a, b]
+                    except Exception:
+                        pass
+                anchor = it.get("anchor")
+                if anchor in ("start", "end"):
+                    item["anchor"] = anchor
+                mr = it.get("max_results")
+                if isinstance(mr, (int, float)):
+                    item["max_results"] = max(1, min(30, int(mr)))
+                clean_plan.append(item)
+
+        raw_scene = parsed.get("scene_filters") or []
+        scene_filters = [
+            str(s).strip().lower() for s in raw_scene
+            if isinstance(s, str) and str(s).strip().lower() in _VALID_SCENE
+        ][:3]
+
+        food_quality = str(parsed.get("food_quality_hint") or "").strip().lower()
+        if food_quality not in _VALID_QUALITY:
+            food_quality = ""
+
+        out = {
+            "destination": str(parsed.get("destination") or "").strip(),
+            "waypoints": [
+                str(w).strip() for w in (parsed.get("waypoints") or [])
+                if isinstance(w, str) and w.strip()
+            ][:5],
+            "food_preference": (
+                parsed.get("food_preference")
+                if parsed.get("food_preference") in _VALID_FOOD_PREF
+                else "Fark etmez"
+            ),
+            "food_location": str(parsed.get("food_location") or "").strip() or "Ortaları",
+            "food_specific": str(parsed.get("food_specific") or "").strip()[:60],
+            "food_quality_hint": food_quality,
+            "scene_filters": scene_filters,
+            "fuel_remaining_km": 0,
+            "break_interval_hours": 2.0,
+            "custom_note": str(parsed.get("custom_note") or "").strip(),
+            "search_plan": clean_plan,
+        }
+        try:
+            fk = float(parsed.get("fuel_remaining_km") or 0)
+            out["fuel_remaining_km"] = max(0, min(1200, int(fk)))
+        except Exception:
+            pass
+        try:
+            bh = float(parsed.get("break_interval_hours") or 2.0)
+            out["break_interval_hours"] = max(0, min(8, round(bh, 1)))
+        except Exception:
+            pass
+
+        elapsed = int((time.monotonic() - t0) * 1000)
+        log.info(
+            f"✅ [ParseIntent] {elapsed}ms — dest={out['destination']!r} "
+            f"food={out['food_preference']!r} specific={out['food_specific']!r} "
+            f"scene={out['scene_filters']} plan_items={len(clean_plan)}"
+        )
+        return ApiEnvelope(
+            success=True,
+            data={"parsed": out},
+            metadata=ApiMetadata(response_time_ms=elapsed),
+        )
+    except Exception as e:
+        log.error(f"🔥 [ParseIntent] Hata: {e}")
+        return ApiEnvelope(
+            success=False,
+            error=ApiError(code="PARSE_INTENT_ERROR", message=str(e)),
+            metadata=ApiMetadata(response_time_ms=int((time.monotonic() - t0) * 1000)),
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1400,12 +2591,21 @@ async def plan_trip(request: TripPlanRequest, user: dict = Depends(get_optional_
                 if _cached_loc:
                     origin = _cached_loc if isinstance(_cached_loc, str) else _cached_loc.decode("utf-8")
 
-        # Konum + FCM kaydet
+        # Konum + FCM kaydet (user fallback key dahil — mode değişiminde kayıp olmasın)
         if orchestrator.redis_client and request.current_lat and request.current_lon:
-            orchestrator.redis_client.setex(
-                f"loc:{session_id}", 3600,
-                f"{request.current_lat},{request.current_lon}"
-            )
+            _loc_value = f"{request.current_lat},{request.current_lon}"
+            orchestrator.redis_client.setex(f"loc:{session_id}", 3600, _loc_value)
+            if ":" in session_id:
+                _user_id = session_id.split(":", 1)[0]
+                orchestrator.redis_client.setex(
+                    f"loc:user:{_user_id}", 3600, _loc_value,
+                )
+            else:
+                _parts = session_id.split("_", 1)
+                if len(_parts) == 2 and _parts[0] in ("chat", "trip", "dayplan", "free"):
+                    orchestrator.redis_client.setex(
+                        f"loc:anon:{_parts[1]}", 3600, _loc_value,
+                    )
         if orchestrator.redis_client and request.fcm_token:
             orchestrator.redis_client.setex(f"fcm:{session_id}", 86400 * 30, request.fcm_token)
 
@@ -1497,9 +2697,9 @@ async def plan_trip(request: TripPlanRequest, user: dict = Depends(get_optional_
         if orchestrator.redis_client and polyline:
             orchestrator.redis_client.setex(f"route:{session_id}", 3600, polyline)
 
-        # ── ETA hesapla ───────────────────────────────────────────────────
-        from datetime import datetime, timedelta, timezone as _tz
-        _now = datetime.now(_tz.utc).astimezone()
+        # ── ETA hesapla (TR saati — 10. Tur fix) ─────────────────────────
+        from datetime import timedelta
+        _now = _now_tr()
         _eta_dt = _now + timedelta(minutes=total_min)
         eta_str = _eta_dt.strftime("%H:%M")
         eta_display = (
@@ -1508,176 +2708,24 @@ async def plan_trip(request: TripPlanRequest, user: dict = Depends(get_optional_
             else eta_str
         )
 
-        # ── 4. Mola ve yemek slotlarını hesapla ──────────────────────────
+        # ── 4. Marker değişkenleri (curator akışı 8.5'te dolduracak) ─────
+        # break_interval_km sadece trip_context'e gidiyor (mobile bilgi için)
         break_interval_km = request.break_interval_hours * 80  # ~80km/saat
-        break_slots: List[float] = []
-        if request.break_interval_hours > 0 and total_km > break_interval_km:
-            curr = break_interval_km
-            while curr < total_km - 20:
-                break_slots.append(curr)
-                curr += break_interval_km
-
-        # ── 4b. Mola noktası araması ──────────────────────────────────────
-        break_markers: list = []
-        if break_slots and polyline and total_km > 0:
-            places_tool_brk = orchestrator.get_tool_by_name("search_hybrid_places")
-            if places_tool_brk:
-                _BRK_QUERIES = ["benzin istasyonu akaryakıt", "otoyol hizmet alanı mola", "kafe restoran mola"]
-                break_task_list = []
-                for slot_km in break_slots:
-                    frac = slot_km / total_km
-                    for q in _BRK_QUERIES:
-                        break_task_list.append((
-                            slot_km, q,
-                            asyncio.wait_for(
-                                places_tool_brk.ainvoke({
-                                    "query": q,
-                                    "route_polyline": polyline,
-                                    "target_fraction": frac,
-                                }),
-                                timeout=15.0,
-                            ),
-                        ))
-
-                try:
-                    break_results = await asyncio.gather(*[t[2] for t in break_task_list], return_exceptions=True)
-                    seen_brk = set()
-                    slot_best_tp: dict = {}
-                    for i, br in enumerate(break_results):
-                        if isinstance(br, Exception):
-                            continue
-                        if isinstance(br, str):
-                            try:
-                                br = json.loads(br)
-                            except Exception:
-                                continue
-                        if isinstance(br, dict):
-                            slot_key = break_task_list[i][0]
-                            if slot_key in slot_best_tp:
-                                continue
-                            candidates = (
-                                br.get("strict_route_places", [])
-                                + br.get("relaxed_route_places", [])
-                                + br.get("places", [])
-                            )
-                            for p in candidates[:10]:
-                                nm = p.get("name", "")
-                                if not nm or nm in seen_brk:
-                                    continue
-                                if "lat" not in p and "coords" in p:
-                                    try:
-                                        clat, clon = map(float, p["coords"].split(","))
-                                        p["lat"] = clat
-                                        p["lon"] = clon
-                                    except Exception:
-                                        continue
-                                if "lat" not in p:
-                                    continue
-                                if not _is_valid_break_stop(p):
-                                    continue
-                                seen_brk.add(nm)
-                                p["type"] = "break_stop"
-                                p["distance_along_route_km"] = slot_key
-                                slot_best_tp[slot_key] = p
-                                break
-                    break_markers = list(slot_best_tp.values())
-                    log.info(f"☕ [TripPlan] Mola: {len(break_markers)} nokta (slots={break_slots})")
-                except Exception as exc:
-                    log.warning(f"⚠️ [TripPlan] Mola araması genel hata: {exc}")
-
-        # Yemek noktası
-        food_fraction = {"Başları": 0.25, "Ortaları": 0.5, "Sonları": 0.75}.get(
-            request.food_location, 0.5
-        )
-        food_target_km = total_km * food_fraction
-
-        # ── 5. Yemek yeri ara ────────────────────────────────────────────
         food_markers: list = []
-        if total_km > 50 and polyline and request.food_preference != "Molasız":
-            food_query_map = {
-                "Yöresel Lezzetler": "yöresel restoran lokanta",
-                "Fast Food": "fast food hamburger",
-                "Ev Yemekleri": "ev yemeği lokanta",
-                "Kahve & Tatlı": "kafe kahve tatlı",
-                "Fark etmez": "restoran",
-            }
-            food_query = food_query_map.get(request.food_preference, "restoran")
-            places_tool = orchestrator.get_tool_by_name("search_hybrid_places")
-            if places_tool:
-                # Geniş alan araması: ±15% fraksiyonlarda parallel
-                food_fracs = sorted({
-                    max(0.1, round(food_fraction - 0.15, 2)),
-                    food_fraction,
-                    min(0.9, round(food_fraction + 0.15, 2)),
-                })
-                food_tasks = [
-                    asyncio.wait_for(
-                        places_tool.ainvoke({
-                            "query": food_query,
-                            "route_polyline": polyline,
-                            "target_fraction": frac,
-                        }),
-                        timeout=20.0,
-                    )
-                    for frac in food_fracs
-                ]
-                food_results = await asyncio.gather(*food_tasks, return_exceptions=True)
-                seen_food: set = set()
-                all_places: list = []
-                for food_res in food_results:
-                    if isinstance(food_res, Exception):
-                        continue
-                    if isinstance(food_res, str):
-                        try:
-                            food_res = json.loads(food_res)
-                        except Exception:
-                            continue
-                    if isinstance(food_res, dict):
-                        for p in (
-                            food_res.get("strict_route_places", [])
-                            + food_res.get("relaxed_route_places", [])
-                            + food_res.get("places", [])
-                        ):
-                            nm = p.get("name", "")
-                            if nm and nm not in seen_food:
-                                seen_food.add(nm)
-                                all_places.append(p)
-                # Yemek noktasına en yakın 5 mekan
-                all_places.sort(
-                    key=lambda p: abs(float(p.get("distance_along_route_km") or 0) - food_target_km)
-                )
-                food_markers = all_places[:5]
-
-        # ── 6. Yakıt analizi ─────────────────────────────────────────────
         fuel_markers: list = []
-        fuel_section_summary = {}
-        if total_km > 100 and polyline:
-            # Anlık menzil belirleniyor — varsa kullanıcının girdiği, yoksa araç profili
-            effective_fuel_km = request.fuel_remaining_km if request.fuel_remaining_km > 0 else (
-                (40 / fuel_consumption) * 100  # varsayılan 40L depo
-            )
-            evaluator = RouteStrategyEvaluator(orchestrator)
-            fuel_result = await evaluator.evaluate(
-                origin=origin,
-                destination=request.destination,
-                fuel_type=fuel_type,
-                fuel_range=effective_fuel_km,
-                polyline=polyline,
-                total_dist_km=total_km,
-            )
-            if fuel_result.get("status") == "success":
-                # Rota uzunluğunu aşan durakları filtrele (700km öneri 677km rotada olmaz)
-                fuel_markers = [
-                    m for m in fuel_result.get("places", [])
-                    if (m.get("distance_along_route_km") or 0) <= total_km
-                ]
-                for fm in fuel_markers:
-                    fm["type"] = "fuel_station"
-                fuel_section_summary = {
-                    "cheapest_city": fuel_result.get("cheapest_fuel_city"),
-                    "best_station": fuel_result.get("best_station_recommendation"),
-                    "stops_by_km": fuel_result.get("stops_by_km", []),
-                }
+        break_markers: list = []
+        combined_markers: list = []
+        scenic_markers: list = []
+        fuel_section_summary: dict = {}
+        # Legacy fraction map — narrative & POI overlay subtitle için
+        _FRACTION_MAP = {"Başları": 0.2, "Ortaları": 0.5, "Sonları": 0.8}
+        food_loc_raw = (request.food_location or "").strip()
+        food_city: Optional[str] = (
+            food_loc_raw if (
+                food_loc_raw and food_loc_raw not in (*_FRACTION_MAP.keys(), "Fark etmez", "")
+            ) else None
+        )
+        food_target_km = total_km * _FRACTION_MAP.get(food_loc_raw, 0.5)
 
         # ── 7. Hava durumu — rota boyunca 40km aralıklarla analiz ────────
         weather_warnings: list = []
@@ -1688,12 +2736,21 @@ async def plan_trip(request: TripPlanRequest, user: dict = Depends(get_optional_
             if not weather_tool:
                 log.warning("⚠️ [TripPlan] analyze_route_weather tool bulunamadı")
             else:
+                # 13. Tur — custom_note'tan yola çıkış saatini çıkar
+                _dep_min = _parse_departure_minutes(
+                    request.custom_note, _now_tr(),
+                )
+                if _dep_min > 0:
+                    log.info(
+                        f"⏰ [TripPlan] custom_note → departure_minutes_from_now={_dep_min} "
+                        f"({_dep_min/60:.1f}sa sonra)"
+                    )
                 try:
                     w_res = await asyncio.wait_for(
                         weather_tool.ainvoke({
                             "polyline": polyline,
                             "avg_speed_kmh": "90",
-                            "departure_minutes_from_now": "0",
+                            "departure_minutes_from_now": str(_dep_min),
                         }),
                         timeout=20.0,
                     )
@@ -1711,12 +2768,23 @@ async def plan_trip(request: TripPlanRequest, user: dict = Depends(get_optional_
                             if isinstance(pt, dict):
                                 weather_details.append({
                                     "km": pt.get("km"),
+                                    "km_int": pt.get("km_int"),                  # 12. Tur
                                     "saat": pt.get("tahmini_saat") or pt.get("saat"),
                                     "durum": pt.get("durum"),
                                     "sicaklik": pt.get("sicaklik"),
                                     "yagis_olasiligi": pt.get("yagis_olasiligi"),
+                                    "yagis_pct": pt.get("yagis_pct"),            # 12. Tur
                                     "ruzgar": pt.get("ruzgar"),
+                                    "ruzgar_ms": pt.get("ruzgar_ms"),            # 12. Tur
                                     "riskli_mi": bool(pt.get("riskli_mi")),
+                                    "severity": pt.get("severity", "acik"),      # 12. Tur
+                                    "intensity_pct": pt.get("intensity_pct", 0), # 12. Tur
+                                    "emoji": pt.get("emoji", "🌤️"),              # 12. Tur
+                                    "il": pt.get("il"),                          # 13. Tur
+                                    "ilce": pt.get("ilce"),                      # 13. Tur
+                                    "location_label": pt.get("location_label"),  # 13. Tur
+                                    "lat": pt.get("lat"),                        # 14. Tur — mini map
+                                    "lon": pt.get("lon"),                        # 14. Tur
                                 })
                         log.info(f"🌦️ [TripPlan] Hava analizi: risk={risk}, {len(zones)} riskli bölge, {len(weather_details)} kontrol noktası")
                         for zone in zones:
@@ -1773,6 +2841,14 @@ async def plan_trip(request: TripPlanRequest, user: dict = Depends(get_optional_
                 "message": "☀️ Rota boyunca hava açık, güvenli yolculuklar!",
             })
 
+        # İl-bazlı zone özeti (mobile chip listesi + curator narrative için)
+        weather_zones_summary = _summarize_weather_by_city(weather_details)
+        if weather_zones_summary:
+            log.info(
+                f"🌤️ [TripPlan] Hava zonları: "
+                f"{', '.join(z['cities'] + ':' + z['severity'] for z in weather_zones_summary[:6])}"
+            )
+
         # ── 7.5 Radar noktaları ───────────────────────────────────────────
         radar_count = 0
         if polyline and total_km >= 50:
@@ -1818,10 +2894,240 @@ async def plan_trip(request: TripPlanRequest, user: dict = Depends(get_optional_
                 except Exception:
                     pass
 
+        # ── 8.5 ★ Strategist v2 — LLM tek çağrısı: plan + narrative ─────────
+        # LLM Türkiye coğrafyasını biliyor: rota üzerindeki ilçeleri kendisi
+        # tahmin eder, kullanıcı tercihlerine göre 4-6 stop üretir ve uzun
+        # imperative narrative yazar (placeholder'lı). Backend sonra her stop'u
+        # paralel olarak gerçek mekana eşler ve narrative'i replace eder.
+        curated_narrative: Optional[str] = None
+        _use_strategist = _os_cur.getenv("TRIP_USE_STRATEGIST", "true").lower() == "true"
+        # Legacy curator default OFF — Strategist fail olursa SIMPLE deterministic akış kullanılır
+        _use_legacy_curator = _os_cur.getenv("TRIP_USE_LEGACY_CURATOR", "false").lower() == "true"
+        _strategy_ok = False
+        if _use_strategist and total_km > 50 and polyline:
+            try:
+                _effective_fuel_km = (
+                    request.fuel_remaining_km if request.fuel_remaining_km > 0
+                    else (40 / fuel_consumption) * 100
+                )
+                _intent_payload = {
+                    "food_preference": request.food_preference,
+                    "food_location": request.food_location,
+                    "food_specific": (request.food_specific or "").strip(),
+                    "food_quality_hint": (request.food_quality_hint or "").strip(),
+                    "scene_filters": list(request.scene_filters or []),
+                    "custom_note": request.custom_note,
+                    "break_interval_hours": request.break_interval_hours,
+                    "waypoints": request.waypoint_labels or request.waypoints,
+                }
+                strategy = await _plan_strategy(
+                    origin=origin,
+                    destination=request.destination,
+                    total_km=total_km,
+                    total_min=total_min,
+                    eta_display=eta_display,
+                    fuel_type=fuel_type,
+                    fuel_remaining_km=_effective_fuel_km,
+                    current_lat=request.current_lat,
+                    current_lon=request.current_lon,
+                    intent=_intent_payload,
+                    weather_zones=weather_zones_summary or [],
+                    orchestrator=orchestrator,
+                )
+                if strategy and strategy.get("stops"):
+                    resolved = await _collect_targeted_stops(
+                        stops=strategy["stops"],
+                        polyline=polyline,
+                        total_km=total_km,
+                        current_lat=request.current_lat,
+                        current_lon=request.current_lon,
+                        fuel_type=fuel_type,
+                        orchestrator=orchestrator,
+                    )
+                    if resolved:
+                        curated_narrative = _inject_stop_names(
+                            strategy.get("narrative", ""), resolved
+                        )
+                        for c in resolved:
+                            role = c.get("role")
+                            if role == "fuel":
+                                fuel_markers.append(c)
+                            elif role == "food":
+                                food_markers.append(c)
+                            elif role == "scenic":
+                                scenic_markers.append(c)
+                            else:
+                                break_markers.append(c)
+                        _strategy_ok = True
+                        log.info(
+                            f"✅ [TripPlan] Strategist akışı: "
+                            f"{len(fuel_markers)} fuel, {len(food_markers)} food, "
+                            f"{len(break_markers)} break, {len(scenic_markers)} scenic"
+                        )
+                    else:
+                        log.warning(
+                            "⚠️ [TripPlan] Strategist stop'lar resolve edilemedi — "
+                            "fallback'e düşülüyor"
+                        )
+                else:
+                    log.warning(
+                        "⚠️ [TripPlan] Strategist None döndü — fallback'e düşülüyor"
+                    )
+            except Exception as _strex:
+                import traceback as _stb
+                log.error(
+                    f"🔥 [TripPlan] Strategist akışı hata: {_strex}\n{_stb.format_exc()}"
+                )
+
+        # ── 8.6 ★ SIMPLE Deterministic fallback (Strategist fail) ─────────
+        # LegacyCurator default OFF — yerine basit, hızlı, doğrudan
+        # search_hybrid_places çağrılarıyla stop'lar üretilir.
+        if not _strategy_ok and not _use_legacy_curator and total_km > 50 and polyline:
+            try:
+                simple_resolved = await _simple_det_stops(
+                    custom_note=request.custom_note or "",
+                    food_preference=request.food_preference,
+                    food_specific=(request.food_specific or "").strip(),
+                    food_quality_hint=(request.food_quality_hint or "").strip(),
+                    food_location=request.food_location or "Ortaları",
+                    scene_filters=list(request.scene_filters or []),
+                    break_interval_hours=request.break_interval_hours,
+                    destination=request.destination,
+                    polyline=polyline,
+                    total_km=total_km,
+                    current_lat=request.current_lat,
+                    current_lon=request.current_lon,
+                    fuel_type=fuel_type,
+                    orchestrator=orchestrator,
+                )
+                if simple_resolved:
+                    curated_narrative = _build_simple_narrative(
+                        origin=origin,
+                        destination=request.destination,
+                        total_km=total_km,
+                        total_min=total_min,
+                        eta_display=eta_display,
+                        resolved=simple_resolved,
+                        custom_note=request.custom_note or "",
+                        food_specific=(request.food_specific or "").strip(),
+                        weather_zones=weather_zones_summary or [],
+                    )
+                    for c in simple_resolved:
+                        role = c.get("role")
+                        if role == "fuel":
+                            fuel_markers.append(c)
+                        elif role == "food":
+                            food_markers.append(c)
+                        elif role == "scenic":
+                            scenic_markers.append(c)
+                        else:
+                            break_markers.append(c)
+                    log.info(
+                        f"✅ [TripPlan] SimpleDet akışı: "
+                        f"{len(fuel_markers)} fuel, {len(food_markers)} food, "
+                        f"{len(break_markers)} break"
+                    )
+            except Exception as _sde:
+                import traceback as _stb2
+                log.error(
+                    f"🔥 [TripPlan] SimpleDet hata: {_sde}\n{_stb2.format_exc()}"
+                )
+
+        # ── 8.7 Legacy Curator (sadece TRIP_USE_LEGACY_CURATOR=true ise) ───
+        if not _strategy_ok and _use_legacy_curator and total_km > 50 and polyline:
+            try:
+                _req_dict = request.model_dump()
+                _req_dict["total_km"] = total_km
+                _raw_plan = _req_dict.get("search_plan") or _build_legacy_search_plan(request)
+                _effective_fuel_km = (
+                    request.fuel_remaining_km if request.fuel_remaining_km > 0
+                    else (40 / fuel_consumption) * 100
+                )
+                pools = await _collect_candidates(
+                    search_plan=_raw_plan,
+                    polyline=polyline,
+                    total_km=total_km,
+                    origin=origin,
+                    destination=request.destination,
+                    fuel_type=fuel_type,
+                    fuel_range=_effective_fuel_km,
+                    orchestrator=orchestrator,
+                    break_filter=_is_valid_break_stop,
+                )
+                fuel_section_summary = pools.fuel_summary or {}
+                _fuel_anchors = _parse_fuel_anchors(request.custom_note)
+                _anchor_str = (
+                    "start" if _fuel_anchors["start"]
+                    else ("end" if _fuel_anchors["end"] else None)
+                )
+                _route_meta = {
+                    "origin": origin,
+                    "destination": request.destination,
+                    "total_km": round(total_km, 1),
+                    "total_min": total_min,
+                    "eta_display": eta_display,
+                    "fuel_type": fuel_type,
+                    "radar_count": radar_count,
+                    "toll": toll_info,
+                }
+                _intent_payload = {
+                    "food_preference": request.food_preference,
+                    "food_location": request.food_location,
+                    "food_specific": (request.food_specific or "").strip(),
+                    "food_quality_hint": (request.food_quality_hint or "").strip(),
+                    "scene_filters": list(request.scene_filters or []),
+                    "custom_note": request.custom_note,
+                    "fuel_anchor": _anchor_str,
+                    "break_interval_hours": request.break_interval_hours,
+                    "waypoints": request.waypoint_labels or request.waypoints,
+                }
+                curated = await _curate_trip(
+                    pools=pools,
+                    route_meta=_route_meta,
+                    intent=_intent_payload,
+                    weather_zones=weather_zones_summary or [],
+                    orchestrator=orchestrator,
+                )
+                if curated:
+                    curated_narrative = curated.get("narrative")
+                    _selected_ids = [s["id"] for s in curated.get("selected_stops", [])]
+                    _selected = _apply_marker_budget(pools, _selected_ids)
+                else:
+                    _selected = _det_select_pools(pools, _req_dict)
+                    log.info(
+                        f"📊 [TripPlan] Legacy fallback deterministik: "
+                        f"{len(_selected)} marker"
+                    )
+                for _c in _selected:
+                    kd = _c.get("kind") or "food"
+                    if kd == "combined":
+                        _c["type"] = "combined_stop"
+                        combined_markers.append(_c)
+                    elif kd == "fuel":
+                        _c["type"] = "fuel_station"
+                        fuel_markers.append(_c)
+                    elif kd == "food":
+                        _c["type"] = "restaurant"
+                        food_markers.append(_c)
+                    elif kd == "scenic":
+                        _c["type"] = "scenic_stop"
+                        scenic_markers.append(_c)
+                    else:
+                        _c["type"] = "break_stop"
+                        break_markers.append(_c)
+            except Exception as _curex:
+                import traceback as _ctb
+                log.error(
+                    f"🔥 [TripPlan] Legacy curator hata: {_curex}\n{_ctb.format_exc()}"
+                )
+
         # ── 9. POI Overlay oluştur ────────────────────────────────────────
         # NOT: break_markers (mola noktaları) da haritada görünmeli — eskiden
         # eksikti, kullanıcı 2sa interval verdiğinde nokta gözükmüyordu.
-        all_markers = food_markers + fuel_markers + break_markers
+        all_markers = (
+            food_markers + fuel_markers + break_markers
+            + combined_markers + scenic_markers
+        )
         poi_overlay = None
         sections = []
 
@@ -1889,10 +3195,24 @@ async def plan_trip(request: TripPlanRequest, user: dict = Depends(get_optional_
                     ai_recommendation=ai_rec,
                 ))
             if food_cards:
+                # 14. Tur — "Rotayı dörde böldük" metni temizlendi.
+                # food_city varsa şehir merkezi, chip varsa bölge etiketi göster.
+                if food_city:
+                    _food_subtitle = f"{food_city} civarında {len(food_cards)} mekan"
+                else:
+                    _region_label_map = {
+                        "Başları": "yolun başlarında",
+                        "Ortaları": "rotanın ortalarında",
+                        "Sonları": "yolun sonlarında",
+                    }
+                    _region = _region_label_map.get(
+                        food_loc_raw, "rota üzerinde"
+                    )
+                    _food_subtitle = f"{_region} {len(food_cards)} mekan"
                 sections.append({
                     "type": "food",
                     "title": f"🍽️ {request.food_preference} Önerileri",
-                    "subtitle": f"Rotayı dörde böldük, {request.food_location.lower()} öneriyoruz",
+                    "subtitle": _food_subtitle,
                     "target_km": int(food_target_km),
                     "cards": [c.model_dump() for c in food_cards],
                 })
@@ -1968,6 +3288,70 @@ async def plan_trip(request: TripPlanRequest, user: dict = Depends(get_optional_
                     "cards": [c.model_dump() for c in fuel_cards],
                 })
 
+        # Combined POI section — hem yakıt hem yemek/mola olan yerler
+        if combined_markers:
+            combined_cards = []
+            for i, m in enumerate(combined_markers):
+                if not isinstance(m, dict) or "lat" not in m:
+                    continue
+                caps = m.get("sub_capabilities") or []
+                cap_label = " + ".join(c.title() for c in caps)
+                dist_along = m.get("distance_along_route_km") or 0
+                combined_cards.append(PoiOverlayCard(
+                    id=f"combined_{i}_{str(m.get('lat',''))[:6]}",
+                    name=m.get("name", "Dinlenme Tesisi"),
+                    address=m.get("address"),
+                    category="combined_stop",
+                    lat=float(m["lat"]), lon=float(m["lon"]),
+                    deviation_meters=m.get("deviation_meters"),
+                    distance_along_route_km=m.get("distance_along_route_km"),
+                    rating=m.get("rating"),
+                    review_count=m.get("review_count"),
+                    deviation_label="Yol üstü kombine ⭐",
+                    is_recommended=(i == 0),
+                    recommendation_reason=f"{cap_label} — tek durakta hepsi",
+                    ai_recommendation=(
+                        f"{m.get('name')} (~{int(dist_along)}. km) — {cap_label}. "
+                        f"Tek durakta hem dol hem ye."
+                    ),
+                ))
+            if combined_cards:
+                sections.append({
+                    "type": "combined",
+                    "title": "⭐ Tek Durakta Kombine",
+                    "subtitle": f"{len(combined_cards)} dinlenme tesisi — yakıt + yemek bir arada",
+                    "cards": [c.model_dump() for c in combined_cards],
+                })
+
+        # Scenic (manzara/sahil/doğa) section
+        if scenic_markers:
+            scenic_cards = []
+            for i, m in enumerate(scenic_markers):
+                if not isinstance(m, dict) or "lat" not in m:
+                    continue
+                dist_along = m.get("distance_along_route_km") or 0
+                scenic_cards.append(PoiOverlayCard(
+                    id=f"scenic_{i}_{str(m.get('lat',''))[:6]}",
+                    name=m.get("name", "Manzara Noktası"),
+                    address=m.get("address"),
+                    category="scenic_stop",
+                    lat=float(m["lat"]), lon=float(m["lon"]),
+                    deviation_meters=m.get("deviation_meters"),
+                    distance_along_route_km=m.get("distance_along_route_km"),
+                    rating=m.get("rating"),
+                    review_count=m.get("review_count"),
+                    is_recommended=(i == 0),
+                    recommendation_reason="Manzaralı mola",
+                    ai_recommendation=f"{m.get('name')} (~{int(dist_along)}. km) — manzaralı kısa mola.",
+                ))
+            if scenic_cards:
+                sections.append({
+                    "type": "scenic",
+                    "title": "📸 Manzaralı Mola Noktaları",
+                    "subtitle": f"{len(scenic_cards)} öneri",
+                    "cards": [c.model_dump() for c in scenic_cards],
+                })
+
         # Mola noktaları kullanıcıya SEÇTİRİLMEZ — biz öneririz, harita üzerinde
         # zaten görünüyor (all_markers'a dahil edildi). POI seçim ekranında
         # ayrı bir section çıkmıyor — kullanıcı "şu mı bu mu" diye uğraşmasın.
@@ -1987,18 +3371,64 @@ async def plan_trip(request: TripPlanRequest, user: dict = Depends(get_optional_
                     "eta_display": eta_display,
                     "food_stops": len(food_markers),
                     "fuel_stops": len(fuel_markers),
+                    "combined_stops": len(combined_markers),
                     "fuel_summary": fuel_section_summary,
                     "toll": toll_info,
                     "radar_count": radar_count,
                 },
                 weather_warnings=weather_warnings if weather_warnings else None,
                 weather_details=weather_details if weather_details else None,
+                weather_zones_summary=weather_zones_summary if weather_zones_summary else None,
                 sections=sections if sections else None,
             )
 
         # ── 9. Trip context Redis'e kaydet ───────────────────────────────
+        # ★ Markerları da Redis'e yaz — chat akışında durak ekleme yapıldığında
+        # eski food/fuel/break markers kaybolmasın (chat response sadece yeni
+        # waypoint marker döndürür; merge için kaynağa ihtiyaç var).
+        _persistable_markers = []
+        for _src in (fuel_markers, food_markers, break_markers,
+                     combined_markers, scenic_markers):
+            for _m in _src:
+                if not isinstance(_m, dict) or "lat" not in _m:
+                    continue
+                _persistable_markers.append({
+                    "lat": float(_m["lat"]),
+                    "lon": float(_m["lon"]),
+                    "title": _m.get("name") or _m.get("title"),
+                    "type": _m.get("type", "poi"),
+                    "snippet": _m.get("address") or _m.get("snippet"),
+                    "rating": _m.get("rating"),
+                    "deviation_meters": _m.get("deviation_meters"),
+                    "distance_along_route_km": _m.get("distance_along_route_km"),
+                    "fuel_price": _m.get("fuel_price"),
+                    "open_now": _m.get("open_now"),
+                })
+
+        # ★ FIX 5: origin koord ise friendly name çıkar (mobile UI'da koord göstermesin)
+        origin_friendly = origin
+        if origin and "," in origin:
+            try:
+                _lat_o, _lon_o = map(float, origin.split(","))
+                import httpx as _httpx_o
+                async with _httpx_o.AsyncClient(
+                    headers={"User-Agent": "GeoIntel_Orchestrator/4.0"}
+                ) as _nom_client:
+                    _rg = await _reverse_geocode_district(_lat_o, _lon_o, _nom_client)
+                if _rg and _rg.get("city"):
+                    _district = _rg.get("district") or ""
+                    _city = _rg.get("city") or ""
+                    origin_friendly = (
+                        f"{_district}, {_city}".strip(", ") if _district else _city
+                    )
+                else:
+                    origin_friendly = "Mevcut Konum"
+            except Exception:
+                origin_friendly = "Mevcut Konum"
+
         trip_context = {
             "origin": origin,
+            "origin_friendly": origin_friendly,  # ★ mobile bunu kullansın
             "destination": request.destination,
             "total_km": total_km,
             "total_min": total_min,
@@ -2007,14 +3437,20 @@ async def plan_trip(request: TripPlanRequest, user: dict = Depends(get_optional_
             "fuel_remaining_km": request.fuel_remaining_km,
             "fuel_type": fuel_type,
             "food_preference": request.food_preference,
+            "food_specific": request.food_specific or "",
+            "scene_filters": list(request.scene_filters or []),
             "break_interval_hours": request.break_interval_hours,
             "custom_note": request.custom_note,
             "waypoints": request.waypoints,
             "toll_info": toll_info,
             "weather_warnings": weather_warnings,
             "weather_details": weather_details,
+            "weather_zones_summary": weather_zones_summary,
             "radar_count": radar_count,
             "break_interval_km": break_interval_km,
+            "plan_markers": _persistable_markers,  # ★ ÖNERİ HAVUZU (POI sheet için)
+            "selected_stops": [],  # ★ KULLANICININ ONAYLADIĞI DURAKLAR (başlangıçta boş)
+                                   # add_stops endpoint VEYA chat'te "ekle" sonrası dolar
         }
         if orchestrator.redis_client:
             orchestrator.redis_client.setex(
@@ -2066,25 +3502,26 @@ async def plan_trip(request: TripPlanRequest, user: dict = Depends(get_optional_
 
         _severe_weather = any(w.get("severity") in ("warning", "critical") for w in weather_warnings)
 
-        # ── LLM Anlatımı (zengin paragraf — kuru metnin yerine) ──────────
-        # Tüm deterministik veri toplandıktan sonra LLM'e bağlam sunup
-        # 3-5 cümlelik akıcı bir rota tanıtımı yazdırıyoruz.
-        narrative_text = await _generate_trip_narrative(
-            origin=origin,
-            destination=request.destination,
-            total_km=total_km,
-            total_min=total_min,
-            eta_display=eta_display,
-            weather_warnings=weather_warnings,
-            radar_count=radar_count,
-            toll_info=toll_info,
-            food_markers=food_markers,
-            fuel_section_summary=fuel_section_summary,
-            custom_note=request.custom_note,
-            waypoint_labels=request.waypoint_labels,
-            break_markers=break_markers,
-            fuel_type=fuel_type,
-        )
+        # ── LLM Anlatımı: Curator yazdıysa onu kullan, yoksa legacy üretici ──
+        if curated_narrative:
+            narrative_text = curated_narrative
+        else:
+            narrative_text = await _generate_trip_narrative(
+                origin=origin,
+                destination=request.destination,
+                total_km=total_km,
+                total_min=total_min,
+                eta_display=eta_display,
+                weather_warnings=weather_warnings,
+                radar_count=radar_count,
+                toll_info=toll_info,
+                food_markers=food_markers,
+                fuel_section_summary=fuel_section_summary,
+                custom_note=request.custom_note,
+                waypoint_labels=request.waypoint_labels,
+                break_markers=break_markers,
+                fuel_type=fuel_type,
+            )
 
         # Fallback: LLM hata verirse mevcut deterministik özet
         if not narrative_text:
@@ -2404,34 +3841,40 @@ async def add_stops_to_trip(request: TripAddStopsRequest, user: dict = Depends(g
                     auto_break_stops = list(slot_best.values())
                     log.info(f"☕ [AddStops] Otomatik mola: {len(auto_break_stops)} nokta eklendi (slots={break_slots})")
 
-        # ── 4.5 Tüm waypoint'leri (kullanıcı seçimleri + otomatik molalar) birleştir ──
-        # auto_break_stops için passthrough YOK (driver gerçekten duruyor)
-        # user_waypoints için "!pt" marker → HERE passThrough=true (sahil/manzara yolu kopmasın)
+        # ── 4.5 Tüm waypoint'leri birleştir (13. Tur — passThrough KALDIRILDI)
+        # Eski mantık: kullanıcı seçimleri "!pt" (HERE passThrough=true) — "buradan
+        # geç ama durma" der. Pratikte HERE 2+ passThrough waypoint görünce
+        # rotayı OTOYOL'a (Bolu/Ankara) çekiyordu → Karadeniz sahili kopuyordu.
+        # Yeni: yemek/mola noktaları GERÇEK DURAK (driver duruyor) — !pt yok.
+        # HERE sahil yolundaki en kısa yolu seçer.
         auto_with_dist = [
-            (float(bs.get("distance_along_route_km") or 0), f"{bs['lat']},{bs['lon']}", bs, False)
+            (float(bs.get("distance_along_route_km") or 0), f"{bs['lat']},{bs['lon']}", bs)
             for bs in auto_break_stops
             if "lat" in bs and "lon" in bs
         ]
-        user_with_dist_marked = [
-            (d, w, s, True) for (d, w, s) in user_waypoints_with_dist
-        ]
-        all_stops_with_dist = user_with_dist_marked + auto_with_dist
+        all_stops_with_dist = [
+            (d, w, s) for (d, w, s) in user_waypoints_with_dist
+        ] + auto_with_dist
         all_stops_with_dist.sort(key=lambda x: x[0])
 
-        new_waypoints = [
-            (f"{w}!pt" if is_user else w)
-            for _, w, _, is_user in all_stops_with_dist
-        ]
-        # Eski waypoint'ler de büyük olasılıkla kullanıcı seçimi — passthrough işaretle
-        existing_marked = [
-            (w if w.endswith("!pt") else f"{w}!pt")
+        new_waypoints = [w for _, w, _ in all_stops_with_dist]
+        # Eski waypoint'lerden !pt marker'larını da SİL — passThrough yok
+        existing_clean = [
+            (w[:-3] if w.endswith("!pt") else w)
             for w in existing_coord_waypoints
         ]
-        combined_waypoints = existing_marked + new_waypoints
+        combined_waypoints = existing_clean + new_waypoints
         waypoints_str = "|".join(combined_waypoints)
 
         if not waypoints_str:
             raise ValueError("Geçerli koordinat bulunamadı.")
+
+        # 13. Tur — Origin/waypoint sırası log'la (Ankara bug debug için)
+        log.info(
+            f"🗺️ [AddStops] origin={origin!r} dest={destination!r} "
+            f"wp_sirali={[f'{d:.0f}km' for d, _, _ in all_stops_with_dist]} "
+            f"toplam_wp={len(combined_waypoints)}"
+        )
 
         # ── 5. Rotayı güncelle ────────────────────────────────────────────
         route_tool = orchestrator.get_tool_by_name("get_route_data")
@@ -2471,11 +3914,45 @@ async def add_stops_to_trip(request: TripAddStopsRequest, user: dict = Depends(g
                 orchestrator.redis_client.setex(f"route:{session_id}", 3600, polyline)
             if tc:
                 tc["waypoints"] = combined_waypoints
+                # ★ Kullanıcının POI sheet'ten seçtiği duraklar selected_stops'a
+                # eklensin — RouteDetail "Duraklar" listesinde gözükecek
+                _existing_sel = list(tc.get("selected_stops") or [])
+                _sel_seen = {
+                    (round(float(s.get("lat", 0)), 4),
+                     round(float(s.get("lon", 0)), 4))
+                    for s in _existing_sel if isinstance(s, dict)
+                }
+                for _us in (request.selected_stops or []):
+                    if not isinstance(_us, dict) or "lat" not in _us:
+                        continue
+                    try:
+                        _k = (round(float(_us["lat"]), 4),
+                              round(float(_us["lon"]), 4))
+                    except Exception:
+                        continue
+                    if _k in _sel_seen:
+                        continue
+                    _sel_seen.add(_k)
+                    _existing_sel.append({
+                        "lat": float(_us["lat"]),
+                        "lon": float(_us["lon"]),
+                        "title": _us.get("name") or _us.get("title"),
+                        "type": _us.get("type", "poi"),
+                        "snippet": _us.get("address") or _us.get("snippet"),
+                        "rating": _us.get("rating"),
+                        "distance_along_route_km": _us.get("distance_along_route_km"),
+                        "added_via_poi_sheet": True,
+                    })
+                tc["selected_stops"] = _existing_sel
                 orchestrator.redis_client.setex(f"trip_ctx:{session_id}", 3600 * 8, json.dumps(tc, ensure_ascii=False))
 
         # ── 6. Marker'ları hazırla (kullanıcı seçimleri + otomatik molalar) ──
         map_markers = []
-        all_displayed_stops = [s for _, _, s, _ in all_stops_with_dist]
+        all_displayed_stops = [s for _, _, s in all_stops_with_dist]
+        log.info(
+            f"🗺️ [AddStops] HERE sonucu: {total_km:.0f}km, "
+            f"polyline_len={len(polyline)}, expected_max ~600km for Karadeniz coast"
+        )
         for i, s in enumerate(all_displayed_stops):
             if "lat" not in s or "lon" not in s:
                 continue
@@ -2495,8 +3972,8 @@ async def add_stops_to_trip(request: TripAddStopsRequest, user: dict = Depends(g
         radar_count_ctx = int(tc.get("radar_count") or 0)
         _severe_ctx = any(w.get("severity") in ("warning", "critical") for w in weather_ctx)
 
-        food_cnt = sum(1 for _, _, s, _ in all_stops_with_dist if s.get("type") not in ("fuel_station", "break_stop"))
-        fuel_cnt = sum(1 for _, _, s, _ in all_stops_with_dist if s.get("type") == "fuel_station")
+        food_cnt = sum(1 for _, _, s in all_stops_with_dist if s.get("type") not in ("fuel_station", "break_stop"))
+        fuel_cnt = sum(1 for _, _, s in all_stops_with_dist if s.get("type") == "fuel_station")
         brk_cnt = len(auto_break_stops)
 
         parts = []
@@ -2532,7 +4009,7 @@ async def add_stops_to_trip(request: TripAddStopsRequest, user: dict = Depends(g
                     "kind": "origin", "name": origin, "address": origin,
                     "lat": None, "lon": None, "km": 0,
                 })
-                for _d, _w, _s, _is_user in all_stops_with_dist:
+                for _d, _w, _s in all_stops_with_dist:
                     if "lat" not in _s or "lon" not in _s:
                         continue
                     stype = _s.get("type", "waypoint")
@@ -2563,7 +4040,7 @@ async def add_stops_to_trip(request: TripAddStopsRequest, user: dict = Depends(g
                     username=user["username"],
                     polyline_encoded=polyline,
                     waypoints=combined_waypoints,
-                    waypoint_labels=[s.get("name", "") for _, _, s, _ in all_stops_with_dist],
+                    waypoint_labels=[s.get("name", "") for _, _, s in all_stops_with_dist],
                     weather_summary=None,
                     warnings=weather_ctx or None,
                     narrative=None,

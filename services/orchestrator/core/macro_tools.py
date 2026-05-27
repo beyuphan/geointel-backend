@@ -170,6 +170,8 @@ class RouteStrategyEvaluator:
         fuel_range: Optional[float] = None,
         polyline: Optional[str] = None,
         total_dist_km: Optional[float] = None,
+        anchor_at_start: bool = False,
+        anchor_at_end: bool = False,
     ) -> Dict[str, Any]:
         """
         İlçe-bazlı yakıt önerisi:
@@ -233,18 +235,50 @@ class RouteStrategyEvaluator:
         cur_km = 0.0
         iteration_safety = 0
 
+        # 10. Tur — Iteration sınırını dinamik yap: rota uzunluğu / menzil + 1
+        # Eski: sabit 6 — uzun rotalarda fazla, kısa rotalarda yeterli
+        # Yeni: 600km/400km = 2, 1200km/400km = 4 — gerçek ihtiyaca göre
+        _max_iter = max(2, int(total_dist / max(float(fuel_range) or 400.0, 200.0)) + 1)
+
         # Tek bir httpx client'ı tüm reverse-geocode çağrıları için paylaş
         nom_headers = {"User-Agent": "GeoIntel_Orchestrator/4.0"}
         async with httpx.AsyncClient(headers=nom_headers) as nom_client:
-            while cur_km + 20 < total_dist and iteration_safety < 6:
+            while cur_km + 20 < total_dist and iteration_safety < _max_iter:
                 iteration_safety += 1
                 segment_end = min(cur_km + safe_max, total_dist - 5)
+
+                # 14. Tur — Kullanıcı "yolun başında yakıt" dediyse ilk
+                # segment'i 60 km'ye sınırla (segment'in EN UCUZ ilçesi
+                # genelde 100-160 km'ye düşüyordu; bu mantığı bozar).
+                if anchor_at_start and iteration_safety == 1:
+                    segment_end = min(cur_km + 60, segment_end)
+                    log.info(
+                        f"⛽ [Fuel/anchor=start] İlk segment 60km'ye sınırlandı"
+                    )
+                # 14. Tur — "Sona doğru yakıt" → son segment'te varış
+                # öncesi 60 km'lik aralıkta ara
+                if anchor_at_end and iteration_safety > 1:
+                    # Eğer şu anki segment varış'tan uzaksa atla — sadece
+                    # son segment için anchor uygula
+                    distance_to_end = total_dist - cur_km
+                    if distance_to_end > 100:
+                        # Henüz son segment değil, normal akış
+                        pass
+                    else:
+                        # Son segment — son 60 km'yi tara
+                        segment_end = min(cur_km + 60, total_dist - 5)
+                        log.info(
+                            f"⛽ [Fuel/anchor=end] Son segment 60km'ye sınırlandı"
+                        )
+
                 if segment_end - cur_km < 40:
                     # Çok kısa segment → son dolum gerekmez
                     break
 
-                # 2a. Polyline'ı örnekle (ilk 30km'de dolum aramaya gerek yok)
-                sample_start = cur_km + 30
+                # 2a. Polyline'ı örnekle
+                # 10. Tur — sample_start 30→5: yol başında (Atakum çıkışı,
+                # Tekkeköy/Çarşamba) istasyon önerebilelim
+                sample_start = cur_km + 5
                 if sample_start >= segment_end:
                     break
                 samples = _sample_polyline_at_km(
@@ -261,8 +295,10 @@ class RouteStrategyEvaluator:
                         key = (rg["city"], rg["district"])
                         if key not in unique_districts:
                             unique_districts[key] = s
-                    # Nominatim rate limit (1 req/sec) — cache hit'ler atlar
-                    await asyncio.sleep(0.4)
+                    # 10. Tur — Nominatim rate limit gevşetildi (0.4→0.1).
+                    # Cache hit oranı yüksek; gerçek API hit'lerde 0.1 yine
+                    # 10 req/sec limitini aşmaz.
+                    await asyncio.sleep(0.1)
 
                 if not unique_districts:
                     log.warning(
@@ -311,6 +347,29 @@ class RouteStrategyEvaluator:
                         })
 
                 district_min.sort(key=lambda x: x["min_price"])
+                # Anchor filter (refactor): "yolun başında" derse en ucuz olsa bile
+                # 80km dışındaki ilçeleri at; "sonlara doğru" derse varış öncesi 80km dışı at.
+                if anchor_at_start and iteration_safety == 1:
+                    _filtered = [d for d in district_min if d["sample"]["km"] <= 80]
+                    if _filtered:
+                        district_min = _filtered
+                        log.info(
+                            f"⛽ [Fuel/anchor=start] İlçe filtresi: "
+                            f"{len(district_min)} ilçe ≤80km'de kaldı"
+                        )
+                if anchor_at_end and iteration_safety > 1:
+                    distance_to_end = total_dist - cur_km
+                    if distance_to_end <= 100:
+                        _filtered = [
+                            d for d in district_min
+                            if d["sample"]["km"] >= total_dist - 80
+                        ]
+                        if _filtered:
+                            district_min = _filtered
+                            log.info(
+                                f"⛽ [Fuel/anchor=end] İlçe filtresi: "
+                                f"{len(district_min)} ilçe son 80km'de kaldı"
+                            )
                 cheap_districts = district_min[:3]
 
                 if not cheap_districts:
