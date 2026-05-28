@@ -50,6 +50,11 @@ Bolu (Mengen/Gerede), Sakarya (Düzce/Hendek), Kocaeli (Kartepe), İstanbul.
      ⚠️ BÜYÜK İLÇE TERCİH ET: Of/Araklı/Çayeli gibi KÜÇÜK kasabalar yerine
      Trabzon Merkez/Sürmene/Rize Merkez gibi MERKEZ/BÜYÜK ilçeler seç. Google
      Places küçük yerlerde sonuç döndüremez → search timeout/fallback yaşanır.
+   - route_fraction: 0.0-1.0 arası float — bu stop rotanın yüzde kaçında?
+       anchor="home_proximity" → 0.05
+       anchor="start" → 0.10
+       anchor="end" → 0.95
+       ortada → rota konumuna göre (300km'de 0.5, 280km'de 0.47 vb.)
    - query_hint: Google Places'e gidecek query (KISA + spesifik olsun)
        ✅ "pideci"   ✅ "köfteci"   ✅ "balıkçı iskele"   ✅ "sahil çay bahçesi"
        ✅ "manzara seyir"   ✅ "benzin"
@@ -63,7 +68,7 @@ Bolu (Mengen/Gerede), Sakarya (Düzce/Hendek), Kocaeli (Kartepe), İstanbul.
 
 3. YÖRESEL LEZZET ZEKASI KULLAN — kullanıcı food_specific belirtmediyse:
    - Akçaabat → köfte         - Bafra → pide               - Mengen (Bolu) → yöresel/aşçılık
-   - Sakarya → ıslak hamburger - Rize → çay/balık          - Ordu → balık
+   - Sakarya → ıslak hamburger - Rize → çay/balık          - Ordu → kavurma/balık
    - Trabzon → lahmacun/balık  - Konya → fırın kebabı      - Şanlıurfa → çiğ köfte
    - Tokat → kebap             - Mersin → tantuni          - Adana → kebap
    - Gaziantep → baklava/lahmacun                          - Antep → katmer
@@ -95,44 +100,87 @@ Bolu (Mengen/Gerede), Sakarya (Düzce/Hendek), Kocaeli (Kartepe), İstanbul.
    "ORTALAR" (food_location="Ortaları"): %40-60 arası.
 
 5. STOP SAYISI — KULLANICI TERCİHİ ÖNCELİKLİ (KESİN):
-   ⚠️ SADECE kullanıcının açıkça ifade ettiği duraklar üret. **GEREKSIZ EK
-      DURAK ÜRETMEK YASAK**.
+   ⚠️ SADECE kullanıcının açıkça ifade ettiği duraklar üret.
 
-   - food_specific dolu → **1 food stop** (food_location'a göre)
-   - custom_note'ta "yolun başında yakıt"/"evime yakın yakıt" → **1 fuel**
-     (anchor="home_proximity")
+   ─── YEMEk ───
+   food_specific'i TAM OLARAK oku — her bir yiyecek+konum çifti için AYRI stop üret:
+
+   PATTERN A — TEK YEMEK ("kavurma", "pide", "balık"):
+     → 1 food stop, food_location veya food_preference'a göre konum belirle.
+
+   PATTERN B — KONUM'LU ÇOKLU YEMEK ("ortada pide, sonlarda cağ kebap"):
+     → 2 AYRI food stop üret. Konum anahtar kelimeleri:
+       "ortada/ortaları/rotanın ortasında" → route_fraction=0.50, anchor=null
+       "sonlarda/sona doğru/yolun sonu/varmadan" → route_fraction=0.82, anchor="end"
+       "başlarda/başa doğru/yolun başında" → route_fraction=0.12, anchor="start"
+       ŞEHİR ADI ("Trabzon'da pide", "Ordu'da kavurma") → city=o şehir
+     ÖRNEK: food_specific="ortada pide, sonlarda cağ kebap", rota=500km, passing=Samsun/Giresun/Trabzon/Artvin
+       → STOP_A: role=food, query_hint="pide", city="Giresun", district="Görele",
+                 route_fraction=0.50, anchor=null
+       → STOP_B: role=food, query_hint="cağ kebap", city="Artvin", district="Merkez",
+                 route_fraction=0.82, anchor="end"
+
+   ⚠️ PATTERN B kuralı: food_specific'te "ortada X" veya "sonlarda X" veya "başlarda X" varsa
+      MUTLAKA 2 stop üret. food_location alanını görmezden gel.
+
+   food_location bir şehir adıysa (Rize, Trabzon, Ordu...) → o şehri city/district olarak yaz.
+   food_location "Başları"/"Ortaları"/"Sonları" ise → rota %20/%50/%80'inde uygun ilçe seç.
+
+   ─── YAKIT ───
+   - custom_note'ta "yolun başında yakıt"/"evime yakın yakıt" → **1 fuel** (anchor="home_proximity")
    - custom_note'ta "sonlara doğru yakıt"/"varmadan yakıt" → **1 fuel** (anchor="end")
-   - custom_note'ta İKİSİ DE varsa → 2 fuel (biri start, biri end)
-   - scene_filters dolu ('manzaralı','sahil',...) → **1 scenic stop**
-   - break_interval_hours > 0 VE total_km > 300 → **1 break stop**
+   - custom_note'ta İKİSİ DE varsa → 2 fuel
 
-   ⛔ **ASLA varsayılan "minimum 1 fuel zorunlu", "200km+ için 2 fuel" gibi
-      ekleme yapma**. Kullanıcı tek yakıt istiyorsa tek üret. Hiç yakıt
-      istemediyse hiç üretme.
+   ⛔ **ASLA varsayılan yakıt durağı EKLEME**. Kullanıcı istemediyse üretme.
 
-   EKSTRA OTOMATIK MOLA İSTİSNASI:
-   - Eğer iki ardışık stop arası >250km mesafe varsa VE break_interval_hours > 0
-     ise, EK olarak 1 dinlenme tesisi ekle (uzun yolda mola için).
-   - Aksi halde kullanıcı ne dediyse o kadar.
+   ⛽ ACİL YAKIT KURALI (KESİN — KULLANICI YAZMASA DA UYGULA):
+      kalan_menzil / total_km < 0.25 → MUTLAKA 1 fuel stop (anchor="home_proximity",
+      city=origin il'i, district=origin'e yakın ilçe, query_hint="benzin istasyonu",
+      route_fraction=0.04).
+      Örnek: kalan=50km, rota=433km → %11.5 < %25 → ZORUNLU.
+      Örnek: kalan=100km, rota=500km → %20 < %25 → ZORUNLU.
+      Örnek: kalan=200km, rota=300km → %66 → EKLEME.
+      ⚠️ Bu stop'ta city = origin'in ili, district = origin'e yakın ilçe OLMALI.
+      ASLA rotanın ortasındaki bir şehri seçme.
 
-   ÖRNEK 1: food_specific="pide", custom_note="yolun başında yakıt, sonlarda pide"
-   → 2 stop: 1 fuel home_proximity (Samsun) + 1 food end (Sürmene/Rize ilçesi)
+   ─── MOLA (BREAK) ─── ← SCENIC'TEN TAMAMEN BAĞIMSIZ
+   - break_interval_hours > 0 VE total_km > 300 → break stop ZORUNLU:
+     * total_km 300–600  → **1 break stop** (rotanın %50'sinde)
+     * total_km 600–900  → **2 break stop** (rotanın %33 ve %66'sında)
+     * total_km 900+     → **3 break stop** (rotanın %25, %50, %75'inde)
+     break_interval_hours ≤ 1.5 ise her adımda +1 ekle (kısa intervalda daha sık mola).
+     query_hint: "dinlenme tesisi" veya "mola noktası" veya "çay bahçesi mola"
+     ⚠️ SCENIC STOP VARSA BİLE ayrıca break_stop ekle — ikisi FARKLI duraklar.
 
-   ÖRNEK 2: food_specific="pide", custom_note="" (boş), scene_filters=[], break=0
-   → 1 stop: 1 food (food_location'a göre)
+   ─── MANZARA ───
+   - scene_filters dolu ('manzaralı','sahil','dağ',...) → **1 scenic stop**
+     (break_stop varsa AYRI bir scenic stop — break = mola yeri, scenic = manzara)
 
-   ÖRNEK 3: hiçbir tercih yok, custom_note="" → 0 stop (sadece narrative)
+   ÖRNEK: food_specific="ortada pide, sonlarda cağ kebap", kalan=100km, rota=550km, break=0
+   → 1 fuel(home_prox,Samsun) + 1 food_pide(Giresun,%50) + 1 food_cağkebap(Artvin,%82) = 3 stop
 
-   food_specific belirtilmişse o yemek için EN İYİ ilçe (Türkiye lezzet haritası).
+   ÖRNEK: food_preference="kavurma", food_location="Ordu", break=2h, scene=['manzaralı'],
+          kalan=50km, rota=836km
+   → 1 fuel(home_prox) + 1 food(Ordu) + 2 break(280km,560km) + 1 scenic = 5 stop
 
-5. NARRATIVE: **300-500 kelime**, Türkçe samimi imperative ton.
+   ÖRNEK: food_specific="pide", custom_note="yolun başında yakıt", break=0, rota=300km
+   → 2 stop: 1 fuel(home_prox) + 1 food
+
+   ─── FOOD_LOCATION ROTADA DEĞİLSE ───
+   food_location bir şehir adıysa VE passing_cities içinde YOK ise:
+   - Yine de food stop oluştur — o şehri istedi, alternatif öner.
+   - Narrative'de şunu yaz: "Rize rotanızda değil — ancak {{STOP_X}}'de de yöresel
+     lezzetler sizi bekliyor." (şehir adını belirt, kullanıcıyı bilgilendir)
+   - Sapma notu: "Rize'ye gitmek rota uzunluğunu yaklaşık 30-40 km artırır."
+
+6. NARRATIVE: **300-500 kelime**, Türkçe samimi imperative ton.
    ÖRNEK: "Yola çıkar çıkmaz **{{STOP_1}}**'de depoyu doldur. 280. km'de \
 **{{STOP_2}}**'de yöresel pide molası ver — bafra pidesi meşhurdur. \
 Sonra Bolu girişinde **{{STOP_3}}** manzarasıyla 15 dk kahve. Varış öncesi \
 **{{STOP_4}}**'de son dolum, sonra İstanbul trafiğine takıl."
 
    - Mekan adlarını {{STOP_N}} placeholder olarak yaz (BACKEND replace EDECEK).
-   - Km bilgisi yaz (LLM tahmini OK — backend gerçek km ile düzelterekek).
+   - Km bilgisi yaz (LLM tahmini OK — backend gerçek km ile düzelterek).
    - Hava durumu uyarısını il-bazlı yaz: "Samsun-Amasya arası yağmurlu, ön farını aç."
    - "Güvenli yolculuklar" tarzı son cümle 1 kez OK.
 
@@ -144,7 +192,7 @@ STRICT JSON object — markdown sarmalı YOK, başka metin YOK:
   "passing_cities": ["Samsun","Amasya","Çorum","Bolu","Sakarya","İstanbul"],
   "stops": [
     {"role":"fuel","city":"Samsun","district":"Atakum","query_hint":"benzin istasyonu",
-     "anchor":"home_proximity","rationale":"yola çıkar çıkmaz, eve yakın",
+     "route_fraction":0.05,"anchor":"home_proximity","rationale":"yola çıkar çıkmaz, eve yakın",
      "narrative_token":"STOP_1"},
     ...
   ],

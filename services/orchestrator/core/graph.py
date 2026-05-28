@@ -109,10 +109,20 @@ async def agent_node(state: AgentState):
         "ekle", "uğrayalım", "uğra", "durup", "durak ekle", "yolda dur",
         "rotaya ekle", "molamızı ekle", "molamı ekle", "şuna da uğrayalım",
     )
-    must_call_tool = (
-        has_active_route
-        and any(k in last_user_msg for k in _ADD_STOP_KEYWORDS)
+    is_waypoint_add = has_active_route and any(k in last_user_msg for k in _ADD_STOP_KEYWORDS)
+
+    # X'ten Y'ye yakıt sorgusu — evaluate_route_strategy ZORUNLU
+    _FUEL_ROUTE_FUEL_KWS = ("mazot", "motorin", "benzin", "yakıt", "lpg", "akaryakıt")
+    _FUEL_ROUTE_INDICATORS = (
+        "den ", "dan ", "ten ", "tan ",
+        "konumdan", "konumumdan", "konumundan", "buradan", "giderken",
     )
+    is_fuel_route = (
+        any(k in last_user_msg for k in _FUEL_ROUTE_FUEL_KWS)
+        and any(k in last_user_msg for k in _FUEL_ROUTE_INDICATORS)
+    )
+
+    must_call_tool = is_waypoint_add or is_fuel_route
 
     def _resp_has_tool_calls(resp) -> bool:
         tc = getattr(resp, "tool_calls", None)
@@ -128,20 +138,32 @@ async def agent_node(state: AgentState):
 
             # Tool çağrısı zorunlu ama LLM atladıysa: 1 kez daha tetikle
             if must_call_tool and not _resp_has_tool_calls(response) and attempt == 0:
-                log.warning(
-                    f"⚠️ [Agent] 'ekle/durak' niyeti var ama tool çağrılmamış — "
-                    f"force-retry. text preview: {str(response.content)[:120]!r}"
-                )
-                # Sistem prompt'una sert hatırlatma ekle
-                force_msg = SystemMessage(content=(
-                    "⚠️ ZORUNLU: Kullanıcı rotaya durak/mola eklemek istiyor. "
-                    "ASLA tool çağırmadan cevap yazma. ŞİMDİ önce "
-                    "`search_hybrid_places(query='...', route_polyline='LATEST')` "
-                    "ile yeni durağın koordinatını bul, sonra "
-                    "`get_route_data(origin='CURRENT_LOCATION', destination='<MEVCUT_HEDEF>', "
-                    "waypoints='<ESKİ_WP>|<YENİ_LAT,LON>')` ile rotayı güncelle. "
-                    "Bu iki tool çağrısını YAP, sonra cevap yaz."
-                ))
+                if is_fuel_route:
+                    log.warning(
+                        f"⚠️ [Agent] Yakıt-rota niyeti var ama tool çağrılmamış — "
+                        f"force-retry. text: {str(response.content)[:120]!r}"
+                    )
+                    force_msg = SystemMessage(content=(
+                        "⚠️ ZORUNLU: Kullanıcı güzergah üstü EN UCUZ yakıt soruyor. "
+                        "ASLA düz metin yazma — ŞİMDİ `evaluate_route_strategy` tool çağrısı yap. "
+                        "Parametreler: origin=başlangıç şehri, destination=hedef şehir, fuel_type=yakıt tipi. "
+                        "`get_fuel_prices` KULLANMA — o sadece tek bir nokta için çalışır, "
+                        "güzergah analizi yapmaz. evaluate_route_strategy rotayı KENDİ HESAPLAR."
+                    ))
+                else:
+                    log.warning(
+                        f"⚠️ [Agent] 'ekle/durak' niyeti var ama tool çağrılmamış — "
+                        f"force-retry. text preview: {str(response.content)[:120]!r}"
+                    )
+                    force_msg = SystemMessage(content=(
+                        "⚠️ ZORUNLU: Kullanıcı rotaya durak/mola eklemek istiyor. "
+                        "ASLA tool çağırmadan cevap yazma. ŞİMDİ önce "
+                        "`search_hybrid_places(query='...', route_polyline='LATEST')` "
+                        "ile yeni durağın koordinatını bul, sonra "
+                        "`get_route_data(origin='CURRENT_LOCATION', destination='<MEVCUT_HEDEF>', "
+                        "waypoints='<ESKİ_WP>|<YENİ_LAT,LON>')` ile rotayı güncelle. "
+                        "Bu iki tool çağrısını YAP, sonra cevap yaz."
+                    ))
                 messages = [SystemMessage(content=sys_prompt), force_msg] + state["messages"]
                 continue  # bir sonraki attempt'te yeniden çağır
 
@@ -451,6 +473,10 @@ def _build_marker(p: dict) -> dict:
         "review_count":            p.get("review_count"),
         "price_level":             p.get("price_level"),
         "phone":                   p.get("phone"),
+        # evaluate_route_strategy tarafından eklenen yakıt fiyatı.
+        # _build_poi_overlay m.get("fuel_price") okur → aynı isimde geçir.
+        # Flutter'ın beklediği field fuel_price_info; _build_poi_overlay oraya map'ler.
+        "fuel_price":              p.get("fuel_price"),
     }
 
 

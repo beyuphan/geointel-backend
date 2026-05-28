@@ -68,6 +68,16 @@ Kullanıcı bir yere gitmek istiyor veya rotayla ilgili bir şey soruyor.
   "ekleniyor", "güncelleniyor", "ekledim" gibi cümleler tool çağrısı YAPMADAN
   asla yazılmaz — kullanıcı haritada güncelleme bekliyor.
 
+🔑 YAKITLI ROTA — KESİN KURAL:
+  Kullanıcı "X'ten Y'ye mazot/benzin nerede?" veya "X'ten Y'ye en ucuz yakıt" diyorsa:
+  → evaluate_route_strategy TOOL ÇAĞRISI YAP. get_fuel_prices ASLA KULLANMA!
+  evaluate_route_strategy rotayı KENDİ HESAPLAR; güzergah üstündeki tüm ilçeleri
+  tarar, fiyatları karşılaştırır ve en ucuz istasyonu döner. TEXT OLARAK YAZMA.
+
+  Tool parametreleri: origin=başlangıç_şehri, destination=hedef_şehri, fuel_type=yakıt_tipi
+  Başlangıç: "Kadirliden"→"Kadirli", "konumumdan"→"CURRENT_LOCATION"
+  Yakıt tipi: mazot/motorin→"motorin", benzin→"benzin", lpg→"lpg"
+
 ADIM 1 — Temel Rotayı Çiz:
   `get_route_data(origin="CURRENT_LOCATION", destination="[HEDEF]")` çağır.
   Yanıt: "Rotan hazır kanka! [X] km, yaklaşık [Y] saat [Z] dk."
@@ -138,11 +148,14 @@ POLYLINE KURALLAR:
     "fuel": """━━━ YAKIT MODU ━━━
 Kullanıcı yakıt fiyatı veya benzin istasyonu soruyor.
 
-- Aktif rota VARSA → `evaluate_route_strategy` kullan (rota üstü analiz).
-  fuel_type'ı kullanıcı profilinden al: gasoline→"benzin", diesel→"motorin", lpg→"lpg"
-- Sadece fiyat soruyorsa → `get_fuel_prices(city="[ŞEHİR]", district="[İLÇE]")` kullan.
+⚠️ X'TEN Y'YE GÜZERGAH SORGUSU (iki şehir varsa):
+  → SADECE `evaluate_route_strategy(origin="[X]", destination="[Y]", fuel_type="...")` kullan.
+  → `get_fuel_prices` KULLANMA — o sadece tek noktanın fiyatını verir, güzergahı görmez.
+
+- Tek şehir / sadece fiyat soruyorsa → `get_fuel_prices(city="[ŞEHİR]", district="[İLÇE]")` kullan.
   Koordinat verme! Şehir ve ilçeyi tahmin et.
-- Benzin istasyonu bulmak istiyorsa → `search_hybrid_places(query="benzin istasyonu", lat=..., lon=...)` kullan.
+- Benzin istasyonu konumu istiyorsa → `search_hybrid_places(query="benzin istasyonu", lat=..., lon=...)` kullan.
+- Aktif rota VARSA → `evaluate_route_strategy` kullan (rota üstü analiz).
 
 Yanıt: "[Şehir]'de en ucuz [yakıt]: [fiyat] TL/L. Rotandaki en iyi nokta [yer]."
 """,
@@ -246,6 +259,7 @@ def classify_intent(message: str) -> dict:
         "mesafe", "süre", "ne kadar sürer", "kaç km", "yolculuk", "seyahat",
         "giderken", "gidiyorum", "geçeceğim", "durak", "waypoint", "mola",
         "her şehirde", "arası", "dan ", " a git", " e git",
+        "konumdan", "konumumdan", "konumundan", "buradan",
     ]):
         category = "routing"
 
@@ -285,8 +299,15 @@ def classify_intent(message: str) -> dict:
     ]):
         category = "places"
 
-    # Multi-intent: rota + mekan → routing
-    has_route = any(k in msg for k in ["rota", "giderken", "yolculuk", "seyahat", "yolda"])
+    # Multi-intent: rota + mekan/yakıt → routing
+    # "den "/"tan "/"ten " → Türkçe ayrılma hali (Kadirliden, Ankaradan, vb.)
+    # "a ", "e " → dativ eki (Maraşa, Ankara'ya) — tek başına çok geniş, sadece
+    # diğer route göstergeleriyle birlikte has_route içinde kullanıyoruz.
+    has_route = any(k in msg for k in [
+        "rota", "giderken", "yolculuk", "seyahat", "yolda",
+        "konumdan", "konumumdan", "konumundan", "buradan",
+        "den ", "dan ", "ten ", "tan ",   # ayrılma hali: X'ten/X'tan/X'den/X'dan
+    ])
     if has_route and category in ("places", "fuel"):
         category = "routing"
 

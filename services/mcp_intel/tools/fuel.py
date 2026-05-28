@@ -122,23 +122,32 @@ class FuelScraper:
             log.error(f"🔥 [HATA] {url} -> {e}")
             return None
 
+    # Türkiye'de 2025+ için gerçekçi minimum fiyat eşiği (TL/L).
+    # Scraper yanlış hücre parse ederse saçma düşük değer gelir; bunu filtrele.
+    MIN_VALID_PRICE = 28.0
+
     async def get_district_prices(self, city: str, district: str) -> list:
         results = []
         log.info(f"🚀 [V3] {city}/{district} Taraması Başlıyor (httpx — Playwright YOK)...")
-        
+
         # V3.5: Paylaşımlı httpx client ile paralel istek
         async with httpx.AsyncClient(headers=self.HEADERS, follow_redirects=True) as client:
             tasks = [self._get_firm_price(client, city, district, firm) for firm in self.FIRMS]
             raw_results = await asyncio.gather(*tasks)
-            
+
             for i, raw in enumerate(raw_results):
                 firm = self.FIRMS[i]
                 if raw:
                     benzin = self._parse_price(raw.get('benzin'))
                     motorin = self._parse_price(raw.get('motorin'))
                     lpg = self._parse_price(raw.get('lpg'))
-                    
-                    if benzin > 10:
+
+                    valid = benzin >= self.MIN_VALID_PRICE or (motorin >= self.MIN_VALID_PRICE and motorin > 0)
+                    if not valid:
+                        log.warning(f"⚠️ [GEÇERSİZ FİYAT] {firm}: benzin={benzin}, motorin={motorin} — MIN_VALID_PRICE altında, atlandı.")
+                        continue
+
+                    if valid:
                         results.append({
                             "firma": firm.title(),
                             "benzin": benzin,

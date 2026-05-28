@@ -213,10 +213,11 @@ class DBHelper:
         pool = get_pool()
         async with pool.acquire() as conn:
             query = """
-                SELECT company as firma, gasoline as benzin, diesel as motorin, lpg 
-                FROM fuel_prices 
+                SELECT company as firma, gasoline as benzin, diesel as motorin, lpg,
+                       updated_at
+                FROM fuel_prices
                 WHERE city = $1 AND district = $2
-                AND updated_at >= NOW() - INTERVAL '24 hours'
+                AND updated_at >= NOW() - INTERVAL '7 days'
                 ORDER BY gasoline ASC
             """
             rows = await conn.fetch(query, city.lower(), district.lower())

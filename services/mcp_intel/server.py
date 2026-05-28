@@ -1,7 +1,8 @@
 import json
 import sys
+from datetime import datetime, timezone
 from fastmcp import FastMCP
-from contextlib import asynccontextmanager 
+from contextlib import asynccontextmanager
 from loguru import logger
 
 # Helper & Tools
@@ -142,17 +143,28 @@ async def get_fuel_prices(city: str, district: str) -> str:
     # 1. DB
     data = await DBHelper.read_fuel_prices(city, district)
     if data:
-        # DB verisini modele uydur
+        # DB verisini modele uydur; 6+ saat eskiyse LLM'e yaş uyarısı ekle
         mapped = []
+        cache_note = None
+        updated_at = data[0].get("updated_at")
+        if updated_at:
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            age_hours = (datetime.now(timezone.utc) - updated_at).total_seconds() / 3600
+            if age_hours > 6:
+                cache_note = f"Bu fiyatlar yaklaşık {int(age_hours)} saat önce güncellendi, anlık fiyat değişmiş olabilir."
         for d in data:
-            mapped.append({
+            entry = {
                 "company": d.get("firma"),
                 "gasoline": float(d.get("benzin", 0)),
                 "diesel": float(d.get("motorin", 0)),
                 "lpg": float(d.get("lpg", 0)),
                 "district": district,
-                "city": city
-            })
+                "city": city,
+            }
+            if cache_note:
+                entry["_cache_note"] = cache_note
+            mapped.append(entry)
         return create_response(mapped, FuelPrice)
     
     # 2. Canlı

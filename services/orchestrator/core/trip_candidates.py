@@ -629,14 +629,14 @@ def deterministic_select_from_pools(
 # Daha az çağrı (sadece N stop), daha hızlı (12s timeout/her biri paralel).
 # ─────────────────────────────────────────────────────────────────────────────
 
-TARGETED_TIMEOUT_S = float(os.getenv("TRIP_TARGETED_TIMEOUT_S", "15.0"))
+TARGETED_TIMEOUT_S = float(os.getenv("TRIP_TARGETED_TIMEOUT_S", "25.0"))
 
 
 def _default_query_for_role(role: str) -> str:
     return {
         "fuel": "benzin istasyonu",
         "food": "restoran lokanta",
-        "break": "kafe mola",
+        "break": "dinlenme tesisi çay bahçesi mola",
         "scenic": "manzara seyir noktası",
     }.get(role, "restoran")
 
@@ -645,7 +645,7 @@ def _generic_fallback_query(role: str) -> str:
     return {
         "fuel": "benzin",
         "food": "lokanta",
-        "break": "kafe",
+        "break": "çay bahçesi",
         "scenic": "seyir",
     }.get(role, "yer")
 
@@ -738,6 +738,17 @@ async def _enrich_fuel_price(
         if not isinstance(raw, dict):
             return None
         prices = raw.get("data") or raw.get("prices") or []
+        # İlçe araması boş döndüyse il seviyesinde dene
+        if not prices and district and city and district != city:
+            _args_city = {"city": city}
+            try:
+                _raw2 = await asyncio.wait_for(fuel_tool.ainvoke(_args_city), timeout=8.0)
+                if isinstance(_raw2, str):
+                    _raw2 = json.loads(_raw2)
+                if isinstance(_raw2, dict):
+                    prices = _raw2.get("data") or _raw2.get("prices") or []
+            except Exception:
+                pass
         if not prices:
             return None
         st_name = (station.get("name") or "").lower().replace(" ", "")
@@ -760,13 +771,13 @@ async def _enrich_fuel_price(
                 "district": district,
                 "price_label": f"{ppl:.2f} ₺/L",
             }
-        # Brand match yoksa ilçe ortalaması
+        # Brand match yoksa ilçe ortalaması — company+price dolu tut
         valid = [p.get(price_key) for p in prices if isinstance(p.get(price_key), (int, float))]
         if valid:
             avg = sum(valid) / len(valid)
             return {
-                "price_per_liter": None,
-                "company": None,
+                "price_per_liter": round(avg, 2),
+                "company": f"{district or city} ort.",
                 "fuel_type": fuel_type,
                 "city": city,
                 "district": district,
@@ -792,8 +803,31 @@ async def _resolve_one_stop(
     role = stop.get("role") or "food"
     city = (stop.get("city") or "").strip()
     district = (stop.get("district") or "").strip()
+
+    # Geçersiz şehir tespiti: virgül içeriyorsa veya çok uzunsa LLM food_specific'i
+    # yanlışlıkla city olarak koymuş demektir — temizle.
+    def _is_valid_city(s: str) -> bool:
+        return bool(s) and len(s) <= 30 and "," not in s and not any(
+            kw in s.lower() for kw in ("ortada", "sonlarda", "başlarda", "pide", "kebap", "lokanta")
+        )
+
+    if not _is_valid_city(city):
+        city = ""
+    if not _is_valid_city(district):
+        district = ""
+
     location_name = district or city
     query = (stop.get("query_hint") or "").strip() or _default_query_for_role(role)
+    # Food query'si tek kelime yiyecek adı ise "lokanta" ekle (Google Places için)
+    _VENUE_SUFFIXES = {"lokanta", "restoran", "restaurant", "kafe", "cafe", "evi",
+                       "pideci", "köfteci", "balıkçı", "büfe", "kebapçı", "iskele"}
+    if role == "food" and query and not any(query.lower().endswith(v) for v in _VENUE_SUFFIXES):
+        query = query + " lokanta"
+    # Food + spesifik şehir: şehir adını query'ye ekle → Google sonuçları o ile odaklanır
+    # (50km radius Ordu→Giresun'u da kapsıyor, city bias ile doğru ile kısıtlarız)
+    _food_city_for_query = city or (district if district != city else "")
+    if role == "food" and _food_city_for_query and _food_city_for_query.lower() not in query.lower():
+        query = f"{query} {_food_city_for_query}"
     anchor = stop.get("anchor")
     narrative_token = stop.get("narrative_token") or ""
 
@@ -801,31 +835,29 @@ async def _resolve_one_stop(
     if not places_tool:
         return None
 
-    # ★ Yakıt + home_proximity: ev koordinatı + rota intersect
-    use_home_proximity = (
-        role == "fuel"
-        and anchor == "home_proximity"
-        and current_lat is not None
-        and current_lon is not None
-    )
-
     base_args: Dict[str, Any] = {"query": query}
     if polyline:
+        # ★ route_polyline + target_fraction kullan — location_name geocoding'i
+        # çok yavaş (25s+ timeout). Polyline Redis'te cache'li → çok daha hızlı.
+        # Food için city adını query'ye ekliyoruz (bias), polyline pozisyon sağlar.
         base_args["route_polyline"] = polyline
-    if use_home_proximity:
-        # ★ Google handler route_polyline varsa lat/lon'u görmezden gelir.
-        # Bu yüzden hem lat/lon hem target_fraction=0.03 (rotanın başı = eve yakın)
-        # geçeriz. Search rotanın ilk %3'ünde yapılır, sonuçlar eve yakın olur.
-        base_args["lat"] = current_lat
-        base_args["lon"] = current_lon
-        base_args["target_fraction"] = 0.03
+        # Kesir: anchor="home_proximity" → her zaman rotanın başı (LLM'in fraction'ı yanlış olabilir)
+        if anchor == "home_proximity":
+            _target_frac = 0.04
+        else:
+            _raw_frac = stop.get("route_fraction")
+            if isinstance(_raw_frac, (int, float)) and 0.0 <= float(_raw_frac) <= 1.0:
+                _target_frac = float(_raw_frac)
+            elif anchor == "end":
+                _target_frac = 0.95
+            elif anchor == "start":
+                _target_frac = 0.05
+            else:
+                _target_frac = 0.5
+        base_args["target_fraction"] = _target_frac
     elif location_name:
+        # polyline yoksa (kısa rotalar) location_name ile fallback
         base_args["location_name"] = location_name
-        # Anchor=end ise rotanın sonuna yakın arama (varış öncesi)
-        if anchor == "end":
-            base_args["target_fraction"] = 0.95
-        elif anchor == "start":
-            base_args["target_fraction"] = 0.05
 
     async def _call(args: Dict[str, Any]) -> List[Dict[str, Any]]:
         try:
@@ -847,14 +879,16 @@ async def _resolve_one_stop(
         log.info(f"🔁 [Targeted] {role} 0 sonuç, fallback query='{fb_args['query']}'")
         raw_places = await _call(fb_args)
 
-    # Fallback 2: location_name'den city'ye geri çık (eğer district aramayı kısıtlamışsa)
-    if not raw_places and district and city and district != city:
-        fb_args = dict(base_args)
-        fb_args.pop("lat", None)
-        fb_args.pop("lon", None)
-        fb_args["location_name"] = city
-        fb_args["query"] = _generic_fallback_query(role)
-        log.info(f"🔁 [Targeted] {role} il fallback: {city}")
+    # Fallback 2: farklı fraction dene (yakın aralık — rota üstü yer bulunamazsa)
+    if not raw_places and "route_polyline" in base_args:
+        _frac2 = float(base_args.get("target_fraction", 0.5))
+        _frac2 = max(0.0, min(1.0, _frac2 + 0.1 if _frac2 < 0.5 else _frac2 - 0.1))
+        fb_args = {
+            "query": _generic_fallback_query(role),
+            "route_polyline": base_args["route_polyline"],
+            "target_fraction": _frac2,
+        }
+        log.info(f"🔁 [Targeted] {role} fraction fallback: {_frac2:.2f}")
         raw_places = await _call(fb_args)
 
     if not raw_places:
@@ -887,24 +921,61 @@ async def _resolve_one_stop(
     if not valid:
         return None
 
+    # Break stop kalite filtresi: nargile/bar/gece kulübü gibi uygunsuz mekanları çıkar.
+    if role == "break":
+        _BREAK_EXCLUDE_KW = {
+            "nargile", "nargili", "hookah", "shisha",
+            "bar", "pub", "discotheque", "disco", "gece kulübü", "night club", "nightclub",
+            "pavyon", "gazino", "kumarhane", "casino",
+        }
+        _filtered_break = [
+            p for p in valid
+            if not any(kw in (p.get("name") or "").lower() for kw in _BREAK_EXCLUDE_KW)
+        ]
+        if _filtered_break:
+            valid = _filtered_break  # en az 1 uygun varsa filtreli listeyi kullan
+
     # Role-based seçim
     if role == "fuel":
-        best = _pick_best_fuel(valid)
-        # ★ Fuel price için mekanın gerçek adresinden city/district çıkar.
-        real_city, real_district = _parse_city_district_from_address(
-            best.get("address") or "", city, district,
-        )
-        fp = await _enrich_fuel_price(best, real_city, real_district, fuel_type, orchestrator)
-        if fp:
-            best["fuel_price"] = fp
-        if real_city:
-            best["city"] = real_city
-        if real_district:
-            best["district"] = real_district
+        # ★ Birden fazla istasyon döndür (top-3): kullanıcı POI overlay'de seçsin.
+        # Önce sapmaya göre sırala, sonra fiyat bilgisini concurrent olarak getir,
+        # ardından fiyata göre yeniden sırala.
+        _fuel_by_dev = sorted(valid, key=lambda s: float(s.get("deviation_meters") or 9999))
+        top_fuel = _fuel_by_dev[:3]
+
+        # city/district zenginleştir
+        for _b in top_fuel:
+            rc, rd = _parse_city_district_from_address(_b.get("address") or "", city, district)
+            if rc:
+                _b["city"] = rc
+            if rd:
+                _b["district"] = rd
+
+        # Fiyat bilgisini concurrent çek
+        _enrich_coros = [
+            _enrich_fuel_price(_b, _b.get("city") or city, _b.get("district") or district, fuel_type, orchestrator)
+            for _b in top_fuel
+        ]
+        _fps = await asyncio.gather(*_enrich_coros, return_exceptions=True)
+        for _b, _fp in zip(top_fuel, _fps):
+            if isinstance(_fp, dict):
+                _b["fuel_price"] = _fp
+
+        # Fiyata göre yeniden sırala (fiyatlılar önce, ucuzlar başta)
+        def _fuel_price_key(s: Dict[str, Any]) -> tuple:
+            fp = s.get("fuel_price") or {}
+            ppl = fp.get("price_per_liter")
+            has = isinstance(ppl, (int, float))
+            return (0 if has else 1, ppl if has else 9999.0, float(s.get("deviation_meters") or 9999))
+        top_fuel.sort(key=_fuel_price_key)
+
+        best = top_fuel[0]
+        if len(top_fuel) > 1:
+            best["_alternatives"] = top_fuel[1:]
     else:
-        # ★ FOOD için top-3 (kullanıcı seçim yapsın); break/scenic için top-1
+        # ★ FOOD + FUEL için top-3 (kullanıcı seçim yapsın); break/scenic için top-1
         sorted_valid = sorted(valid, key=_score_food_break, reverse=True)
-        top_n = 3 if role == "food" else 1
+        top_n = 3 if role in ("food", "fuel") else 1
         bests = sorted_valid[:top_n]
         for b in bests:
             real_city, real_district = _parse_city_district_from_address(
@@ -953,10 +1024,17 @@ async def collect_targeted_stops(
     """
     if not stops:
         return []
-    tasks = [
-        _resolve_one_stop(s, polyline, total_km, current_lat, current_lon, fuel_type, orchestrator)
-        for s in stops
-    ]
+    # Google Places API rate-limit koruması: en fazla 3 concurrent arama.
+    # Daha fazla paralel istek → rate-limit / timeout riski artar.
+    _sem = asyncio.Semaphore(3)
+
+    async def _guarded(s):
+        async with _sem:
+            return await _resolve_one_stop(
+                s, polyline, total_km, current_lat, current_lon, fuel_type, orchestrator
+            )
+
+    tasks = [_guarded(s) for s in stops]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     resolved: List[Dict[str, Any]] = []
     for r in results:

@@ -116,7 +116,7 @@ async def analyze_route_weather_handler(
     # Latency v2 — Strategist akışında Nominatim çağrısı zaten yoktur,
     # weather için sample aralığını gevşet: kısa rotalarda 60km, uzun rotalarda 120km.
     # 1000km rotada 16→9, 400km rotada 10→7 çağrıya indirir.
-    interval = 120 if len(polyline) > 1000 else 60
+    interval = 60 if len(polyline) > 1000 else 40
     # Daha garanti bir mesafe tahmini için sample_route_points içinde mesafe kontrolü yapılır.
     
     checkpoints = sample_route_points(polyline, interval_km=interval)
@@ -208,28 +208,27 @@ async def analyze_route_weather_handler(
         else:
             location_label = f"{km}. km"
 
-        if is_risky or km == 0 or point == checkpoints[-1]:
-            summary.append({
-                "km":            f"{km}. km",
-                "km_int":        km,                                # 12. Tur — int km (UI timeline için)
-                "tahmini_saat":  eta_str,
-                "durum":         f"{risk_emoji} {desc.title()}",
-                "sicaklik":      f"{temp}°C" if temp is not None else "?",
-                "yagis_olasiligi": f"%{rain_prob}",
-                "yagis_pct":     rain_prob,                          # 12. Tur — int (kalk yağış)
-                "ruzgar":        f"{wind} m/s",
-                "ruzgar_ms":     float(wind or 0),                   # 12. Tur — float (rüzgar)
-                "riskli_mi":     is_risky,
-                "severity":      severity,                           # 12. Tur — acik/hafif/orta/siddetli
-                "intensity_pct": intensity_pct,                      # 12. Tur — UI bar 0-100
-                "emoji":         risk_emoji,                         # 12. Tur — emoji ayrı (kolay render)
-                "il":            il,                                  # 13. Tur — Çorum vs.
-                "ilce":          ilce,                                # 13. Tur — Sungurlu vs.
-                "location_label": location_label,                     # 13. Tur — "Sungurlu, Çorum"
-                "lat":           point["lat"],                        # 14. Tur — mini map marker için
-                "lon":           point["lon"],                        # 14. Tur
-            })
-            if is_risky:
+        summary.append({
+            "km":            f"{km}. km",
+            "km_int":        km,                                # 12. Tur — int km (UI timeline için)
+            "tahmini_saat":  eta_str,
+            "durum":         f"{risk_emoji} {desc.title()}",
+            "sicaklik":      f"{temp}°C" if temp is not None else "?",
+            "yagis_olasiligi": f"%{rain_prob}",
+            "yagis_pct":     rain_prob,                          # 12. Tur — int (kalk yağış)
+            "ruzgar":        f"{wind} m/s",
+            "ruzgar_ms":     float(wind or 0),                   # 12. Tur — float (rüzgar)
+            "riskli_mi":     is_risky,
+            "severity":      severity,                           # 12. Tur — acik/hafif/orta/siddetli
+            "intensity_pct": intensity_pct,                      # 12. Tur — UI bar 0-100
+            "emoji":         risk_emoji,                         # 12. Tur — emoji ayrı (kolay render)
+            "il":            il,                                  # 13. Tur — Çorum vs.
+            "ilce":          ilce,                                # 13. Tur — Sungurlu vs.
+            "location_label": location_label,                     # 13. Tur — "Sungurlu, Çorum"
+            "lat":           point["lat"],                        # 14. Tur — mini map marker için
+            "lon":           point["lon"],                        # 14. Tur
+        })
+        if is_risky:
                 risks.append({
                     "km": f"{km}. km",
                     "km_int": km,
